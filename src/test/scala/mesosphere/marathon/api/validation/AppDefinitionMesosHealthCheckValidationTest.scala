@@ -2,13 +2,14 @@ package mesosphere.marathon
 package api.validation
 
 import mesosphere.UnitTest
+import mesosphere.marathon.api.v2.ValidationHelper
 import mesosphere.marathon.core.health._
 import mesosphere.marathon.core.plugin.PluginManager
 import mesosphere.marathon.state._
 
 class AppDefinitionMesosHealthCheckValidationTest extends UnitTest {
 
-  lazy val validAppDefinition = AppDefinition.validAppDefinition(Set.empty)(PluginManager.None)
+  lazy val validAppDefinition = AppDefinition.validAppDefinition(Set.empty, ValidationHelper.roleSettings())(PluginManager.None)
   "AppDefinitionMesosHealthCheckValidation" should {
     "app with 0 Mesos health checks is valid" in {
       val f = new Fixture
@@ -40,9 +41,8 @@ class AppDefinitionMesosHealthCheckValidationTest extends UnitTest {
     "app with more than 1 command Mesos health check is valid" in {
       val f = new Fixture
       Given("an app with one health check")
-      val app = f.app(healthChecks = Set(
-        MesosCommandHealthCheck(command = Command("true")),
-        MesosCommandHealthCheck(command = Command("true"))))
+      val app =
+        f.app(healthChecks = Set(MesosCommandHealthCheck(command = Command("true")), MesosCommandHealthCheck(command = Command("true"))))
 
       Then("the app is considered valid")
       validAppDefinition(app).isSuccess shouldBe true
@@ -66,7 +66,8 @@ class AppDefinitionMesosHealthCheckValidationTest extends UnitTest {
   class Fixture {
     def app(healthChecks: Set[HealthCheck] = Set(MarathonHttpHealthCheck())): AppDefinition =
       AppDefinition(
-        id = PathId("/test"),
+        id = AbsolutePathId("/test"),
+        role = "*",
         cmd = Some("sleep 1000"),
         instances = 1,
         healthChecks = healthChecks,

@@ -1,16 +1,17 @@
 package mesosphere.marathon
 package core.readiness.impl
 
+import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpHeader, StatusCodes, HttpResponse => AkkaHttpResponse}
+import akka.stream.scaladsl.Sink
 import mesosphere.AkkaUnitTest
+import mesosphere.marathon.core.instance.Instance
 import mesosphere.marathon.core.readiness.ReadinessCheckExecutor.ReadinessCheckSpec
-import mesosphere.marathon.core.readiness.{ HttpResponse, ReadinessCheckResult }
+import mesosphere.marathon.core.readiness.{HttpResponse, ReadinessCheckResult}
 import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.state.PathId
-import rx.lang.scala.Observable
-import akka.http.scaladsl.model.{ ContentTypes, HttpEntity, HttpHeader, StatusCodes, HttpResponse => AkkaHttpResponse }
+import mesosphere.marathon.state.AbsolutePathId
 
 import scala.concurrent.Future
-import scala.concurrent.duration.{ FiniteDuration, _ }
+import scala.concurrent.duration._
 
 class ReadinessCheckExecutorImplTest extends AkkaUnitTest {
   "ReadinessCheckExecutorImpl" should {
@@ -19,7 +20,7 @@ class ReadinessCheckExecutorImplTest extends AkkaUnitTest {
 
       When("querying readiness which immediately responds with ready")
       val readinessResultsObservable = f.executor.execute(f.check)
-      val readinessResults = readinessResultsObservable.toBlocking.toList
+      val readinessResults = readinessResultsObservable.runWith(Sink.seq).futureValue
 
       Then("the observable terminates with exactly one result")
       readinessResults should have size 1
@@ -31,15 +32,16 @@ class ReadinessCheckExecutorImplTest extends AkkaUnitTest {
 
     "terminates on eventual readiness" in {
       val f = new Fixture {
-        override def httpResponse: AkkaHttpResponse = synchronized {
-          if (httpGetCalls < 5) httpNotOkResponse
-          else httpOkResponse
-        }
+        override def httpResponse: AkkaHttpResponse =
+          synchronized {
+            if (httpGetCalls < 5) httpNotOkResponse
+            else httpOkResponse
+          }
       }
 
       When("querying readiness")
       val readinessResultsObservable = f.executor.execute(f.check)
-      val readinessResults = readinessResultsObservable.toBlocking.toList
+      val readinessResults = readinessResultsObservable.runWith(Sink.seq).futureValue
 
       Then("the observable terminates with five results")
       readinessResults should have size 5
@@ -53,17 +55,18 @@ class ReadinessCheckExecutorImplTest extends AkkaUnitTest {
 
     "continue on error" in {
       val f = new Fixture {
-        override def testableAkkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] = synchronized {
-          httpGetCalls += 1
-          if (httpGetCalls < 5) Future.failed(new RuntimeException("temporary failure"))
-          else Future.successful(httpOkResponse)
-        }
+        override def testableAkkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] =
+          synchronized {
+            httpGetCalls += 1
+            if (httpGetCalls < 5) Future.failed(new RuntimeException("temporary failure"))
+            else Future.successful(httpOkResponse)
+          }
 
       }
 
       When("querying readiness")
       val readinessResultsObservable = f.executor.execute(f.check)
-      val readinessResults = readinessResultsObservable.toBlocking.toList
+      val readinessResults = readinessResultsObservable.runWith(Sink.seq).futureValue
 
       Then("the observable terminates with five results")
       readinessResults should have size 5
@@ -108,35 +111,36 @@ class ReadinessCheckExecutorImplTest extends AkkaUnitTest {
   }
 
   class Fixture {
+    val instanceId = Instance.Id.forRunSpec(AbsolutePathId("/test"))
     lazy val check = ReadinessCheckSpec(
-      taskId = Task.Id.forRunSpec(PathId("/test")),
+      taskId = Task.Id(instanceId),
       checkName = "testCheck",
       url = "http://sample.url:123",
-      interval = 3.seconds,
+      interval = 1.milliseconds, // we're testing!
       timeout = 1.second,
       httpStatusCodesForReady = Set(StatusCodes.OK.intValue),
       preserveLastResponse = true
     )
 
-    lazy val ticks = Observable.from(Seq.fill(10000)(0))
     lazy val executor: ReadinessCheckExecutorImpl = new ReadinessCheckExecutorImpl()(system, mat) {
-      override private[impl] def intervalObservable(interval: FiniteDuration): Observable[_] = ticks
       override private[impl] def akkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] =
         testableAkkaHttpGet(check)
     }
 
     def hiBody = synchronized { HttpEntity(s"Hi $httpGetCalls") }
-    def httpOkResponse = AkkaHttpResponse(
-      headers = Seq[HttpHeader](akka.http.scaladsl.model.headers.`Content-Type`(ContentTypes.`text/plain(UTF-8)`)),
-      entity = hiBody
-    )
+    def httpOkResponse =
+      AkkaHttpResponse(
+        headers = Seq[HttpHeader](akka.http.scaladsl.model.headers.`Content-Type`(ContentTypes.`text/plain(UTF-8)`)),
+        entity = hiBody
+      )
     def httpNotOkResponse = httpOkResponse.copy(status = StatusCodes.InternalServerError)
     def httpResponse = httpOkResponse
 
     var httpGetCalls = 0
-    def testableAkkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] = synchronized { // linter:ignore:UnusedParameter
-      httpGetCalls += 1
-      Future.successful(httpResponse)
-    }
+    def testableAkkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] =
+      synchronized { // linter:ignore:UnusedParameter
+        httpGetCalls += 1
+        Future.successful(httpResponse)
+      }
   }
 }

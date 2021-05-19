@@ -1,0 +1,43 @@
+# ----------------------------------------------------------- #
+# Configuration Fragment : DataDog Summaries Reporter         #
+# ----------------------------------------------------------- #
+# This fragment enables the DataDog reporter and configures   #
+# it to submit the summarized indicators at the end of the    #
+# test run.                                                   #
+# ----------------------------------------------------------- #
+
+# Global test configuration
+# ===========================
+config:
+
+  # We require datadog credentials to be given through the command-line
+  definitions:
+    - name: datadog_api_key
+      desc: The datadog API Key
+      required: yes
+
+# Global test configuration
+# ===========================
+reporters:
+
+  - class: reporter.DataDogReporter
+    api_key: "{{datadog_api_key}}"
+    app_key: "{{datadog_app_key}}"
+    prefix: "marathon.perf.{{meta:test}}."
+    points:
+      - name: meanDeploymentTime
+        indicator: meanDeploymentTime
+      - name: meanHttpRequestTime
+        indicator: meanHttpRequestTime
+      - name: meanFailedDeployments
+        indicator: meanFailedDeployments
+      - name: meanFullDeploymentTime
+        indicator: meanFullDeploymentTime
+      - name: meangroupsResponseTime
+        indicator: meangroupsResponseTime
+      - name: meanCpuUsage
+        indicator: meanCpuUsage
+      - name: meanThreadCount
+        indicator: meanThreadCount
+      - name: meanUsedMemory
+        indicator: meanUsedMemory

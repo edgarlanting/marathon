@@ -3,41 +3,42 @@ package core.launcher.impl
 
 import java.util.Collections
 
-import mesosphere.marathon.core.launcher.{ InstanceOp, TaskLauncher }
-import mesosphere.marathon.metrics.{ Metrics, ServiceMetric }
-import mesosphere.marathon.stream.Implicits._
-import org.apache.mesos.Protos.{ OfferID, Status }
-import org.apache.mesos.{ Protos, SchedulerDriver }
-import org.slf4j.LoggerFactory
+import com.typesafe.scalalogging.StrictLogging
+import mesosphere.marathon.core.launcher.{InstanceOp, TaskLauncher}
+import mesosphere.marathon.metrics.Metrics
+import scala.jdk.CollectionConverters._
+import org.apache.mesos.Protos.{OfferID, Status}
+import org.apache.mesos.{Protos, SchedulerDriver}
 
-private[launcher] class TaskLauncherImpl(
-    marathonSchedulerDriverHolder: MarathonSchedulerDriverHolder) extends TaskLauncher {
-  private[this] val log = LoggerFactory.getLogger(getClass)
+private[launcher] class TaskLauncherImpl(metrics: Metrics, marathonSchedulerDriverHolder: MarathonSchedulerDriverHolder)
+    extends TaskLauncher
+    with StrictLogging {
 
-  private[this] val usedOffersMeter = Metrics.minMaxCounter(ServiceMetric, getClass, "usedOffers")
-  private[this] val launchedTasksMeter = Metrics.minMaxCounter(ServiceMetric, getClass, "launchedTasks")
-  private[this] val declinedOffersMeter = Metrics.minMaxCounter(ServiceMetric, getClass, "declinedOffers")
+  private[this] val usedOffersMetric =
+    metrics.counter("mesos.offers.used")
+  private[this] val launchedTasksMetric =
+    metrics.counter("tasks.launched")
+  private[this] val declinedOffersMetric =
+    metrics.counter("mesos.offers.declined")
 
   override def acceptOffer(offerID: OfferID, taskOps: Seq[InstanceOp]): Boolean = {
     val accepted = withDriver(s"launchTasks($offerID)") { driver =>
-
       //We accept the offer, the rest of the offer is declined automatically with the given filter.
       //The filter duration is set to 0, so we get the same offer in the next allocator cycle.
       val noFilter = Protos.Filters.newBuilder().setRefuseSeconds(0).build()
       val operations = taskOps.flatMap(_.offerOperations)
-      if (log.isDebugEnabled) {
-        log.debug(s"Operations on $offerID:\n${operations.mkString("\n")}")
-      }
+      logger.info(s"Operations on $offerID:\n${operations.mkString("\n")}")
+
       driver.acceptOffers(Collections.singleton(offerID), operations.asJava, noFilter)
     }
     if (accepted) {
-      usedOffersMeter.increment()
+      usedOffersMetric.increment()
       val launchCount = taskOps.count {
         case _: InstanceOp.LaunchTask => true
         case _: InstanceOp.LaunchTaskGroup => true
         case _ => false
       }
-      launchedTasksMeter.increment(launchCount.toLong)
+      launchedTasksMetric.increment(launchCount.toLong)
     }
     accepted
   }
@@ -50,7 +51,7 @@ private[launcher] class TaskLauncherImpl(
       _.declineOffer(offerID, filters)
     }
     if (declined) {
-      declinedOffersMeter.increment()
+      declinedOffersMetric.increment()
     }
   }
 
@@ -58,13 +59,12 @@ private[launcher] class TaskLauncherImpl(
     marathonSchedulerDriverHolder.driver match {
       case Some(driver) =>
         val status = block(driver)
-        if (log.isDebugEnabled) {
-          log.debug(s"$description returned status = $status")
-        }
+        logger.debug(s"$description returned status = $status")
+
         status == Status.DRIVER_RUNNING
 
       case None =>
-        log.warn(s"Cannot execute '$description', no driver available")
+        logger.warn(s"Cannot execute '$description', no driver available")
         false
     }
   }

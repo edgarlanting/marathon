@@ -15,7 +15,7 @@ For issues and feature requests related to the web UI, please refer to the [Supp
 <img src="{{ site.baseurl }}/img/marathon-ui-0.13.png" width="700" alt="Marathon UI in 0.13">
 
 By default, Marathon exposes its web UI on port `8080`. This can be configured
-via [command line flags]({{ site.baseurl }}/command-line-flags.html).
+via [command line flags]({{ site.baseurl }}/docs/command-line-flags.html).
 
 ## Application Status Reference
 Marathon UI introduces the following concepts to illustrate the possible statuses
@@ -94,7 +94,7 @@ as failing.
 
 #### Staged
 A task is staged when a launch request has been submitted to the cluster, but
-has not been reported as running yet. Fetching the specified "uris" in the app
+has not been reported as running yet. Fetching the specified "fetch" in the app
 definition or the docker images happens before Mesos reports the task as
 running.
 

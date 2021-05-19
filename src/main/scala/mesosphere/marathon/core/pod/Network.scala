@@ -3,9 +3,9 @@ package core.pod
 
 import mesosphere.marathon.Protos.NetworkDefinition
 import mesosphere.marathon.plugin.NetworkSpec
-import mesosphere.marathon.stream.Implicits._
+import scala.jdk.CollectionConverters._
 import mesosphere.mesos.protos.Implicits._
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 
 /**
   * Network declared by a [[PodDefinition]].
@@ -25,14 +25,16 @@ object Network {
 
   implicit class NetworkHelper(val networks: Seq[Network]) extends AnyVal {
     def hasNonHostNetworking = networks.exists(_ != HostNetwork)
-    def hasBridgeNetworking = networks.exists {
-      case _: BridgeNetwork => true
-      case _ => false
-    }
-    def hasContainerNetworking = networks.exists {
-      case _: ContainerNetwork => true
-      case _ => false
-    }
+    def hasBridgeNetworking =
+      networks.exists {
+        case _: BridgeNetwork => true
+        case _ => false
+      }
+    def hasContainerNetworking =
+      networks.exists {
+        case _: ContainerNetwork => true
+        case _ => false
+      }
 
     /**
       * Returns whether or not host networking is specified by the network list.
@@ -54,7 +56,7 @@ object Network {
   def fromProto(net: NetworkDefinition): Option[Network] = {
     import NetworkDefinition.Mode._
 
-    def labelsFromProto: Map[String, String] = net.getLabelsList.toSeq.fromProto
+    def labelsFromProto: Map[String, String] = net.getLabelsList.asScala.toSeq.fromProto
 
     net.getMode() match {
       case UNKNOWN =>
@@ -79,12 +81,12 @@ object Network {
       case br: BridgeNetwork =>
         builder
           .setMode(NetworkDefinition.Mode.BRIDGE)
-          .addAllLabels(br.labels.map{ case (k, v) => Mesos.Label.newBuilder().setKey(k).setValue(v).build() }.asJava)
+          .addAllLabels(br.labels.map { case (k, v) => Mesos.Label.newBuilder().setKey(k).setValue(v).build() }.asJava)
       case ct: ContainerNetwork =>
         builder
           .setMode(NetworkDefinition.Mode.CONTAINER)
           .setName(ct.name)
-          .addAllLabels(ct.labels.map{ case (k, v) => Mesos.Label.newBuilder().setKey(k).setValue(v).build() }.asJava)
+          .addAllLabels(ct.labels.map { case (k, v) => Mesos.Label.newBuilder().setKey(k).setValue(v).build() }.asJava)
     }
     builder.build()
   }

@@ -1,10 +1,11 @@
 package mesosphere.mesos.protos
 
-import com.google.protobuf.{ ByteString, Message }
-import mesosphere.marathon.stream.Implicits._
+import com.google.protobuf.{ByteString, Message}
+import mesosphere.marathon.silent
 import org.apache.mesos.Protos
 
 import scala.collection.immutable.Seq
+import scala.jdk.CollectionConverters._
 import scala.language.implicitConversions
 
 trait Implicits {
@@ -38,10 +39,10 @@ trait Implicits {
       .setId(frameworkInfo.id)
       .setName(frameworkInfo.name)
       .setUser(frameworkInfo.user)
-      .setRole(frameworkInfo.role)
+      .addRoles(frameworkInfo.role)
       .setCheckpoint(frameworkInfo.checkpoint)
       .setFailoverTimeout(frameworkInfo.failoverTimeout)
-      .build
+      .build: @silent
   }
 
   implicit def frameworkInfoToCaseClass(frameworkInfo: Protos.FrameworkInfo): FrameworkInfo = {
@@ -51,7 +52,7 @@ trait Implicits {
       frameworkInfo.getId,
       frameworkInfo.getFailoverTimeout,
       frameworkInfo.getCheckpoint,
-      frameworkInfo.getRole
+      frameworkInfo.getRole: @silent
     )
   }
 
@@ -69,8 +70,12 @@ trait Implicits {
     )
   }
 
-  // As indicator that mesos should enable tty functionality for a container, mesos only needs an empty TTYInfo send in
-  // the task info. Therefore: If this is called, the tty configuration is set to `true`, therefore return an empty TTYInfo.
+  /**
+    * As indicator that mesos should enable tty functionality for a container, mesos only needs an empty TTYInfo send in
+    * the task info. Therefore: If this is called, the tty configuration is set to `true`, therefore return an empty TTYInfo.
+    *
+    * TODO remove this (MARATHON-8319)
+    */
   implicit def ttyToProto(tty: Boolean): Protos.TTYInfo = Protos.TTYInfo.newBuilder().build()
 
   implicit def protoToTTY(proto: Protos.TTYInfo): Boolean = true // if anything as tty is configured in the proto, we return true
@@ -86,14 +91,14 @@ trait Implicits {
           .setName(name)
           .setRanges(rangesProto)
           .setRole(role)
-          .build
+          .build: @silent
       case ScalarResource(name, value, role) =>
         Protos.Resource.newBuilder
           .setType(Protos.Value.Type.SCALAR)
           .setName(name)
           .setScalar(Protos.Value.Scalar.newBuilder.setValue(value))
           .setRole(role)
-          .build
+          .build: @silent
       case SetResource(name, items, role) =>
         val set = Protos.Value.Set.newBuilder
           .addAllItem(items.asJava)
@@ -103,7 +108,7 @@ trait Implicits {
           .setName(name)
           .setSet(set)
           .setRole(role)
-          .build
+          .build: @silent
       case unsupported: Resource =>
         throw new IllegalArgumentException(s"Unsupported type: $unsupported")
     }
@@ -114,20 +119,20 @@ trait Implicits {
       case Protos.Value.Type.RANGES =>
         RangesResource(
           resource.getName,
-          resource.getRanges.getRangeList.map(rangeToCaseClass)(collection.breakOut),
-          resource.getRole
+          resource.getRanges.getRangeList.asScala.iterator.map(rangeToCaseClass).toSeq,
+          resource.getRole: @silent
         )
       case Protos.Value.Type.SCALAR =>
         ScalarResource(
           resource.getName,
           resource.getScalar.getValue,
-          resource.getRole
+          resource.getRole: @silent
         )
       case Protos.Value.Type.SET =>
         SetResource(
           resource.getName,
-          resource.getSet.getItemList.toSet,
-          resource.getRole
+          resource.getSet.getItemList.asScala.toSet,
+          resource.getRole: @silent
         )
       case unsupported: Protos.Value.Type =>
         throw new IllegalArgumentException(s"Unsupported type: $unsupported")
@@ -209,16 +214,17 @@ trait Implicits {
     )
   }
 
-  implicit def attributeToProto(attribute: Attribute): Protos.Attribute = attribute match {
-    case TextAttribute(name, text) =>
-      Protos.Attribute.newBuilder
-        .setType(Protos.Value.Type.TEXT)
-        .setName(name)
-        .setText(Protos.Value.Text.newBuilder.setValue(text))
-        .build
-    case unsupported: Attribute =>
-      throw new IllegalArgumentException(s"Unsupported type: $unsupported")
-  }
+  implicit def attributeToProto(attribute: Attribute): Protos.Attribute =
+    attribute match {
+      case TextAttribute(name, text) =>
+        Protos.Attribute.newBuilder
+          .setType(Protos.Value.Type.TEXT)
+          .setName(name)
+          .setText(Protos.Value.Text.newBuilder.setValue(text))
+          .build
+      case unsupported: Attribute =>
+        throw new IllegalArgumentException(s"Unsupported type: $unsupported")
+    }
 
   implicit def attributeToCaseClass(attribute: Protos.Attribute): Attribute = {
     attribute.getType match {
@@ -250,9 +256,9 @@ trait Implicits {
       offer.getFrameworkId,
       offer.getSlaveId,
       offer.getHostname,
-      offer.getResourcesList.map(resourceToCaseClass)(collection.breakOut),
-      offer.getAttributesList.map(attributeToCaseClass)(collection.breakOut),
-      offer.getExecutorIdsList.map(executorIDToCaseClass)(collection.breakOut)
+      offer.getResourcesList.asScala.iterator.map(resourceToCaseClass).toSeq,
+      offer.getAttributesList.asScala.iterator.map(attributeToCaseClass).toSeq,
+      offer.getExecutorIdsList.asScala.iterator.map(executorIDToCaseClass).toSeq
     )
   }
 
@@ -305,14 +311,19 @@ object Implicits extends Implicits {
       builder.build
     }
     def toProto: Seq[Protos.Label] =
-      labels.map { e => Protos.Label.newBuilder.setKey(e._1).setValue(e._2).build }(collection.breakOut)
+      labels.iterator.map { e => Protos.Label.newBuilder.setKey(e._1).setValue(e._2).build }.toSeq
   }
 
   implicit final class LabelsToMap(val labels: Protos.Labels) extends AnyVal {
     def fromProto: Map[String, String] =
-      labels.getLabelsList.collect {
-        case label if label.hasKey && label.hasValue => label.getKey -> label.getValue
-      }(collection.breakOut)
+      labels
+        .getLabelsList()
+        .asScala
+        .iterator
+        .collect {
+          case label if label.hasKey && label.hasValue => label.getKey -> label.getValue
+        }
+        .toMap
   }
 
   implicit final class LabelToTuple(val label: Protos.Label) extends AnyVal {
@@ -322,8 +333,8 @@ object Implicits extends Implicits {
 
   implicit final class LabelSeqToMap(val labels: Iterable[Protos.Label]) extends AnyVal {
     def fromProto: Map[String, String] =
-      labels.collect {
+      labels.iterator.collect {
         case label if label.hasKey && label.hasValue => label.getKey -> label.getValue
-      }(collection.breakOut)
+      }.toMap
   }
 }

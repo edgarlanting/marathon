@@ -19,10 +19,7 @@ import scala.concurrent.duration._
   * @param maxLaunchDelay The maximum backoff applied when subsequent failures are detected.
   *   minimum: 0.0
   */
-case class BackoffStrategy(
-  backoff: FiniteDuration = 1.seconds,
-  maxLaunchDelay: FiniteDuration = 1.hour,
-  factor: Double = 1.15)
+case class BackoffStrategy(backoff: FiniteDuration = 1.seconds, maxLaunchDelay: FiniteDuration = 5.minutes, factor: Double = 1.15)
 
 /**
   * A generic spec that specifies something that Marathon is able to launch instances of.
@@ -32,7 +29,7 @@ case class BackoffStrategy(
 // don't make sense to do generically, eg 'executor', 'cmd', 'args', etc.
 // we should try to group things up logically - pod does a decent job of this
 trait RunSpec extends plugin.RunSpec {
-  val id: PathId
+  val id: AbsolutePathId
   val env: Map[String, EnvVarValue]
   val labels: Map[String, String]
   val acceptedResourceRoles: Set[String]
@@ -42,23 +39,48 @@ trait RunSpec extends plugin.RunSpec {
   val version: Timestamp
   val resources: Resources
   val backoffStrategy: BackoffStrategy
-  val residency: Option[Residency] = Option.empty[Residency]
   val upgradeStrategy: UpgradeStrategy
+  def isResident: Boolean = persistentVolumes.nonEmpty
   def withInstances(instances: Int): RunSpec
   def isUpgrade(to: RunSpec): Boolean
   def needsRestart(to: RunSpec): Boolean
   def isOnlyScaleChange(to: RunSpec): Boolean
+  def isScaledToZero: Boolean = instances == 0
   val versionInfo: VersionInfo
   val container = Option.empty[Container]
   val cmd = Option.empty[String]
   val args = Seq.empty[String]
   val isSingleInstance: Boolean = false
   val volumes = Seq.empty[Volume]
+  val volumeMounts = Seq.empty[VolumeMount]
   val persistentVolumes = Seq.empty[PersistentVolume]
+  val persistentVolumeMounts = Seq.empty[VolumeMount]
   val externalVolumes = Seq.empty[ExternalVolume]
   val diskForPersistentVolumes: Double = 0.0
   val user: Option[String]
   val unreachableStrategy: UnreachableStrategy
   val killSelection: KillSelection
   val networks: Seq[Network]
+  val role: Role
+
+  final def ref: RunSpecRef = RunSpecRef(id, version)
+
+  /**
+    * Reference to the last config ref
+    */
+  final def configRef: RunSpecConfigRef = RunSpecConfigRef(id, versionInfo.lastConfigChangeVersion)
 }
+
+object RunSpec {
+  var wipDefaultRole = "default"
+}
+
+/**
+  * Points to a specific version of a runSpec
+  */
+final case class RunSpecRef(id: AbsolutePathId, version: Timestamp)
+
+/**
+  * Points to a runSpec at some config point in time
+  */
+final case class RunSpecConfigRef(id: AbsolutePathId, configVersion: Timestamp)

@@ -1,9 +1,9 @@
 package mesosphere.marathon
 package core.launcher
 
-import mesosphere.marathon.state.{ RunSpec, Timestamp }
+import mesosphere.marathon.state.{RunSpec, Timestamp}
 import mesosphere.mesos.NoOfferMatchReason
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 
 /**
   * Defines the offer match result based on the related offer for given runSpec.
@@ -33,4 +33,3 @@ object OfferMatchResult {
   case class NoMatch(runSpec: RunSpec, offer: Mesos.Offer, reasons: Seq[NoOfferMatchReason], timestamp: Timestamp) extends OfferMatchResult
 
 }
-

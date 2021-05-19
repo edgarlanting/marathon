@@ -3,19 +3,20 @@ package core.task.termination.impl
 
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.instance.Instance
+import mesosphere.marathon.core.instance.{Goal, Instance}
 import mesosphere.marathon.core.task.Task
 
 /**
   * Possible actions that can be chosen in order to `kill` a given instance.
   * Depending on the instance's state this can be one of
-  * - [[KillAction.ExpungeFromState]]
+  * - [[KillAction.Decommission]]
   * - [[KillAction.Noop]]
   * - [[KillAction.IssueKillRequest]]
   */
 private[termination] sealed trait KillAction
 
 private[termination] object KillAction extends StrictLogging {
+
   /**
     * Any normal, reachable and stateless instance will simply be killed via the scheduler driver.
     */
@@ -28,23 +29,26 @@ private[termination] object KillAction extends StrictLogging {
 
   /**
     * In case of an instance being Unreachable, killing the related Mesos task is impossible.
-    * In order to get rid of the instance, processing this action expunges the metadata from
-    * state. If the instance is reported to be non-terminal in the future, it will be killed.
+    * In order to get rid of the instance, we decommission this instance.
+    * If the instance is reported to be non-terminal in the future, it will be killed.
     */
-  case object ExpungeFromState extends KillAction
+  case object Decommission extends KillAction
 
   /* returns whether or not we can expect the task to report a terminal state after sending a kill signal */
   private val wontRespondToKill: Condition => Boolean = {
     import Condition._
     Set(
-      Unknown, Unreachable, UnreachableInactive,
+      Unknown,
+      Unreachable,
+      UnreachableInactive,
       // TODO: it should be safe to remove these from this list, because
       // 1) all taskId's should be removed at this point, because Gone & Dropped are terminal.
       // 2) Killing a Gone / Dropped task will cause it to be in a terminal state.
       // 3) Killing a Gone / Dropped task may result in no status change at all.
       // 4) Either way, we end up in a terminal state.
       // However, we didn't want to risk changing behavior in a point release. So they remain here.
-      Dropped, Gone
+      Dropped,
+      Gone
     )
   }
 
@@ -66,28 +70,21 @@ private[termination] object KillAction extends StrictLogging {
     // TODO(PODS): align this with other Terminal/Unreachable/whatever extractors
     val maybeCondition = knownInstance.map(_.state.condition)
     val isUnkillable = maybeCondition.fold(false)(wontRespondToKill)
+    val isGoalRunning: Boolean = knownInstance.exists(_.state.goal == Goal.Running)
 
-    // Ephemeral instances are expunged once all tasks are terminal, it's unlikely for this to be true for them.
-    // Resident tasks, however, could be in this state if scaled down, or, if kill is attempted between recovery.
-    val allTerminal: Boolean = taskIds.isEmpty
-
-    if (isUnkillable || allTerminal) {
-      val msg = if (isUnkillable)
-        s"it is ${maybeCondition.fold("unknown")(_.toString)}"
-      else
-        "none of its tasks are running"
+    if (isUnkillable && isGoalRunning) {
       if (hasReservations) {
-        logger.info(
-          s"Ignoring kill request for ${instanceId}; killing it while ${msg} is unsupported")
+        logger.info(s"Ignoring kill request for $instanceId; It is in unkillable state but it has reservation - cannot decommission.")
         KillAction.Noop
       } else {
-        logger.warn(s"Expunging ${instanceId} from state because ${msg}")
+        val msg = s"its condition is ${maybeCondition.fold("unknown")(_.toString)}"
+        logger.warn(s"Decommissioning $instanceId from state because $msg")
         // we will eventually be notified of a taskStatusUpdate after the instance has been expunged
-        KillAction.ExpungeFromState
+        KillAction.Decommission
       }
     } else {
       val knownOrNot = if (knownInstance.isDefined) "known" else "unknown"
-      logger.warn("Killing {} {} of instance {}", knownOrNot, taskIds.mkString(","), instanceId)
+      logger.warn(s"Killing $knownOrNot ${taskIds.mkString(",")} of instance $instanceId")
       KillAction.IssueKillRequest
     }
   }

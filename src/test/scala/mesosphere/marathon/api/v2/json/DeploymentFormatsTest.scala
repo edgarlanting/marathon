@@ -5,9 +5,9 @@ import java.util.UUID
 
 import mesosphere.UnitTest
 import mesosphere.marathon.core.deployment._
-import mesosphere.marathon.raml.{ App, GroupUpdate, Raml }
+import mesosphere.marathon.raml.{App, GroupUpdate, Raml}
 import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.state.{ AppDefinition, Group, Timestamp }
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, Group, Timestamp}
 import mesosphere.marathon.test.GroupCreation
 import play.api.libs.json._
 
@@ -30,14 +30,13 @@ class DeploymentFormatsTest extends UnitTest with GroupCreation {
       |  "scaleBy": 23.0,
       |  "version": "2015-06-03T13:00:52.928Z"
       |}
-      |""".
-          stripMargin
+      |""".stripMargin
       val update = Json.parse(json).as[GroupUpdate]
       update.id should be(Some("a"))
-      update.apps should be ('defined)
+      update.apps should be('defined)
       update.apps.get should have size 1
       update.apps.get.head.id should be("b")
-      update.groups should be ('defined)
+      update.groups should be('defined)
       update.groups.get should have size 1
       update.groups.get.head.id should be(Some("c"))
       update.dependencies should be('defined)
@@ -63,29 +62,25 @@ class DeploymentFormatsTest extends UnitTest with GroupCreation {
       groupFromNull.version should be('empty)
     }
 
-    "Can write/read Group" in {
-      marshalUnmarshal(Raml.toRaml(genGroup()))
-      marshalUnmarshal(Raml.toRaml(genGroup(Set(genGroup(), genGroup(Set(genGroup()))))))
-    }
-
     "Can write/read byte arrays" in {
       marshalUnmarshal("Hello".getBytes)
     }
 
     "DeploymentPlan can be serialized" in {
       val plan = DeploymentPlan(
-        genId.toString,
+        genId,
         genRootGroup(),
         genRootGroup(Set(genGroup(), genGroup())),
         Seq(genStep),
         Timestamp.now()
       )
-      val json = Json.toJson(plan).as[JsObject]
+      val json = Json.toJson(Raml.toRaml(plan)).as[JsObject]
       val fieldMap = json.fields.toMap
-      fieldMap.keySet should be(Set("version", "id", "target", "original", "steps"))
+      // Expect the following fields ONLY from serialized DeploymentPlan
+      fieldMap.keySet should be(Set("id", "steps", "version"))
 
       val action = ((json \ "steps")(0) \ "actions")(0)
-      val actionFields: Set[String] = action.as[JsObject].fields.map(_._1)(collection.breakOut)
+      val actionFields: Set[String] = action.as[JsObject].fields.iterator.map(_._1).toSet
       actionFields should be(Set("action", "app"))
     }
 
@@ -100,43 +95,60 @@ class DeploymentFormatsTest extends UnitTest with GroupCreation {
   def marshalUnmarshal[T](original: T)(implicit format: Format[T]): JsValue = {
     val json = Json.toJson(original)
     val read = json.as[T]
-    read should be (original)
+    read should be(original)
     json
   }
 
   def genInt = Random.nextInt(1000)
 
-  def genId = UUID.randomUUID().toString.toPath
+  def genId = UUID.randomUUID().toString
+  def genAbsoluteId = AbsolutePathId(s"/${UUID.randomUUID().toString}")
 
   def genTimestamp = Timestamp.now()
 
-  def genApp = AppDefinition(id = genId)
+  def genApp = AppDefinition(id = genAbsoluteId, role = "*", cmd = Some("sleep"))
 
-  def genStep = DeploymentStep(actions = Seq(
-    StartApplication(genApp, genInt),
-    ScaleApplication(genApp, genInt),
-    StopApplication(genApp),
-    RestartApplication(genApp)
-  ))
+  def genStep =
+    DeploymentStep(actions =
+      Seq(
+        StartApplication(genApp),
+        ScaleApplication(genApp, genInt),
+        StopApplication(genApp),
+        RestartApplication(genApp)
+      )
+    )
 
   def genGroup(children: Set[Group] = Set.empty) = {
     val app1 = genApp
     val app2 = genApp
-    createGroup(genId, apps = Map(app1.id -> app1, app2.id -> app2), groups = children, dependencies = Set(genId), version = genTimestamp)
+    createGroup(
+      genAbsoluteId,
+      apps = Map(app1.id -> app1, app2.id -> app2),
+      groups = children,
+      dependencies = Set(genAbsoluteId),
+      version = genTimestamp,
+      validate = false
+    )
   }
 
   def genRootGroup(children: Set[Group] = Set.empty) = {
     val app1 = genApp
     val app2 = genApp
-    createRootGroup(apps = Map(app1.id -> app1, app2.id -> app2), groups = children, dependencies = Set(genId), version = genTimestamp)
+    createRootGroup(
+      apps = Map(app1.id -> app1, app2.id -> app2),
+      groups = children,
+      dependencies = Set(genAbsoluteId),
+      version = genTimestamp,
+      validate = false
+    )
   }
 
   def genGroupUpdate(children: Set[GroupUpdate] = Set.empty) =
     GroupUpdate(
-      Some(genId.toString),
-      Some(Set(App(id = genId.toString), App(id = genId.toString))),
+      Some(genAbsoluteId.toString),
+      Some(Set(App(id = genId), App(id = genId))),
       Some(children),
-      Some(Set(genId.toString)),
+      Some(Set(genId)),
       Some(23),
       Some(genTimestamp.toOffsetDateTime)
     )

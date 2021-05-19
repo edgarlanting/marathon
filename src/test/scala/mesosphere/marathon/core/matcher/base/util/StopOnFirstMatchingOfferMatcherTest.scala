@@ -3,11 +3,11 @@ package core.matcher.base.util
 
 import mesosphere.UnitTest
 import mesosphere.marathon.core.matcher.base.OfferMatcher
-import mesosphere.marathon.core.matcher.base.OfferMatcher.{ InstanceOpWithSource, MatchedInstanceOps }
+import mesosphere.marathon.core.matcher.base.OfferMatcher.{InstanceOpWithSource, MatchedInstanceOps}
 import mesosphere.marathon.state.Timestamp
 import mesosphere.marathon.test.MarathonTestHelper
 import org.apache.mesos.Protos.Offer
-import org.apache.mesos.{ Protos => MesosProtos }
+import org.apache.mesos.{Protos => MesosProtos}
 
 import scala.collection.immutable
 import scala.concurrent.Future
@@ -95,11 +95,12 @@ class StopOnFirstMatchingOfferMatcherTest extends UnitTest {
       )
     }
 
-    def offerMatcher(matching: OfferMatcher.MatchedInstanceOps): OfferMatcher = new OfferMatcher {
-      override def matchOffer(offer: Offer): Future[MatchedInstanceOps] = {
-        Future.successful(matching)
+    def offerMatcher(matching: OfferMatcher.MatchedInstanceOps): OfferMatcher =
+      new OfferMatcher {
+        override def matchOffer(offer: Offer): Future[MatchedInstanceOps] = {
+          Future.successful(matching)
+        }
       }
-    }
 
     lazy val matchers: Seq[OfferMatcher] = Seq.empty
     lazy val stopOnFirstMatching = new StopOnFirstMatchingOfferMatcher(matchers: _*)

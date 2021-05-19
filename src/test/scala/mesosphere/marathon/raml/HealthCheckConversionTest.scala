@@ -2,7 +2,7 @@ package mesosphere.marathon
 package raml
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.health.{ HealthCheck => CoreHealthCheck, _ }
+import mesosphere.marathon.core.health.{HealthCheck => CoreHealthCheck, _}
 
 import scala.concurrent.duration._
 
@@ -48,7 +48,7 @@ class HealthCheckConversionTest extends UnitTest {
         core.maxConsecutiveFailures should be(check.maxConsecutiveFailures)
         core.path should be(check.path)
         core.port should be(check.port)
-        core.portIndex should be (check.portIndex)
+        core.portIndex should be(check.portIndex)
         core.timeout should be(check.timeoutSeconds.seconds)
       }
     }
@@ -83,7 +83,7 @@ class HealthCheckConversionTest extends UnitTest {
         core.interval should be(check.intervalSeconds.seconds)
         core.maxConsecutiveFailures should be(check.maxConsecutiveFailures)
         core.port should be(check.port)
-        core.portIndex should be (check.portIndex)
+        core.portIndex should be(check.portIndex)
         core.timeout should be(check.timeoutSeconds.seconds)
       }
     }
@@ -98,7 +98,7 @@ class HealthCheckConversionTest extends UnitTest {
 
       "convert to a RAML AppHealthCheck" in {
         raml.protocol should be(AppHealthCheckProtocol.Command)
-        raml.command should be(Some(CommandCheck("test")))
+        raml.command should be(Some(AppCommandCheck("test")))
         raml.gracePeriodSeconds should be(check.gracePeriod.toSeconds)
         raml.ignoreHttp1xx should be(None)
         raml.intervalSeconds should be(check.interval.toSeconds)
@@ -111,7 +111,7 @@ class HealthCheckConversionTest extends UnitTest {
     }
     "An AppHealthCheck" should {
       "convert to a MesosCommandHealthCheck" in {
-        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.Command, command = Some(CommandCheck("foo")))
+        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.Command, command = Some(AppCommandCheck("foo")))
         val core = Some(check.fromRaml).collect {
           case c: MesosCommandHealthCheck => c
         }.getOrElse(fail("expected MesosCommandHealthCheck"))
@@ -127,13 +127,14 @@ class HealthCheckConversionTest extends UnitTest {
 
   "A MesosHttpHealthCheck is converted correctly" when {
     "A core MesosHttpHealthCheck" should {
-      val check = MesosHttpHealthCheck()
+      val check = MesosHttpHealthCheck(ipProtocol = IPv6)
       val raml = check.toRaml[AppHealthCheck]
 
       behave like convertToProtobufThenToRAML(check, raml)
 
       "convert to a RAML AppHealthCheck" in {
         raml.protocol should be(AppHealthCheckProtocol.MesosHttp)
+        raml.ipProtocol should be(mesosphere.marathon.raml.IpProtocol.Ipv6)
         raml.command should be(empty)
         raml.gracePeriodSeconds should be(check.gracePeriod.toSeconds)
         raml.ignoreHttp1xx should be(None)
@@ -147,24 +148,25 @@ class HealthCheckConversionTest extends UnitTest {
     }
     "An AppHealthCheck" should {
       "convert to a MesosHttpHealthCheck" in {
-        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.MesosHttp)
+        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.MesosHttp, ipProtocol = IpProtocol.Ipv6)
         val core = Some(check.fromRaml).collect {
           case c: MesosHttpHealthCheck => c
         }.getOrElse(fail("expected MesosHttpHealthCheck"))
         core.protocol should be(Protos.HealthCheckDefinition.Protocol.MESOS_HTTP)
+        core.ipProtocol should be(IPv6)
         core.gracePeriod should be(check.gracePeriodSeconds.seconds)
         core.delay should be(CoreHealthCheck.DefaultDelay)
         core.interval should be(check.intervalSeconds.seconds)
         core.maxConsecutiveFailures should be(check.maxConsecutiveFailures)
         core.path should be(check.path)
         core.port should be(check.port)
-        core.portIndex should be (check.portIndex)
+        core.portIndex should be(check.portIndex)
         core.timeout should be(check.timeoutSeconds.seconds)
       }
     }
     "A HealthCheck with HttpHealthCheck defined" should {
       "convert to a MesosHealthCheck" in {
-        val check = HealthCheck(http = Some(HttpHealthCheck(endpoint = "localhost")))
+        val check = HealthCheck(http = Some(HttpCheck(endpoint = "localhost")))
         val core = Some(check.fromRaml).collect {
           case c: MesosHttpHealthCheck => c
         }.getOrElse(fail("expected MesosHttpHealthCheck"))
@@ -175,7 +177,7 @@ class HealthCheckConversionTest extends UnitTest {
         core.maxConsecutiveFailures should be(check.maxConsecutiveFailures)
         core.path should not be 'defined
         core.port should not be 'defined
-        core.portIndex should be (Some(PortReference("localhost")))
+        core.portIndex should be(Some(PortReference("localhost")))
         core.timeout should be(check.timeoutSeconds.seconds)
       }
     }
@@ -183,13 +185,14 @@ class HealthCheckConversionTest extends UnitTest {
 
   "A MesosTcpHealthCheck is converted correctly" when {
     "A MesosTcpHealthCheck" should {
-      val check = MesosTcpHealthCheck()
+      val check = MesosTcpHealthCheck(ipProtocol = IPv6)
       val raml = check.toRaml[AppHealthCheck]
 
       behave like convertToProtobufThenToRAML(check, raml)
 
       "convert to a RAML AppHealthCheck" in {
         raml.protocol should be(AppHealthCheckProtocol.MesosTcp)
+        raml.ipProtocol should be(mesosphere.marathon.raml.IpProtocol.Ipv6)
         raml.command should be(empty)
         raml.gracePeriodSeconds should be(check.gracePeriod.toSeconds)
         raml.ignoreHttp1xx should be(None)
@@ -203,10 +206,11 @@ class HealthCheckConversionTest extends UnitTest {
     }
     "An AppHealthCheck" should {
       "convert to a MesosTcpHealthCheck" in {
-        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.MesosTcp)
+        val check = AppHealthCheck(protocol = AppHealthCheckProtocol.MesosTcp, ipProtocol = IpProtocol.Ipv6)
         val core = Some(check.fromRaml).collect {
           case c: MesosTcpHealthCheck => c
         }.getOrElse(fail("expected MesosTcpHealthCheck"))
+        core.ipProtocol should be(IPv6)
         core.gracePeriod should be(check.gracePeriodSeconds.seconds)
         core.delay should be(CoreHealthCheck.DefaultDelay)
         core.interval should be(check.intervalSeconds.seconds)

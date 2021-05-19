@@ -4,22 +4,24 @@ package storage.repository
 import java.util.UUID
 
 import akka.Done
+import com.mesosphere.utils.zookeeper.ZookeeperServerTest
 import mesosphere.AkkaUnitTest
+import mesosphere.marathon.core.base.JvmExitsCrashStrategy
 import mesosphere.marathon.core.storage.repository.SingletonRepository
-import mesosphere.marathon.core.storage.store.impl.cache.{ LazyCachingPersistenceStore, LoadTimeCachingPersistenceStore }
+import mesosphere.marathon.core.storage.store.impl.cache.{LazyCachingPersistenceStore, LoadTimeCachingPersistenceStore}
 import mesosphere.marathon.core.storage.store.impl.memory.InMemoryPersistenceStore
-import mesosphere.marathon.core.storage.store.impl.zk.ZkPersistenceStore
-import mesosphere.marathon.integration.setup.ZookeeperServerTest
+import mesosphere.marathon.core.storage.store.impl.zk.{RichCuratorFramework, ZkPersistenceStore}
+import mesosphere.marathon.metrics.dummy.DummyMetrics
 import mesosphere.util.state.FrameworkId
 
-import scala.concurrent.duration._
-
 class SingletonRepositoryTest extends AkkaUnitTest with ZookeeperServerTest {
+  val metrics = DummyMetrics
+
   def basic(name: String, createRepo: => SingletonRepository[FrameworkId]): Unit = {
     name should {
       "return none if nothing has been stored" in {
         val repo = createRepo
-        repo.get().futureValue should be ('empty)
+        repo.get().futureValue should be('empty)
       }
       "delete should succeed if nothing has been stored" in {
         val repo = createRepo
@@ -36,27 +38,34 @@ class SingletonRepositoryTest extends AkkaUnitTest with ZookeeperServerTest {
         val id = FrameworkId(UUID.randomUUID().toString)
         repo.store(id).futureValue
         repo.delete().futureValue should be(Done)
-        repo.get().futureValue should be ('empty)
+        repo.get().futureValue should be('empty)
       }
     }
   }
 
   def createInMemRepo(): FrameworkIdRepository = {
-    FrameworkIdRepository.inMemRepository(new InMemoryPersistenceStore())
+    val store = new InMemoryPersistenceStore(metrics)
+    store.markOpen()
+    FrameworkIdRepository.inMemRepository(store)
   }
 
   def createLoadTimeCachingRepo(): FrameworkIdRepository = {
-    val cached = new LoadTimeCachingPersistenceStore(new InMemoryPersistenceStore())
+    val cached = new LoadTimeCachingPersistenceStore(new InMemoryPersistenceStore(metrics))
+    cached.markOpen()
     cached.preDriverStarts.futureValue
     FrameworkIdRepository.inMemRepository(cached)
   }
 
   def createZKRepo(): FrameworkIdRepository = {
-    FrameworkIdRepository.zkRepository(new ZkPersistenceStore(zkClient(), 10.seconds))
+    val store = new ZkPersistenceStore(metrics, RichCuratorFramework(zkClient(), JvmExitsCrashStrategy))
+    store.markOpen()
+    FrameworkIdRepository.zkRepository(store)
   }
 
   def createLazyCachingRepo(): FrameworkIdRepository = {
-    FrameworkIdRepository.inMemRepository(LazyCachingPersistenceStore(new InMemoryPersistenceStore()))
+    val store = LazyCachingPersistenceStore(metrics, new InMemoryPersistenceStore(metrics))
+    store.markOpen()
+    FrameworkIdRepository.inMemRepository(store)
   }
 
   behave like basic("InMemoryPersistence", createInMemRepo())

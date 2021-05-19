@@ -1,31 +1,30 @@
 package mesosphere.marathon
 
 import java.util.concurrent.CountDownLatch
-import java.util.{ Timer, TimerTask }
-import javax.inject.{ Inject, Named }
+import java.util.{Timer, TimerTask}
 
 import akka.Done
-import akka.actor.{ ActorRef, ActorSystem }
+import akka.actor.{ActorRef, ActorSystem}
 import akka.stream.Materializer
+import akka.stream.scaladsl.Sink
 import akka.util.Timeout
 import com.google.common.util.concurrent.AbstractExecutionThreadService
+import com.typesafe.scalalogging.StrictLogging
+import javax.inject.{Inject, Named}
 import mesosphere.marathon.MarathonSchedulerActor._
-import mesosphere.marathon.core.base.toRichRuntime
-import mesosphere.marathon.core.deployment.{ DeploymentManager, DeploymentPlan, DeploymentStepInfo }
-import mesosphere.marathon.core.election.{ ElectionCandidate, ElectionService }
+import mesosphere.marathon.core.deployment.{DeploymentManager, DeploymentPlan, DeploymentStepInfo}
+import mesosphere.marathon.core.election.{ElectionCandidate, ElectionService}
 import mesosphere.marathon.core.group.GroupManager
 import mesosphere.marathon.core.heartbeat._
-import mesosphere.marathon.core.instance.Instance
 import mesosphere.marathon.core.leadership.LeadershipCoordinator
-import mesosphere.marathon.state.{ AppDefinition, PathId, Timestamp }
+import mesosphere.marathon.core.storage.store.PersistenceStore
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, Timestamp}
 import mesosphere.marathon.storage.migration.Migration
-import mesosphere.marathon.stream.Sink
 import mesosphere.util.PromiseActor
 import org.apache.mesos.SchedulerDriver
-import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration._
-import scala.concurrent.{ Await, Future }
+import scala.concurrent.{Await, Future}
 import scala.util.Failure
 
 /**
@@ -33,6 +32,7 @@ import scala.util.Failure
   * start/stop events
   */
 trait PrePostDriverCallback {
+
   /**
     * Will get called _before_ the driver is running, but after migration.
     */
@@ -49,6 +49,7 @@ trait PrePostDriverCallback {
   */
 // TODO (AD): do we need this trait?
 trait DeploymentService {
+
   /**
     * Deploy a plan.
     * @param plan the plan to deploy.
@@ -65,20 +66,25 @@ trait DeploymentService {
   * Wrapper class for the scheduler
   */
 class MarathonSchedulerService @Inject() (
-  leadershipCoordinator: LeadershipCoordinator,
-  config: MarathonConf,
-  electionService: ElectionService,
-  prePostDriverCallbacks: Seq[PrePostDriverCallback],
-  groupManager: GroupManager,
-  driverFactory: SchedulerDriverFactory,
-  system: ActorSystem,
-  migration: Migration,
-  deploymentManager: DeploymentManager,
-  @Named("schedulerActor") schedulerActor: ActorRef,
-  @Named(ModuleNames.MESOS_HEARTBEAT_ACTOR) mesosHeartbeatActor: ActorRef)(implicit mat: Materializer)
-    extends AbstractExecutionThreadService with ElectionCandidate with DeploymentService {
+    persistenceStore: PersistenceStore[_, _, _],
+    leadershipCoordinator: LeadershipCoordinator,
+    config: MarathonConf,
+    electionService: ElectionService,
+    prePostDriverCallbacks: Seq[PrePostDriverCallback],
+    groupManager: GroupManager,
+    driverFactory: SchedulerDriverFactory,
+    system: ActorSystem,
+    migration: Migration,
+    deploymentManager: DeploymentManager,
+    @Named("schedulerActor") schedulerActor: ActorRef,
+    heartbeatMonitor: MesosHeartbeatMonitor
+)(implicit mat: Materializer)
+    extends AbstractExecutionThreadService
+    with ElectionCandidate
+    with DeploymentService
+    with StrictLogging {
 
-  import mesosphere.marathon.core.async.ExecutionContexts.global
+  import scala.concurrent.ExecutionContext.Implicits.global
 
   implicit val zkTimeout = config.zkTimeoutDuration
 
@@ -102,8 +108,6 @@ class MarathonSchedulerService @Inject() (
 
   private[mesosphere] var timer = newTimer()
 
-  val log = LoggerFactory.getLogger(getClass.getName)
-
   // This is a little ugly as we are using a mutable variable. But drivers can't
   // be reused (i.e. once stopped they can't be started again. Thus,
   // we have to allocate a new driver before each run or after each stop.
@@ -114,7 +118,7 @@ class MarathonSchedulerService @Inject() (
   protected def newTimer() = new Timer("marathonSchedulerTimer")
 
   def deploy(plan: DeploymentPlan, force: Boolean = false): Future[Done] = {
-    log.info(s"Deploy plan with force=$force:\n$plan ")
+    logger.debug(s"Forwarding new deployment plan with planId=${plan.id}, force=$force to the MarathonSchedulerActor")
     val future: Future[Any] = PromiseActor.askWithoutTimeout(system, schedulerActor, Deploy(plan, force))
     future.map {
       case DeploymentStarted(_) => Done
@@ -125,31 +129,25 @@ class MarathonSchedulerService @Inject() (
   def cancelDeployment(plan: DeploymentPlan): Unit =
     schedulerActor ! CancelDeployment(plan)
 
-  def listAppVersions(appId: PathId): Seq[Timestamp] =
+  def listAppVersions(appId: AbsolutePathId): Seq[Timestamp] =
     Await.result(groupManager.appVersions(appId).map(Timestamp(_)).runWith(Sink.seq), config.zkTimeoutDuration)
 
   def listRunningDeployments(): Future[Seq[DeploymentStepInfo]] =
     deploymentManager.list()
 
-  def getApp(appId: PathId, version: Timestamp): Option[AppDefinition] = {
+  def getApp(appId: AbsolutePathId, version: Timestamp): Option[AppDefinition] = {
     Await.result(groupManager.appVersion(appId, version.toOffsetDateTime), config.zkTimeoutDuration)
-  }
-
-  def killInstances(
-    appId: PathId,
-    instances: Seq[Instance]): Unit = {
-    schedulerActor ! KillTasks(appId, instances)
   }
 
   //Begin Service interface
 
   override def startUp(): Unit = {
-    log.info("Starting up")
+    logger.info("Starting up")
     super.startUp()
   }
 
   override def run(): Unit = {
-    log.info("Beginning run")
+    logger.info("Beginning run")
 
     // The first thing we do is offer our leadership.
     electionService.offerLeadership(this)
@@ -161,106 +159,115 @@ class MarathonSchedulerService @Inject() (
       isRunningLatch.await()
     }
 
-    log.info("Completed run")
+    logger.info("Completed run")
   }
 
-  override def triggerShutdown(): Unit = synchronized {
-    log.info("Shutdown triggered")
+  override def triggerShutdown(): Unit =
+    synchronized {
+      logger.info("Shutdown triggered")
 
-    electionService.abdicateLeadership(reoffer = false)
-    stopDriver()
+      electionService.abdicateLeadership()
+      stopDriver()
 
-    log.info("Cancelling timer")
-    timer.cancel()
+      logger.info("Cancelling timer")
+      timer.cancel()
 
-    // The countdown latch blocks run() from exiting. Counting down the latch removes the block.
-    log.info("Removing the blocking of run()")
-    isRunningLatch.countDown()
+      // The countdown latch blocks run() from exiting. Counting down the latch removes the block.
+      logger.info("Removing the blocking of run()")
+      isRunningLatch.countDown()
 
-    super.triggerShutdown()
-  }
+      super.triggerShutdown()
+    }
 
-  private[this] def stopDriver(): Unit = synchronized {
-    // many are the assumptions concerning when this is invoked. see startLeadership, stopLeadership,
-    // triggerShutdown.
-    log.info("Stopping driver")
+  private[this] def stopDriver(): Unit =
+    synchronized {
+      // many are the assumptions concerning when this is invoked. see startLeadership, stopLeadership,
+      // triggerShutdown.
+      logger.info("Stopping driver")
 
-    // Stopping the driver will cause the driver run() method to return.
-    driver.foreach(_.stop(true)) // failover = true
+      // Stopping the driver will cause the driver run() method to return.
+      driver.foreach(_.stop(true)) // failover = true
 
-    // signals that the driver was stopped manually (as opposed to crashing mid-process)
-    driver = None
-  }
+      // signals that the driver was stopped manually (as opposed to crashing mid-process)
+      driver = None
+    }
 
   //End Service interface
 
   //Begin ElectionCandidate interface
 
-  override def startLeadership(): Unit = synchronized {
-    log.info("As new leader running the driver")
+  override def startLeadership(): Unit =
+    synchronized {
+      logger.info("As new leader running the driver")
 
-    refreshCachesAndDoMigration()
+      // allow interactions with the persistence store
+      persistenceStore.markOpen()
 
-    // run all pre-driver callbacks
-    log.info(s"""Call preDriverStarts callbacks on ${prePostDriverCallbacks.mkString(", ")}""")
-    Await.result(
-      Future.sequence(prePostDriverCallbacks.map(_.preDriverStarts)),
-      config.onElectedPrepareTimeout().millis
-    )
-    log.info("Finished preDriverStarts callbacks")
+      // Before reading to and writing from the storage, let's ensure that
+      // no stale values are read from the persistence store.
+      // Although in case of ZK it is done at the time of creation of CuratorZK,
+      // it is better to be safe than sorry.
+      Await.result(persistenceStore.sync(), Duration.Inf)
 
-    // start all leadership coordination actors
-    Await.result(leadershipCoordinator.prepareForStart(), config.maxActorStartupTime().milliseconds)
+      refreshCachesAndDoMigration()
 
-    // create new driver
-    driver = Some(driverFactory.createDriver())
+      // run all pre-driver callbacks
+      logger.info(s"""Call preDriverStarts callbacks on ${prePostDriverCallbacks.mkString(", ")}""")
+      Await.result(
+        Future.sequence(prePostDriverCallbacks.map(_.preDriverStarts)),
+        config.onElectedPrepareTimeout().millis
+      )
+      logger.info("Finished preDriverStarts callbacks")
 
-    // start timers
-    schedulePeriodicOperations()
+      // start all leadership coordination actors
+      Await.result(leadershipCoordinator.prepareForStart(), config.maxActorStartupTime().milliseconds)
 
-    // The following block asynchronously runs the driver. Note that driver.run()
-    // blocks until the driver has been stopped (or aborted).
-    Future {
-      scala.concurrent.blocking {
-        driver.foreach(_.run())
-      }
-    } onComplete { result =>
-      synchronized {
+      // create new driver
+      driver = Some(driverFactory.createDriver())
 
-        log.info(s"Driver future completed with result=$result.")
-        result match {
-          case Failure(t) => log.error("Exception while running driver", t)
-          case _ =>
+      // start timers
+      schedulePeriodicOperations()
+
+      // We have to start the Heartbeat monitor even before we're successfully registered, since in rare occasions driver
+      // can hang forever trying to connect to Mesos (or doing some other driver work). In this case we also want
+      // to suicide after not receiving any messages for a while.
+      driver.foreach(heartbeatMonitor.activate(_))
+
+      // The following block asynchronously runs the driver. Note that driver.run()
+      // blocks until the driver has been stopped (or aborted).
+      Future {
+        scala.concurrent.blocking {
+          driver.foreach(_.run())
         }
+      } onComplete { result =>
+        synchronized {
 
-        // ONLY do this if there's some sort of driver crash: avoid invoking abdication logic if
-        // the driver was stopped via stopDriver. stopDriver only happens when
-        //   1. we're being terminated (and have already abdicated)
-        //   2. we've lost leadership (no need to abdicate if we've already lost)
-        driver.foreach { _ =>
-          // tell leader election that we step back, but want to be re-elected if isRunning is true.
-          electionService.abdicateLeadership(error = result.isFailure, reoffer = isRunningLatch.getCount > 0)
+          logger.info(s"Driver future completed with result=$result.")
+          result match {
+            case Failure(t) => logger.error("Exception while running driver", t)
+            case _ =>
+          }
+
+          // ONLY do this if there's some sort of driver crash: avoid invoking abdication logic if
+          // the driver was stopped via stopDriver. stopDriver only happens when
+          //   1. we're being terminated (and have already abdicated)
+          //   2. we've lost leadership (no need to abdicate if we've already lost)
+          driver.foreach { _ =>
+            electionService.abdicateLeadership()
+          }
+
+          driver = None
+
+          logger.info(s"Call postDriverRuns callbacks on ${prePostDriverCallbacks.mkString(", ")}")
+          Await.result(Future.sequence(prePostDriverCallbacks.map(_.postDriverTerminates)), config.zkTimeoutDuration)
+          logger.info("Finished postDriverRuns callbacks")
         }
-
-        driver = None
-
-        log.info(s"Call postDriverRuns callbacks on ${prePostDriverCallbacks.mkString(", ")}")
-        Await.result(Future.sequence(prePostDriverCallbacks.map(_.postDriverTerminates)), config.zkTimeoutDuration)
-        log.info("Finished postDriverRuns callbacks")
       }
     }
-  }
 
   private def refreshCachesAndDoMigration(): Unit = {
-    // GroupManager and GroupRepository are holding in memory caches of the root group. The cache is loaded when it is accessed the first time.
-    // Actually this is really bad, because each marathon will log the amount of groups during startup through Kamon.
-    // Therefore the root group state is loaded from zk when the marathon instance is started.
-    // When the marathon instance is elected as leader, this cache is still in the same state as the time marathon started.
-    // Therefore we need to re-load the root group from zk again from zookeeper when becoming leader.
-    // The same is true after doing the migration. A migration or a restore also affects the state of zookeeper, but does not
-    // update the internal hold caches. Therefore we need to refresh the internally loaded caches after the migration.
-    // Actually we need to do the fresh twice, before the migration, to perform the migration on the current zk state and after
-    // the migration to have marathon loaded the current valid state to the internal caches.
+    // We might not need to invalidate the group cache before migration, but it doesn't hurt. After migration we
+    // certainly want to make sure the migrated state is reloaded
 
     // refresh group repository cache
     Await.result(groupManager.invalidateGroupCache(), Duration.Inf)
@@ -269,55 +276,57 @@ class MarathonSchedulerService @Inject() (
     migration.migrate()
 
     // refresh group repository again - migration or restore might changed zk state, this needs to be re-loaded
-    Await.result(groupManager.invalidateGroupCache(), Duration.Inf)
+    Await.result(groupManager.invalidateAndRefreshGroupCache(), Duration.Inf)
   }
 
-  override def stopLeadership(): Unit = synchronized {
-    // invoked by election service upon loss of leadership (state transitioned to Idle)
-    log.info("Lost leadership")
+  override def stopLeadership(): Unit =
+    synchronized {
+      // invoked by election service upon loss of leadership (state transitioned to Idle)
+      logger.info("Lost leadership")
 
-    leadershipCoordinator.stop()
+      // disallow any interaction with the persistence storage
+      persistenceStore.markClosed()
 
-    val oldTimer = timer
-    timer = newTimer()
-    oldTimer.cancel()
+      leadershipCoordinator.stop()
 
-    driver.foreach { driverInstance =>
-      mesosHeartbeatActor ! Heartbeat.MessageDeactivate(MesosHeartbeatMonitor.sessionOf(driverInstance))
-      // Our leadership has been defeated. Thus, stop the driver.
-      stopDriver()
+      val oldTimer = timer
+      timer = newTimer()
+      oldTimer.cancel()
+
+      driver.foreach { driverInstance =>
+        heartbeatMonitor.deactivate(driverInstance)
+        // Our leadership has been defeated. Thus, stop the driver.
+        stopDriver()
+      }
     }
-
-    log.error("Terminating after loss of leadership")
-    Runtime.getRuntime.asyncExit()
-  }
 
   //End ElectionDelegate interface
 
-  private def schedulePeriodicOperations(): Unit = synchronized {
-    timer.schedule(
-      new TimerTask {
-        def run(): Unit = {
-          if (electionService.isLeader) {
-            schedulerActor ! ScaleRunSpecs
-          } else log.info("Not leader therefore not scaling apps")
-        }
-      },
-      scaleAppsInitialDelay.toMillis,
-      scaleAppsInterval.toMillis
-    )
+  private def schedulePeriodicOperations(): Unit =
+    synchronized {
+      timer.schedule(
+        new TimerTask {
+          def run(): Unit = {
+            if (electionService.isLeader) {
+              schedulerActor ! ScaleRunSpecs
+            } else logger.info("Not leader therefore not scaling apps")
+          }
+        },
+        scaleAppsInitialDelay.toMillis,
+        scaleAppsInterval.toMillis
+      )
 
-    timer.schedule(
-      new TimerTask {
-        def run(): Unit = {
-          if (electionService.isLeader) {
-            schedulerActor ! ReconcileTasks
-            schedulerActor ! ReconcileHealthChecks
-          } else log.info("Not leader therefore not reconciling tasks")
-        }
-      },
-      reconciliationInitialDelay.toMillis,
-      reconciliationInterval.toMillis
-    )
-  }
+      timer.schedule(
+        new TimerTask {
+          def run(): Unit = {
+            if (electionService.isLeader) {
+              schedulerActor ! ReconcileTasks
+              schedulerActor ! ReconcileHealthChecks
+            } else logger.info("Not leader therefore not reconciling tasks")
+          }
+        },
+        reconciliationInitialDelay.toMillis,
+        reconciliationInterval.toMillis
+      )
+    }
 }

@@ -1,26 +1,52 @@
 package mesosphere.marathon
 package api
 
+import akka.actor.ActorSystem
+import akka.stream.ActorMaterializer
 import java.util.concurrent.atomic.AtomicInteger
-import javax.inject.Provider
 
+import javax.inject.Provider
 import akka.event.EventStream
-import mesosphere.AkkaUnitTestLike
 import mesosphere.marathon.core.group.GroupManagerModule
+import mesosphere.marathon.core.storage.store.impl.memory.InMemoryPersistenceStore
+import mesosphere.marathon.metrics.dummy.DummyMetrics
 import mesosphere.marathon.state.RootGroup
-import mesosphere.marathon.storage.repository.GroupRepository
+import mesosphere.marathon.state.RootGroup.NewGroupStrategy
+import mesosphere.marathon.storage.repository.{AppRepository, GroupRepository, InstanceRepository, PodRepository}
 import mesosphere.marathon.test.Mockito
 
-import scala.concurrent.Future
-import mesosphere.marathon.core.async.ExecutionContexts
-import mesosphere.AkkaUnitTestLike
+import scala.concurrent.{ExecutionContext, Future}
 
-class TestGroupManagerFixture(initialRoot: RootGroup = RootGroup.empty) extends Mockito with AkkaUnitTestLike {
+class TestGroupManagerFixture(
+    initialRoot: RootGroup = RootGroup.empty(),
+    authenticated: Boolean = true,
+    authorized: Boolean = true,
+    authFn: Any => Boolean = _ => true,
+    val config: AllConf = AllConf.withTestConfig("--zk_timeout", "3000")
+)(implicit as: ActorSystem, ec: ExecutionContext)
+    extends Mockito {
+  implicit val mat = ActorMaterializer()
   val service = mock[MarathonSchedulerService]
-  val groupRepository = mock[GroupRepository]
+  val metrics = DummyMetrics
+  val store = new InMemoryPersistenceStore(metrics)
+  store.markOpen()
+
+  val maxVersionsCacheSize = 1000
+
+  val appRepository = AppRepository.inMemRepository(store)
+  val podRepository = PodRepository.inMemRepository(store)
+  val groupRepository =
+    GroupRepository.inMemRepository(store, appRepository, podRepository, maxVersionsCacheSize, initialRoot.newGroupStrategy)
+  val instanceRepository = InstanceRepository.inMemRepository(store)
+  groupRepository.storeRoot(initialRoot, Nil, Nil, Nil, Nil)
   val eventBus = mock[EventStream]
 
-  val config = AllConf.withTestConfig("--zk_timeout", "3000")
+  val authFixture = new TestAuthFixture()
+  authFixture.authenticated = authenticated
+  authFixture.authorized = authorized
+  authFixture.authFn = authFn
+
+  implicit val authenticator = authFixture.auth
 
   val actorId = new AtomicInteger(0)
 
@@ -28,12 +54,14 @@ class TestGroupManagerFixture(initialRoot: RootGroup = RootGroup.empty) extends 
     override def get() = service
   }
 
-  groupRepository.root() returns Future.successful(initialRoot)
+  schedulerProvider.get().listRunningDeployments() returns Future.successful(Seq.empty)
 
-  private[this] val groupManagerModule = new GroupManagerModule(
-    config = config,
-    scheduler = schedulerProvider,
-    groupRepo = groupRepository)(ExecutionContexts.global, eventBus)
+  private[this] val groupManagerModule =
+    new GroupManagerModule(metrics = metrics, config = config, scheduler = schedulerProvider, groupRepo = groupRepository)(
+      ExecutionContext.Implicits.global,
+      eventBus,
+      authenticator
+    )
 
   val groupManager = groupManagerModule.groupManager
 }

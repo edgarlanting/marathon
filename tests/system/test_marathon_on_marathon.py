@@ -4,58 +4,77 @@
     In addition it contains tests which are specific to MoM environments only.
 """
 
-import pytest
+import apps
 import common
+import pytest
+import retrying
+import scripts
 import shakedown
+import time
+import logging
 
 from datetime import timedelta
-# this is intentional import *
-# it imports all the common test_ methods which are to be tested on root and mom
-from marathon_common_tests import *
-from utils import fixture_dir, get_resource
 
-pytestmark = [pytest.mark.usefixtures('marathon_service_name')]
+import shakedown.dcos.service
+from shakedown.clients import mesos
+from shakedown.dcos.agent import restart_agent
+from shakedown.dcos.command import run_command_on_master
+from shakedown.dcos.marathon import deployment_wait, marathon_on_marathon
+from shakedown.dcos.package import uninstall_package_and_wait
+from shakedown.dcos.service import wait_for_service_endpoint
+from shakedown.dcos.task import wait_for_task
+from shakedown.dcos.zookeeper import delete_zk_node
+
+# the following lines essentially do:
+#     from marathon_common_tests import test_*
+import marathon_common_tests
+for attribute in dir(marathon_common_tests):
+    if attribute.startswith('test_'):
+        exec("from marathon_common_tests import {}".format(attribute))
+
+from shakedown.dcos.agent import required_private_agents # NOQA
+from fixtures import wait_for_marathon_user_and_cleanup # NOQA
+
+
+logger = logging.getLogger(__name__)
+
+pytestmark = [pytest.mark.usefixtures('wait_for_marathon_user_and_cleanup')]
 
 
 @pytest.fixture(scope="function")
 def marathon_service_name():
-
-    shakedown.wait_for_service_endpoint('marathon-user', timedelta(minutes=5).total_seconds())
-    with shakedown.marathon_on_marathon():
-        yield 'marathon-user'
-        shakedown.wait_for_service_endpoint('marathon-user', timedelta(minutes=5).total_seconds())
-        clear_marathon()
+    return "marathon-user"
 
 
 def setup_module(module):
     common.ensure_mom()
-    shakedown.wait_for_service_endpoint('marathon-user', timedelta(minutes=5).total_seconds())
     common.cluster_info()
-    with shakedown.marathon_on_marathon():
-        clear_marathon()
+    with marathon_on_marathon() as client:
+        common.clean_up_marathon(client=client)
 
 
 def teardown_module(module):
-    with shakedown.marathon_on_marathon():
+    with marathon_on_marathon() as client:
         try:
-            clear_marathon()
-        except:
+            common.clean_up_marathon(client=client)
+        except Exception:
             pass
-    # Uninstall MoM
-    shakedown.uninstall_package_and_wait('marathon')
-    shakedown.delete_zk_node('universe/marathon-user')
+
+    uninstall_package_and_wait('marathon')
+    delete_zk_node('universe/marathon-user')
+
     # Remove everything from root marathon
-    clear_marathon()
+    common.clean_up_marathon()
 
 
-###########
+#################################################
 # MoM only tests
-###########
+#################################################
 
 
 def test_ui_registration_requirement():
     """ Testing the UI is a challenge with this toolchain.  The UI team has the
-        best tooling for testing it.   This test verifies that the required configurations
+        best tooling for testing it.  This test verifies that the required configurations
         for the service endpoint and ability to launch to the service UI are present.
     """
     tasks = mesos.get_master().tasks()
@@ -64,76 +83,78 @@ def test_ui_registration_requirement():
             for label in task['labels']:
                 if label['key'] == 'DCOS_PACKAGE_NAME':
                     assert label['value'] == 'marathon'
-                if label['key'] == 'DCOS_PACKAGE_IS_FRAMEWORK':
-                    assert label['value'] == 'true'
                 if label['key'] == 'DCOS_SERVICE_NAME':
                     assert label['value'] == 'marathon-user'
 
 
-
-@private_agents(2)
+@shakedown.dcos.agent.private_agents(2)
 def test_mom_when_mom_agent_bounced():
-    """ Launch an app from MoM and restart the node MoM is on.
-    """
-    app_def = app('agent-failure')
-    mom_ip = ip_of_mom()
-    host = ip_other_than_mom()
-    pin_to_host(app_def, host)
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
+    """Launch an app from MoM and restart the node MoM is on."""
+
+    app_def = apps.sleep_app()
+    app_id = app_def["id"]
+    mom_ip = common.ip_of_mom()
+    host = common.ip_other_than_mom()
+    common.pin_to_host(app_def, host)
+
+    with marathon_on_marathon() as client:
         client.add_app(app_def)
-        shakedown.deployment_wait()
-        tasks = client.get_tasks('/agent-failure')
+        deployment_wait(service_id=app_id, client=client)
+        tasks = client.get_tasks(app_id)
         original_task_id = tasks[0]['id']
 
-        shakedown.restart_agent(mom_ip)
+        restart_agent(mom_ip)
 
-        @retrying.retry(wait_fixed=1000, stop_max_delay=3000)
+        @retrying.retry(wait_fixed=1000, stop_max_attempt_number=30, retry_on_exception=common.ignore_exception)
         def check_task_is_back():
-            tasks = client.get_tasks('/agent-failure')
-            tasks[0]['id'] == original_task_id
+            tasks = client.get_tasks(app_id)
+            assert tasks[0]['id'] == original_task_id, "The task ID has changed"
+
+        check_task_is_back()
 
 
-@private_agents(2)
+@shakedown.dcos.agent.private_agents(2)
 def test_mom_when_mom_process_killed():
-    """ Launched a task from MoM then killed MoM.
-    """
-    app_def = app('agent-failure')
-    host = ip_other_than_mom()
-    pin_to_host(app_def, host)
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
+    """Launched a task from MoM then killed MoM."""
+
+    app_def = apps.sleep_app()
+    app_id = app_def["id"]
+    host = common.ip_other_than_mom()
+    common.pin_to_host(app_def, host)
+
+    with marathon_on_marathon() as client:
         client.add_app(app_def)
-        shakedown.deployment_wait()
-        tasks = client.get_tasks('/agent-failure')
+        deployment_wait(service_id=app_id, client=client)
+        tasks = client.get_tasks(app_id)
         original_task_id = tasks[0]['id']
 
-        shakedown.kill_process_on_host(ip_of_mom(), 'marathon-assembly')
-        shakedown.wait_for_task('marathon', 'marathon-user', 300)
-        shakedown.wait_for_service_endpoint('marathon-user')
+        common.kill_process_on_host(common.ip_of_mom(), 'marathon-assembly')
+        wait_for_task('marathon', 'marathon-user', 300)
+        wait_for_service_endpoint('marathon-user', path="ping")
 
-        tasks = client.get_tasks('/agent-failure')
-        tasks[0]['id'] == original_task_id
+        @retrying.retry(wait_fixed=1000, stop_max_attempt_number=30, retry_on_exception=common.ignore_exception)
+        def check_task_is_back():
+            tasks = client.get_tasks(app_id)
+            assert tasks[0]['id'] == original_task_id, "The task ID has changed"
+
+        check_task_is_back()
 
 
-@private_agents(2)
+@shakedown.dcos.agent.private_agents(2)
 def test_mom_with_network_failure():
-    """Marathon on Marathon (MoM) tests for DC/OS with network failures
-    simulated by knocking out ports
-    """
+    """Marathon on Marathon (MoM) tests for DC/OS with network failures simulated by knocking out ports."""
 
-    # get MoM ip
-    mom_ip = ip_of_mom()
-    print("MoM IP: {}".format(mom_ip))
+    mom_ip = common.ip_of_mom()
+    logger.info("MoM IP: {}".format(mom_ip))
 
-    app_def = get_resource("{}/large-sleep.json".format(fixture_dir()))
+    app_def = apps.sleep_app()
+    app_id = app_def["id"]
 
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
+    with marathon_on_marathon() as client:
         client.add_app(app_def)
-        shakedown.wait_for_task("marathon-user", "sleep")
-        tasks = client.get_tasks('sleep')
-        original_sleep_task_id = tasks[0]["id"]
+        wait_for_task("marathon-user", app_id.lstrip('/'))
+        tasks = client.get_tasks(app_id)
+        original_task_id = tasks[0]["id"]
         task_ip = tasks[0]['host']
 
     # PR for network partitioning in shakedown makes this better
@@ -149,39 +170,39 @@ def test_mom_with_network_failure():
     reconnect_agent(task_ip)
 
     time.sleep(timedelta(minutes=1).total_seconds())
-    shakedown.wait_for_service_endpoint('marathon-user', timedelta(minutes=5).total_seconds())
-    shakedown.wait_for_task("marathon-user", "sleep")
+    wait_for_service_endpoint('marathon-user', timedelta(minutes=5).total_seconds(), path="ping")
+    wait_for_task("marathon-user", app_id.lstrip('/'))
 
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
-        shakedown.wait_for_task("marathon-user", "sleep")
-        tasks = client.get_tasks('sleep')
-        current_sleep_task_id = tasks[0]["id"]
+    with marathon_on_marathon() as client:
+        wait_for_task("marathon-user", app_id.lstrip('/'))
 
-    assert current_sleep_task_id == original_sleep_task_id, "Task ID shouldn't change"
+        @retrying.retry(wait_fixed=1000, stop_max_attempt_number=30, retry_on_exception=common.ignore_exception)
+        def check_task_is_back():
+            tasks = client.get_tasks(app_id)
+            assert tasks[0]['id'] == original_task_id, "The task ID has changed"
+
+        check_task_is_back()
 
 
-@dcos_1_9
-@private_agents(2)
+@shakedown.dcos.cluster.dcos_1_9
+@shakedown.dcos.agent.private_agents(2)
 def test_mom_with_network_failure_bounce_master():
-    """Marathon on Marathon (MoM) tests for DC/OS with network failures simulated by
-    knocking out ports
-    """
+    """Marathon on Marathon (MoM) tests for DC/OS with network failures simulated by knocking out ports."""
 
     # get MoM ip
-    mom_ip = ip_of_mom()
-    print("MoM IP: {}".format(mom_ip))
+    mom_ip = common.ip_of_mom()
+    logger.info("MoM IP: {}".format(mom_ip))
 
-    app_def = get_resource("{}/large-sleep.json".format(fixture_dir()))
+    app_def = apps.sleep_app()
+    app_id = app_def["id"]
 
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
+    with marathon_on_marathon() as client:
         client.add_app(app_def)
-        shakedown.wait_for_task("marathon-user", "sleep")
-        tasks = client.get_tasks('sleep')
-        original_sleep_task_id = tasks[0]["id"]
+        wait_for_task("marathon-user", app_id.lstrip('/'))
+        tasks = client.get_tasks(app_id)
+        original_task_id = tasks[0]["id"]
         task_ip = tasks[0]['host']
-        print("\nTask IP: " + task_ip)
+        logger.info("\nTask IP: " + task_ip)
 
     # PR for network partitioning in shakedown makes this better
     # take out the net
@@ -192,57 +213,54 @@ def test_mom_with_network_failure_bounce_master():
     time.sleep(timedelta(minutes=1).total_seconds())
 
     # bounce master
-    shakedown.run_command_on_master("sudo systemctl restart dcos-mesos-master")
+    run_command_on_master("sudo systemctl restart dcos-mesos-master")
 
     # bring the net up
     reconnect_agent(mom_ip)
     reconnect_agent(task_ip)
 
     time.sleep(timedelta(minutes=1).total_seconds())
-    shakedown.wait_for_service_endpoint('marathon-user', timedelta(minutes=10).total_seconds())
+    wait_for_service_endpoint('marathon-user', timedelta(minutes=10).total_seconds(), path="ping")
 
-    with shakedown.marathon_on_marathon():
-        client = marathon.create_client()
-        shakedown.wait_for_task("marathon-user", "sleep", timedelta(minutes=10).total_seconds())
-        tasks = client.get_tasks('sleep')
-        current_sleep_task_id = tasks[0]["id"]
+    with marathon_on_marathon() as client:
+        wait_for_task("marathon-user", app_id.lstrip('/'), timedelta(minutes=10).total_seconds())
 
-    assert current_sleep_task_id == original_sleep_task_id, "Task ID shouldn't change"
+        @retrying.retry(wait_fixed=1000, stop_max_attempt_number=30, retry_on_exception=common.ignore_exception)
+        def check_task_is_back():
+            tasks = client.get_tasks(app_id)
+            assert tasks[0]['id'] == original_task_id, "The task ID has changed"
+
+        check_task_is_back()
 
 
 def test_framework_unavailable_on_mom():
-    """ Launches an app that has elements necessary to create a service endpoint in DCOS.
-        This test confirms that the endpoint is not created when launched with MoM.
+    """Launches an app that has elements necessary to create a service endpoint in DCOS.
+       This test confirms that the endpoint is not created when launched with MoM.
     """
-    if shakedown.service_available_predicate('pyfw'):
-        client = marathon.create_client()
-        client.remove_app('python-http', True)
-        shakedown.deployment_wait()
-        shakedown.wait_for_service_endpoint_removal('pyfw')
 
-    with shakedown.marathon_on_marathon():
-        delete_all_apps_wait()
-        client = marathon.create_client()
-        client.add_app(common.fake_framework_app())
-        shakedown.deployment_wait()
+    app_def = apps.fake_framework()
+    app_id = app_def["id"]
 
+    with marathon_on_marathon() as client:
+        client.add_app(app_def)
+        deployment_wait(service_id=app_id, client=client)
     try:
-        shakedown.wait_for_service_endpoint('pyfw', 15)
-        assert False, 'MoM shoud NOT create a service endpoint'
-    except:
-        assert True
+        wait_for_service_endpoint('pyfw', 15)
+    except Exception:
         pass
+    else:
+        assert False, 'MoM shoud NOT create a service endpoint'
 
 
 def partition_agent(hostname):
     """Partition a node from all network traffic except for SSH and loopback"""
 
-    shakedown.copy_file_to_agent(hostname, "{}/net-services-agent.sh".format(fixture_dir()))
-    print("partitioning {}".format(hostname))
-    shakedown.run_command_on_agent(hostname, 'sh net-services-agent.sh fail')
+    shakedown.dcos.file.copy_file_to_agent(hostname, "{}/net-services-agent.sh".format(scripts.scripts_dir()))
+    logger.info("partitioning {}".format(hostname))
+    shakedown.dcos.command.run_command_on_agent(hostname, 'sh net-services-agent.sh fail')
 
 
 def reconnect_agent(hostname):
     """Reconnect a node to cluster"""
 
-    shakedown.run_command_on_agent(hostname, 'sh net-services-agent.sh')
+    shakedown.dcos.command.run_command_on_agent(hostname, 'sh net-services-agent.sh')

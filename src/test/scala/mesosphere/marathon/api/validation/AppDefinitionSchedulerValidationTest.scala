@@ -2,26 +2,27 @@ package mesosphere.marathon
 package api.validation
 
 import mesosphere.UnitTest
+import mesosphere.marathon.api.v2.ValidationHelper
 import mesosphere.marathon.core.plugin.PluginManager
 import mesosphere.marathon.raml.Apps
 import mesosphere.marathon.state._
 
 class AppDefinitionSchedulerValidationTest extends UnitTest {
 
-  private lazy val validAppDefinition = AppDefinition.validAppDefinition(Set())(PluginManager.None)
+  private lazy val validAppDefinition = AppDefinition.validAppDefinition(Set(), ValidationHelper.roleSettings())(PluginManager.None)
 
   class Fixture {
-    def normalApp = AppDefinition(
-      id = PathId("/test"),
-      cmd = Some("sleep 1000"))
+    def normalApp = AppDefinition(id = AbsolutePathId("/test"), role = "*", cmd = Some("sleep 1000"))
 
     def schedulerAppWithApi(
-      frameworkName: String = "Framework-42",
-      migrationApiVersion: String = "v1",
-      migrationApiPath: String = "/v1/plan"): AppDefinition = {
+        frameworkName: String = "Framework-42",
+        migrationApiVersion: String = "v1",
+        migrationApiPath: String = "/v1/plan"
+    ): AppDefinition = {
 
       AppDefinition(
-        id = PathId("/test"),
+        id = AbsolutePathId("/test"),
+        role = "*",
         cmd = Some("sleep 1000"),
         instances = 1,
         upgradeStrategy = UpgradeStrategy(0, 0),
@@ -52,23 +53,29 @@ class AppDefinitionSchedulerValidationTest extends UnitTest {
       )
 
       When("the Migration API version is added")
-      val step1 = normalApp.copy(labels = normalApp.labels + (
-        Apps.LabelDcosMigrationApiVersion -> "v1"
-      ))
+      val step1 = normalApp.copy(labels =
+        normalApp.labels + (
+          Apps.LabelDcosMigrationApiVersion -> "v1"
+        )
+      )
       Then("the app is not valid")
       validAppDefinition(step1).isSuccess shouldBe false
 
       When("the framework label is added")
-      val step2 = normalApp.copy(labels = step1.labels + (
-        Apps.LabelDcosPackageFrameworkName -> "Framework-42"
-      ))
+      val step2 = normalApp.copy(labels =
+        step1.labels + (
+          Apps.LabelDcosPackageFrameworkName -> "Framework-42"
+        )
+      )
       Then("the app is not valid")
       validAppDefinition(step2).isSuccess shouldBe false
 
       When("the Migration API path is added")
-      val step3 = normalApp.copy(labels = step2.labels + (
-        Apps.LabelDcosMigrationApiPath -> "/v1/plan"
-      ))
+      val step3 = normalApp.copy(labels =
+        step2.labels + (
+          Apps.LabelDcosMigrationApiPath -> "/v1/plan"
+        )
+      )
       Then("the app is valid")
       validAppDefinition(step3).isSuccess shouldBe true
     }

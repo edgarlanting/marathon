@@ -2,40 +2,36 @@ package mesosphere.marathon
 package core.group
 
 import javax.inject.Provider
-
 import akka.event.EventStream
-import kamon.Kamon
-import kamon.metric.instrument.Time
+import mesosphere.marathon.api.GroupApiService
 import mesosphere.marathon.core.group.impl.GroupManagerImpl
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.metrics.current.UnitOfMeasurement
+import mesosphere.marathon.plugin.auth.Authorizer
 import mesosphere.marathon.storage.repository.GroupRepository
 
-import scala.concurrent.{ Await, ExecutionContext }
+import scala.concurrent.ExecutionContext
 
 /**
   * Provides a [[GroupManager]] implementation.
   */
-class GroupManagerModule(
-    config: GroupManagerConfig,
-    scheduler: Provider[DeploymentService],
-    groupRepo: GroupRepository)(implicit ctx: ExecutionContext, eventStream: EventStream) {
+class GroupManagerModule(metrics: Metrics, config: MarathonConf, scheduler: Provider[DeploymentService], groupRepo: GroupRepository)(
+    implicit
+    ctx: ExecutionContext,
+    eventStream: EventStream,
+    authorizer: Authorizer
+) {
 
   val groupManager: GroupManager = {
-    val groupManager = new GroupManagerImpl(config, Await.result(groupRepo.root(), config.zkTimeoutDuration), groupRepo, scheduler)
-
-    // We've already released metrics using these names, so we can't use the Metrics.* methods
-    Kamon.metrics.gauge("service.mesosphere.marathon.app.count")(
-      groupManager.rootGroup().transitiveApps.size.toLong
-    )
-
-    Kamon.metrics.gauge("service.mesosphere.marathon.group.count")(
-      groupManager.rootGroup().transitiveGroupsById.size.toLong
-    )
+    val groupManager = new GroupManagerImpl(metrics, config, None, groupRepo, scheduler)
 
     val startedAt = System.currentTimeMillis()
-    Kamon.metrics.gauge("service.mesosphere.marathon.uptime", Time.Milliseconds)(
-      System.currentTimeMillis() - startedAt
-    )
+    metrics.closureGauge("uptime", () => (System.currentTimeMillis() - startedAt).toDouble / 1000.0, unit = UnitOfMeasurement.Time)
 
     groupManager
+  }
+
+  val groupService: GroupApiService = {
+    new GroupApiService(groupManager)
   }
 }

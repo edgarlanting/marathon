@@ -1,19 +1,19 @@
 package mesosphere.marathon
 package api
 
-import java.io.IOException
-import java.net.{ HttpURLConnection, URL }
+import java.net.URL
 import javax.servlet.FilterChain
-import javax.servlet.http.{ HttpServletRequest, HttpServletResponse }
+import javax.servlet.http.{HttpServletRequest, HttpServletResponse}
 
-import mesosphere.UnitTest
-import mesosphere.chaos.http.HttpConf
+import mesosphere.AkkaUnitTest
+import mesosphere.marathon.HttpConf
+import mesosphere.marathon.api.forwarder.RequestForwarder
 import mesosphere.marathon.core.election.ElectionService
 import akka.http.scaladsl.model.StatusCodes._
 import org.mockito.Mockito._
 import org.rogach.scallop.ScallopConf
 
-class LeaderProxyFilterTest extends UnitTest {
+class LeaderProxyFilterTest extends AkkaUnitTest {
 
   def httpConf(args: String*): HttpConf = {
     new ScallopConf(args) with HttpConf {
@@ -24,13 +24,19 @@ class LeaderProxyFilterTest extends UnitTest {
   }
 
   case class Fixture(
-      conf: HttpConf = httpConf(),
+      disableHttp: Boolean = false,
       electionService: ElectionService = mock[ElectionService]("electionService"),
       forwarder: RequestForwarder = mock[RequestForwarder]("forwarder"),
       request: HttpServletRequest = mock[HttpServletRequest]("request"),
       response: HttpServletResponse = mock[HttpServletResponse]("response"),
-      chain: FilterChain = mock[FilterChain]("chain")) {
-    val filter = new LeaderProxyFilter(conf, electionService, "host:10000", forwarder) {
+      chain: FilterChain = mock[FilterChain]("chain")
+  ) {
+    val filter = new LeaderProxyFilter(
+      disableHttp = disableHttp,
+      electionService = electionService,
+      myHostPort = "host:10000",
+      forwarder = forwarder
+    ) {
       override def sleep() = {}
     }
 
@@ -47,6 +53,9 @@ class LeaderProxyFilterTest extends UnitTest {
 
       // we pass that request down the chain
       verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_MARATHON_LEADER, "http://host:10000")
+      verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_FRAME_OPTIONS, LeaderProxyFilter.VALUE_FRAME_OPTIONS)
+      verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_XXS_PROTECTION, LeaderProxyFilter.VALUE_XXS_PROTECTION)
+
       verify(electionService, times(1)).isLeader
       verify(chain, times(1)).doFilter(request, response)
       verifyClean()
@@ -64,7 +73,7 @@ class LeaderProxyFilterTest extends UnitTest {
       verify(electionService, times(12)).isLeader
       verify(electionService, times(12)).leaderHostPort
       verify(response, times(1))
-        .sendError(ServiceUnavailable.intValue, LeaderProxyFilter.ERROR_STATUS_NO_CURRENT_LEADER)
+        .sendError(BadGateway.intValue, LeaderProxyFilter.ERROR_STATUS_NO_CURRENT_LEADER)
       verifyClean()
     }
 
@@ -106,7 +115,7 @@ class LeaderProxyFilterTest extends UnitTest {
       verifyClean()
     }
 
-    "use https if http is disabled" in new Fixture(conf = httpConf("--disable_http")) {
+    "use https if http is disabled" in new Fixture(disableHttp = true) {
       when(electionService.isLeader).thenReturn(false)
       when(electionService.leaderHostPort).thenReturn(Some("otherhost:9999"))
       when(request.getRequestURI).thenReturn("/test")
@@ -157,6 +166,8 @@ class LeaderProxyFilterTest extends UnitTest {
       verify(electionService, times(4)).isLeader
       verify(electionService, times(3)).leaderHostPort
       verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_MARATHON_LEADER, "http://host:10000")
+      verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_FRAME_OPTIONS, LeaderProxyFilter.VALUE_FRAME_OPTIONS)
+      verify(response, times(1)).addHeader(LeaderProxyFilter.HEADER_XXS_PROTECTION, LeaderProxyFilter.VALUE_XXS_PROTECTION)
       verify(chain, times(1)).doFilter(request, response)
       verifyClean()
     }
@@ -175,27 +186,7 @@ class LeaderProxyFilterTest extends UnitTest {
       verify(electionService, times(12)).isLeader
       verify(electionService, times(12)).leaderHostPort
       verify(response, times(1))
-        .sendError(ServiceUnavailable.intValue, LeaderProxyFilter.ERROR_STATUS_NO_CURRENT_LEADER)
-      verifyClean()
-    }
-
-    "bad proxy connection, drops partially complete response after status code has already been sent" in new Fixture {
-      val urlConnection = mock[HttpURLConnection]
-
-      when(urlConnection.getResponseCode).thenReturn(200)
-
-      JavaUrlConnectionRequestForwarder.copyConnectionResponse(response)(
-        () => {
-          response.setStatus(200)
-          scala.util.Failure(new IOException("foo"))
-        },
-        () => {}
-      )
-
-      verify(response, times(1)).setStatus(200)
-      verify(response, times(1))
-        .sendError(BadGateway.intValue, JavaUrlConnectionRequestForwarder.ERROR_STATUS_BAD_CONNECTION)
-      verifyNoMoreInteractions(response)
+        .sendError(BadGateway.intValue, LeaderProxyFilter.ERROR_STATUS_NO_CURRENT_LEADER)
       verifyClean()
     }
   }

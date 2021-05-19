@@ -1,11 +1,9 @@
 package mesosphere.marathon
 package state
 
-import org.apache.mesos.{ Protos => mesos }
+import org.apache.mesos.{Protos => mesos}
 
-case class Parameter(
-    key: String,
-    value: String) {
+case class Parameter(key: String, value: String) {
 
   def toProto: mesos.Parameter =
     mesos.Parameter.newBuilder
@@ -21,4 +19,3 @@ object Parameter {
       proto.getValue
     )
 }
-

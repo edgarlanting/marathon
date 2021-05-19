@@ -15,7 +15,7 @@ Marathon enables users to launch containers with container images using two diff
 
 # Universal Container Runtime
 
-The [Universal Container Runtime](http://mesos.apache.org/documentation/latest/container-image) (UCR) extends the Mesos containerizer to support provisioning [Docker](https://docker.com/) container images ([AppC](https://github.com/appc/spec) coming soon). This means that you can use both the Mesos containerizer and other container image types. You can still use the Docker container runtime directly ([instructions are below](#docker-containerizer)), but the Universal Container Runtime supports running Docker images without depending on the Docker Engine, which allows for better integration with Mesos.
+The [Universal Container Runtime](http://mesos.apache.org/documentation/latest/container-image) (UCR) extends the Mesos containerizer to support provisioning [Docker](https://docker.com/) container images. This means that you can use both the Mesos containerizer and other container image types. You can still use the Docker container runtime directly ([instructions are below](#docker-containerizer)), but the Universal Container Runtime supports running Docker images without depending on the Docker Engine, which allows for better integration with Mesos.
 
 The following Marathon features _only_ work with the UCR:
 
@@ -27,7 +27,7 @@ The following Marathon features _only_ work with the UCR:
 
 To provision containers with the UCR, specify the container type `MESOS` and a the appropriate object in your application definition. Here, we specify a Docker container with the `docker` object.
 
-The UCR containerizer provides a `pullConfig` parameter with a `secret` field for [authentication with a private Docker registry]({{ site.baseurl }}/docs/native-docker-private-registry.html). 
+The UCR containerizer provides a `pullConfig` parameter with a `secret` field for [authentication with a private Docker registry]({{ site.baseurl }}/docs/native-docker-private-registry.html).
 
 `credential`, with a `principal` and an optional `secret` field to authenticate when downloading the Docker image.
 
@@ -59,7 +59,7 @@ The UCR containerizer provides a `pullConfig` parameter with a `secret` field fo
 **Important:** If you leave the `args` field empty, the default entry point will be the launch command for the container. If your container does not have a default entry point, you must specify a command in the `args` field. If you do not, your app will fail to deploy.
 
 ## UCR Limitations
-- The UCR does not support the following: runtime privileges, Docker options, force pull, named ports, numbered ports, bridge networking, port mapping.
+- The UCR does not support the following: runtime privileges, Docker options.
 
 <a name="docker-containerizer"></a>
 
@@ -268,7 +268,7 @@ the following Dockerfile with an `ENTRYPOINT` defined:
 
 ```bash
 FROM busybox
-MAINTAINER support@mesosphere.io
+LABEL maintainer="support@mesosphere.io"
 
 CMD ["inky"]
 ENTRYPOINT ["echo"]
@@ -341,5 +341,4 @@ the future, as Mesos may not always interact with Docker via the CLI.
 # Resources
 
 - [Mesos Docker Containerizer](http://mesos.apache.org/documentation/latest/docker-containerizer)
-- [Supporting Container Images in Mesos Containerizer]
-  (http://mesos.apache.org/documentation/latest/container-image/)
+- [Supporting Container Images in Mesos Containerizer](http://mesos.apache.org/documentation/latest/container-image/)

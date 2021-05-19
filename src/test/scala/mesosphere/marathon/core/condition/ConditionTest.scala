@@ -36,8 +36,8 @@ class ConditionTest extends UnitTest {
       "not be terminal" in { condition.isTerminal should be(false) }
     }
 
-    "created" should {
-      val condition = Condition.Created
+    "provisioned" should {
+      val condition = Condition.Provisioned
       "be active" in { condition.isActive should be(true) }
       "not be terminal" in { condition.isTerminal should be(false) }
     }
@@ -70,6 +70,26 @@ class ConditionTest extends UnitTest {
       val condition = Condition.Dropped
       "not be active" in { condition.isActive should be(false) }
       "be terminal" in { condition.isTerminal should be(true) }
+    }
+  }
+
+  "Condition apply/unapply" should {
+    "round trip all instances" in {
+      Condition.all.foreach { condition =>
+        Condition(Condition.unapply(condition).get) shouldBe condition
+      }
+    }
+  }
+
+  "ConditionFormat" should {
+    import play.api.libs.json._
+    import Condition.conditionFormat
+    "read the legacy format" in {
+      Json.parse("""{"str":"Running"}""").as[Condition] shouldBe Condition.Running
+    }
+
+    "can round trip serialize a condition" in {
+      Json.toJson(Condition.Error: Condition).as[Condition] shouldBe (Condition.Error)
     }
   }
 }

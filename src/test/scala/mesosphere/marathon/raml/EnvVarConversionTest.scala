@@ -2,9 +2,9 @@ package mesosphere.marathon
 package raml
 
 import mesosphere.UnitTest
-import mesosphere.marathon.stream.Implicits._
+import scala.jdk.CollectionConverters._
 import mesosphere.mesos.protos.Implicits._
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 
 class EnvVarConversionTest extends UnitTest {
 
@@ -17,8 +17,9 @@ class EnvVarConversionTest extends UnitTest {
           val sd: Protos.ServiceDefinition = sdf(this)
           val converted = sd.whenOrElse(
             _.hasCmd,
-            s => (s.getCmd.getEnvironment.getVariablesList.to[Seq], s.getEnvVarReferencesList.to[Seq]).toRaml,
-            App.DefaultEnv)
+            s => (s.getCmd.getEnvironment.getVariablesList.asScala.to(Seq), s.getEnvVarReferencesList.asScala.to(Seq)).toRaml,
+            App.DefaultEnv
+          )
           converted should be(expected)
         }
 
@@ -39,7 +40,8 @@ class EnvVarConversionTest extends UnitTest {
   }
 
   class Fixture {
-    val emptyService: Protos.ServiceDefinition = Protos.ServiceDefinition.newBuilder()
+    val emptyService: Protos.ServiceDefinition = Protos.ServiceDefinition
+      .newBuilder()
       .setCmd(Mesos.CommandInfo.newBuilder())
       .setExecutor("//cmd")
       .setId("/foo")
@@ -61,7 +63,8 @@ class EnvVarConversionTest extends UnitTest {
       val builder = sd.toBuilder
       secretRefs.foreach {
         case (envVarName, secretName) =>
-          builder.addEnvVarReferencesBuilder()
+          builder
+            .addEnvVarReferencesBuilder()
             .setType(Protos.EnvVarReference.Type.SECRET)
             .setName(envVarName)
             .setSecretRef(Protos.EnvVarSecretRef.newBuilder().setSecretId(secretName))

@@ -1,20 +1,22 @@
 package mesosphere.marathon
 package core.readiness.impl
 
-import akka.actor.ActorSystem
-import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.headers.`Content-Type`
+import akka.actor.{ActorSystem, Cancellable}
 import akka.http.scaladsl.client.RequestBuilding
-import akka.http.scaladsl.model.{ MediaTypes, StatusCodes, HttpResponse => AkkaHttpResponse }
-import akka.stream.Materializer
+import akka.http.scaladsl.model.headers.`Content-Type`
+import akka.http.scaladsl.model.{MediaTypes, StatusCodes, HttpResponse => AkkaHttpResponse}
+import akka.http.scaladsl.{ConnectionContext, Http}
+import akka.pattern.after
+import akka.stream.scaladsl.{Keep, Source}
+import akka.stream.{KillSwitches, Materializer}
+import com.typesafe.scalalogging.StrictLogging
+import com.mesosphere.usi.async.Timeout
+import mesosphere.marathon.core.health.impl.HealthCheckWorker
 import mesosphere.marathon.core.readiness.ReadinessCheckExecutor.ReadinessCheckSpec
-import mesosphere.marathon.core.readiness.{ HttpResponse, ReadinessCheckExecutor, ReadinessCheckResult }
-import mesosphere.marathon.util.Timeout
-import org.slf4j.LoggerFactory
-import rx.lang.scala.Observable
+import mesosphere.marathon.core.readiness.{HttpResponse, ReadinessCheckExecutor, ReadinessCheckResult}
+import mesosphere.marathon.util.CancellableOnce
 
 import scala.concurrent.Future
-import scala.concurrent.duration.FiniteDuration
 import scala.util.Success
 import scala.util.control.NonFatal
 
@@ -22,37 +24,55 @@ import scala.util.control.NonFatal
   * A Akka-HTTP-based implementation of a ReadinessCheckExecutor.
   */
 private[readiness] class ReadinessCheckExecutorImpl(implicit actorSystem: ActorSystem, materializer: Materializer)
-    extends ReadinessCheckExecutor {
+    extends ReadinessCheckExecutor
+    with StrictLogging {
 
-  import mesosphere.marathon.core.async.ExecutionContexts.global
-  private[this] val log = LoggerFactory.getLogger(getClass)
-  private implicit val scheduler = actorSystem.scheduler
+  import scala.concurrent.ExecutionContext.Implicits.global
+  private[readiness] implicit val scheduler = actorSystem.scheduler
 
-  override def execute(readinessCheckSpec: ReadinessCheckSpec): Observable[ReadinessCheckResult] = {
-    def singleCheck(): Future[ReadinessCheckResult] = executeSingleCheck(readinessCheckSpec)
-
-    intervalObservable(readinessCheckSpec.interval)
-      .scan(singleCheck()) {
-        case (last, next) =>
-          // Serialize readiness check execution and repeat last on ready.
-          // Note that the futures will usually never fail, therefore flatMap is ok.
-          last.flatMap(result => if (result.ready) last else singleCheck())
+  /**
+    * Iterator which lazily invokes an endless series of serial readiness checks, with delay between invocations.
+    *
+    * Once a check returns ready, this result is used forever.
+    *
+    * First check is eager. Next check will not commence until after both 1) first check completes, and 2)
+    * iterator.next() is called
+    */
+  private def serialChecksIterator(spec: ReadinessCheckSpec) =
+    Iterator.iterate(executeSingleCheck(spec)) { result =>
+      result.flatMap { r =>
+        if (r.ready)
+          result
+        else
+          after(spec.interval, scheduler) { executeSingleCheck(spec) }
       }
-      .concatMap(Observable.from(_))
-      .takeUntil(_.ready)
+    }
+
+  /**
+    * Returns an akka stream source that, when materializes, runs readiness checks periodically according to the spec.
+    *
+    * No checks are executed until the source is materialized.
+    *
+    * When the readiness check succeeds, the last element will be the successful result, followed by the source
+    * completing.
+    */
+  override def execute(readinessCheckSpec: ReadinessCheckSpec): Source[ReadinessCheckResult, Cancellable] = {
+    Source
+      .fromIterator(() => serialChecksIterator(readinessCheckSpec))
+      .mapAsync(1)(identity)
+      .takeWhile({ result => !result.ready }, inclusive = true)
+      .viaMat(KillSwitches.single)(Keep.right)
+      .mapMaterializedValue { killSwitch => new CancellableOnce(() => killSwitch.shutdown()) }
   }
 
-  private[impl] def intervalObservable(interval: FiniteDuration): Observable[_] =
-    Observable.interval(interval)
-
   private[impl] def executeSingleCheck(check: ReadinessCheckSpec): Future[ReadinessCheckResult] = {
-    log.info(s"Querying ${check.taskId} readiness check '${check.checkName}' at '${check.url}'")
+    logger.info(s"Querying ${check.taskId} readiness check '${check.checkName}' at '${check.url}'")
 
     akkaHttpGet(check)
       .flatMap(akkaResponseToCheckResponse(_, check))
       .map(ReadinessCheckResult.forSpecAndResponse(check, _))
       .recover(exceptionToErrorResponse(check))
-      .andThen { case Success(result) => log.info(result.summary) }
+      .andThen { case Success(result) => logger.info(result.summary) }
   }
 
   private[impl] def akkaResponseToCheckResponse(akkaResponse: AkkaHttpResponse, check: ReadinessCheckSpec): Future[HttpResponse] = {
@@ -66,8 +86,7 @@ private[readiness] class ReadinessCheckExecutorImpl(implicit actorSystem: ActorS
     }
   }
 
-  private[impl] def exceptionToErrorResponse(
-    check: ReadinessCheckSpec): PartialFunction[Throwable, ReadinessCheckResult] = {
+  private[impl] def exceptionToErrorResponse(check: ReadinessCheckSpec): PartialFunction[Throwable, ReadinessCheckResult] = {
     case NonFatal(e) =>
       val response = HttpResponse(
         status = StatusCodes.GatewayTimeout.intValue,
@@ -79,8 +98,12 @@ private[readiness] class ReadinessCheckExecutorImpl(implicit actorSystem: ActorS
   }
 
   private[impl] def akkaHttpGet(check: ReadinessCheckSpec): Future[AkkaHttpResponse] = {
-    Timeout(check.timeout)(Http().singleRequest(
-      request = RequestBuilding.Get(check.url)
-    ))
+    Timeout(check.timeout)(
+      Http().singleRequest(
+        request = RequestBuilding.Get(check.url),
+        connectionContext =
+          ConnectionContext.https(HealthCheckWorker.disabledSslContext, sslConfig = Some(HealthCheckWorker.disabledSslConfig()))
+      )
+    )
   }
 }

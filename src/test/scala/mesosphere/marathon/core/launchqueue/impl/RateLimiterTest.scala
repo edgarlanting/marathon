@@ -2,70 +2,71 @@ package mesosphere.marathon
 package core.launchqueue.impl
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.base.ConstantClock
-import mesosphere.marathon.core.launchqueue.LaunchQueueConfig
-import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.state.{ AppDefinition, BackoffStrategy, Timestamp }
+import mesosphere.marathon.test.SettableClock
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, BackoffStrategy}
 
 import scala.concurrent.duration._
 
 class RateLimiterTest extends UnitTest {
 
-  val clock = ConstantClock(Timestamp.now())
-
-  private[this] val launchQueueConfig: LaunchQueueConfig = new LaunchQueueConfig {
-    verify()
-  }
+  val clock = SettableClock.ofNow()
 
   "RateLimiter" should {
     "addDelay" in {
-      val limiter = new RateLimiter(launchQueueConfig, clock)
-      val app = AppDefinition(id = "test".toPath, backoffStrategy = BackoffStrategy(backoff = 10.seconds))
+      val limiter = new RateLimiter(clock)
+      val app = AppDefinition(id = AbsolutePathId("/test"), role = "*", backoffStrategy = BackoffStrategy(backoff = 10.seconds))
 
       limiter.addDelay(app)
 
-      limiter.getDeadline(app) should be(clock.now() + 10.seconds)
+      limiter.getDelay(app.configRef).value.deadline should be(clock.now() + 10.seconds)
     }
 
     "addDelay for existing delay" in {
-      val limiter = new RateLimiter(launchQueueConfig, clock)
-      val app = AppDefinition(id = "test".toPath, backoffStrategy = BackoffStrategy(backoff = 10.seconds, factor = 2.0))
+      val limiter = new RateLimiter(clock)
+      val app =
+        AppDefinition(id = AbsolutePathId("/test"), role = "*", backoffStrategy = BackoffStrategy(backoff = 10.seconds, factor = 2.0))
 
       limiter.addDelay(app) // linter:ignore:IdenticalStatements
       limiter.addDelay(app)
 
-      limiter.getDeadline(app) should be(clock.now() + 20.seconds)
+      limiter.getDelay(app.configRef).value.deadline should be(clock.now() + 20.seconds)
     }
 
-    "resetDelaysOfViableTasks" in {
+    "cleanUpOverdueDelays" in {
       val time_origin = clock.now()
-      val limiter = new RateLimiter(launchQueueConfig, clock)
-      val threshold = launchQueueConfig.minimumViableTaskExecutionDuration
-      val viable = AppDefinition(id = "viable".toPath, backoffStrategy = BackoffStrategy(backoff = 10.seconds))
-      limiter.addDelay(viable)
-      val notYetViable = AppDefinition(id = "notYetViable".toPath, backoffStrategy = BackoffStrategy(backoff = 20.seconds))
-      limiter.addDelay(notYetViable)
-      val stillWaiting = AppDefinition(id = "test".toPath, backoffStrategy = BackoffStrategy(backoff = threshold + 20.seconds))
-      limiter.addDelay(stillWaiting)
+      val limiter = new RateLimiter(clock)
+      val threshold = 60.seconds
 
-      clock += threshold + 11.seconds
+      val appWithOverdueDelay = AppDefinition(
+        id = AbsolutePathId("/overdue"),
+        role = "*",
+        backoffStrategy = BackoffStrategy(backoff = 10.seconds, maxLaunchDelay = threshold)
+      )
+      limiter.addDelay(appWithOverdueDelay)
 
-      limiter.resetDelaysOfViableTasks()
+      val appWithValidDelay = AppDefinition(
+        id = AbsolutePathId("/valid"),
+        role = "*",
+        backoffStrategy = BackoffStrategy(backoff = 20.seconds, maxLaunchDelay = threshold + 10.seconds)
+      )
+      limiter.addDelay(appWithValidDelay)
 
-      limiter.getDeadline(viable) should be(clock.now())
-      limiter.getDeadline(notYetViable) should be(time_origin + 20.seconds)
-      limiter.getDeadline(stillWaiting) should be(time_origin + threshold + 20.seconds)
+      // after advancing the clock by (threshold + 1), the existing delays
+      // with maxLaunchDelay < (threshold + 1) should be gone
+      clock.advanceBy(threshold + 1.seconds)
+      limiter.cleanUpOverdueDelays()
+      limiter.getDelay(appWithOverdueDelay.configRef) shouldBe empty
+      limiter.getDelay(appWithValidDelay.configRef).value.deadline should be(time_origin + 20.seconds)
     }
 
     "resetDelay" in {
-      val limiter = new RateLimiter(launchQueueConfig, clock)
-      val app = AppDefinition(id = "test".toPath, backoffStrategy = BackoffStrategy(backoff = 10.seconds))
+      val limiter = new RateLimiter(clock)
+      val app = AppDefinition(id = AbsolutePathId("/test"), role = "*", backoffStrategy = BackoffStrategy(backoff = 10.seconds))
 
       limiter.addDelay(app)
-
       limiter.resetDelay(app)
 
-      limiter.getDeadline(app) should be(clock.now())
+      limiter.getDelay(app.configRef) shouldBe empty
     }
   }
 }

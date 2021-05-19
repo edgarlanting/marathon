@@ -42,11 +42,6 @@ layout: default
                 </a>
             </li>
             <li>
-                <a href="{{ site.baseurl }}/docs/artifact-store.html">
-                    Artifact Store
-                </a>
-            </li>
-            <li>
                 <a href="{{ site.baseurl }}/docs/auth-access-ctrl.html">
                     Authorization and Access Control
                 </a>
@@ -126,6 +121,11 @@ layout: default
                     Secret Configuration
                 </a>
             </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/unreachable.html">
+                    Unreachable Strategy
+                </a>
+            </li>
         </ul>
 
         <h5>Administration</h5>
@@ -138,6 +138,11 @@ layout: default
             <li>
                 <a href="{{ site.baseurl }}/docs/backup-restore.html">
                     Backup and Restore
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/data-migration.html">
+                    Data Migration
                 </a>
             </li>
             <li>
@@ -156,8 +161,18 @@ layout: default
                 </a>
             </li>
             <li>
+                <a href="{{ site.baseurl }}/docs/deprecated-metrics.html">
+                    Deprecated Metrics
+                </a>
+            </li>
+            <li>
                 <a href="{{ site.baseurl }}/docs/readiness-checks.html">
                     Readiness Checks
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/checks.html">
+                    Checks
                 </a>
             </li>
             <li>
@@ -171,8 +186,23 @@ layout: default
                 </a>
             </li>
             <li>
+                <a href="{{ site.baseurl }}/docs/seccomp.html">
+                    Seccomp
+                </a>
+            </li>
+            <li>
                 <a href="{{ site.baseurl }}/docs/native-docker-private-registry.html">
                     Using a Private Docker Registry
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/maintenance-mode.html">
+                    Maintenance mode
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/mesos-compatibility.html">
+                    Compatibility with Mesos
                 </a>
             </li>
         </ul>
@@ -209,6 +239,11 @@ layout: default
                 </a>
             </li>
             <li>
+                <a href="{{ site.baseurl }}/docs/backoff.html">
+                    No new instances are starting
+                </a>
+            </li>
+            <li>
                 <a href="{{ site.baseurl }}/docs/host-port.html">
                     An App Requires a Specific Host Port
                 </a>
@@ -221,6 +256,16 @@ layout: default
             <li>
                 <a href="{{ site.baseurl }}/docs/auth-secret.html">
                     Error Reading Authentication Secret
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/cfs.html">
+                    Slow Docker apps and deployments
+                </a>
+            </li>
+            <li>
+                <a href="{{ site.baseurl }}/docs/exit-codes.html">
+                   Exit Codes
                 </a>
             </li>
         </ul>
@@ -257,9 +302,9 @@ layout: default
         </ul>
         <h5>Docs for Previous Versions</h5>
         <ul class="list-unstyled">
-          <li><a href="https://github.com/mesosphere/marathon/tree/v1.4.0/docs/docs">Version 1.4.0</a></li>
-          <li><a href="https://github.com/mesosphere/marathon/tree/v1.3.0/docs/docs">Version 1.3.0</a></li>
-          <li><a href="https://github.com/mesosphere/marathon/tree/v1.1.0/docs/docs">Version 1.1.0</a></li>
+            {% for version in site.release_versions %}
+            <li><a href="{{ site.url }}/marathon/{{ version }}/docs">Version {{ version }}.x</a></li>
+            {% endfor %}
         </ul>
     </div>
 

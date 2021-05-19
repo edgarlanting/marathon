@@ -5,16 +5,16 @@ import akka.Done
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.stream.ActorMaterializer
-import ch.qos.logback.classic.{ Level, Logger }
+import ch.qos.logback.classic.{Level, Logger}
 import com.typesafe.scalalogging.StrictLogging
-import kamon.Kamon
-import mesosphere.marathon.core.base.LifecycleState
-import mesosphere.marathon.storage.{ StorageConf, StorageModule }
+import mesosphere.marathon.core.base.{JvmExitsCrashStrategy, LifecycleState}
+import mesosphere.marathon.core.storage.store.impl.zk.RichCuratorFramework
+import mesosphere.marathon.storage.{StorageConfig, StorageModule}
 import org.rogach.scallop.ScallopConf
 import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration.Duration
-import scala.concurrent.{ Await, Future }
+import scala.concurrent.{Await, Future}
 import scala.util.control.NonFatal
 
 /**
@@ -22,7 +22,7 @@ import scala.util.control.NonFatal
   */
 abstract class BackupRestoreAction extends StrictLogging {
 
-  class BackupConfig(args: Seq[String]) extends ScallopConf(args) with StorageConf with NetworkConf {
+  class BackupConfig(args: Seq[String]) extends ScallopConf(args) with MarathonConf {
     override def availableFeatures: Set[String] = Set.empty
     verify()
     require(backupLocation.isDefined, "--backup_location needs to be defined!")
@@ -31,17 +31,22 @@ abstract class BackupRestoreAction extends StrictLogging {
   /**
     * Can either run a backup or restore operation.
     */
-  @SuppressWarnings(Array("AsInstanceOf"))
   def action(conf: BackupConfig, fn: PersistentStoreBackup => Future[Done]): Unit = {
-    Kamon.start()
     implicit val system = ActorSystem("Backup")
     implicit val materializer = ActorMaterializer()
     implicit val scheduler = system.scheduler
-    import mesosphere.marathon.core.async.ExecutionContexts.global
+    import scala.concurrent.ExecutionContext.Implicits.global
+
+    val metricsModule = MetricsModule(conf)
+    metricsModule.start(system)
+
     try {
-      val storageModule = StorageModule(conf, LifecycleState.WatchingJVM)
+      val curatorFramework: RichCuratorFramework = StorageConfig.curatorFramework(conf, JvmExitsCrashStrategy, LifecycleState.WatchingJVM)
+      val storageModule = StorageModule(metricsModule.metrics, conf, curatorFramework)
+      storageModule.persistenceStore.markOpen()
       val backup = storageModule.persistentStoreBackup
       Await.result(fn(backup), Duration.Inf)
+      storageModule.persistenceStore.markClosed()
       logger.info("Action complete.")
     } catch {
       case NonFatal(ex) =>
@@ -49,7 +54,6 @@ abstract class BackupRestoreAction extends StrictLogging {
         sys.exit(1) // signal a problem to the caller
     } finally {
       Await.result(Http().shutdownAllConnectionPools(), Duration.Inf)
-      Kamon.shutdown()
       // akka http has an issue tearing down the connection pool: https://github.com/akka/akka-http/issues/907
       // We will hide the fail message from the user until this is fixed
       LoggerFactory.getLogger("akka.actor.ActorSystemImpl").asInstanceOf[Logger].setLevel(Level.OFF)

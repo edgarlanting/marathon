@@ -4,7 +4,7 @@ package core.matcher.base
 import mesosphere.marathon.core.instance.Instance
 import mesosphere.marathon.core.launcher.InstanceOp
 import mesosphere.marathon.state.PathId
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 
 import scala.concurrent.Future
 
@@ -40,13 +40,10 @@ object OfferMatcher {
     * @param resendThisOffer true, if this offer could not be processed completely (e.g. timeout)
     *                        and should be resend and processed again
     */
-  case class MatchedInstanceOps(
-      offerId: Mesos.OfferID,
-      opsWithSource: Seq[InstanceOpWithSource],
-      resendThisOffer: Boolean = false) {
+  case class MatchedInstanceOps(offerId: Mesos.OfferID, opsWithSource: Seq[InstanceOpWithSource], resendThisOffer: Boolean = false) {
 
     /** all included [InstanceOp] without the source information. */
-    val ops: Seq[InstanceOp] = opsWithSource.map(_.op)(collection.breakOut)
+    val ops: Seq[InstanceOp] = opsWithSource.iterator.map(_.op).toSeq
   }
 
   object MatchedInstanceOps {
@@ -64,6 +61,7 @@ object OfferMatcher {
   * Tries to match offers with some instances.
   */
 trait OfferMatcher {
+
   /**
     * Process offer and return the ops that this matcher wants to execute on this offer.
     *

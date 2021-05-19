@@ -1,0 +1,107 @@
+import logging
+import os
+import paramiko
+
+import itertools
+from . import master_ip
+
+
+logger = logging.getLogger(__name__)
+
+
+def get_transport(host, username, key):
+    """ Create a transport object
+
+        :param host: the hostname to connect to
+        :type host: str
+        :param username: SSH username
+        :type username: str
+        :param key: key object used for authentication
+        :type key: paramiko.RSAKey
+
+        :return: a transport object
+        :rtype: paramiko.Transport
+    """
+
+    if host == master_ip():
+        transport = paramiko.Transport(host)
+    else:
+
+        logger.debug('Connecting to %s@%s with key %s', username, master_ip(), key)
+
+        transport_master = paramiko.Transport(master_ip())
+        transport_master = start_transport(transport_master, username, key)
+
+        if not transport_master.is_authenticated():
+            logger.error('unable to authenticate %s@%s with key %s', username, master_ip(), key)
+            return False
+
+        try:
+            channel = transport_master.open_channel('direct-tcpip', (host, 22), ('127.0.0.1', 0))
+        except paramiko.SSHException:
+            logger.error('unable to connect to %s', host)
+            return False
+
+        transport = paramiko.Transport(channel)
+
+    return transport
+
+
+def start_transport(transport, username, key):
+    """ Begin a transport client and authenticate it
+
+        :param transport: the transport object to start
+        :type transport: paramiko.Transport
+        :param username: SSH username
+        :type username: str
+        :param key: key object used for authentication
+        :type key: paramiko.RSAKey
+
+        :return: the transport object passed
+        :rtype: paramiko.Transport
+    """
+
+    transport.start_client()
+
+    agent = paramiko.agent.Agent()
+    keys = itertools.chain((key,) if key else (), agent.get_keys())
+    for test_key in keys:
+        try:
+            transport.auth_publickey(username, test_key)
+            break
+        except paramiko.AuthenticationException:
+            logger.exception('Could authenticate with provided ssh key.')
+            pass
+    else:
+        raise ValueError('No valid key supplied')
+
+    return transport
+
+
+# SSH connection will be auto-terminated at the conclusion of this operation, causing
+# a race condition; the try/except block attempts to close the channel and/or transport
+# but does not issue a failure if it has already been closed.
+def try_close(obj):
+    try:
+        obj.close()
+    except Exception:
+        pass
+
+
+def validate_key(key_path):
+    """ Validate a key
+
+        :param key_path: path to a key to use for authentication
+        :type key_path: str
+
+        :return: key object used for authentication
+        :rtype: paramiko.RSAKey
+    """
+
+    key_path = os.path.expanduser(key_path)
+
+    if not os.path.isfile(key_path):
+        logger.warning('Provided key %s is not a file.', key_path)
+        return False
+
+    return paramiko.RSAKey.from_private_key_file(key_path)

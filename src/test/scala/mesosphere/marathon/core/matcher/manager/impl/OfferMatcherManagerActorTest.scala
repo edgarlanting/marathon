@@ -1,61 +1,61 @@
 package mesosphere.marathon
 package core.matcher.manager.impl
 
+import akka.pattern.ask
+import akka.stream.OverflowStrategy
+import akka.stream.scaladsl.{Sink, Source}
+import akka.testkit.TestActorRef
+import akka.util.Timeout
 import java.util
 import java.util.concurrent.TimeUnit
 
-import akka.pattern.ask
-import akka.testkit.TestActorRef
-import akka.util.Timeout
 import mesosphere.AkkaUnitTest
-import mesosphere.marathon.core.base.ConstantClock
+import mesosphere.marathon.core.instance.LocalVolumeId
 import mesosphere.marathon.core.matcher.base.OfferMatcher
 import mesosphere.marathon.core.matcher.base.util.ActorOfferMatcher
 import mesosphere.marathon.core.matcher.manager.OfferMatcherManagerConfig
-import mesosphere.marathon.core.task.Task.LocalVolumeId
-import mesosphere.marathon.state.PathId
+import mesosphere.marathon.metrics.dummy.DummyMetrics
+import mesosphere.marathon.state.{AbsolutePathId, PathId}
 import mesosphere.marathon.test.MarathonTestHelper
+import mesosphere.marathon.test.SettableClock
 import org.apache.mesos.Protos.Offer
 import org.rogach.scallop.ScallopConf
 import org.scalatest.concurrent.Eventually
-import rx.lang.scala.Observer
 
-import scala.concurrent.{ Future, Promise }
-import scala.util.{ Random, Success }
+import scala.concurrent.{Future, Promise}
+import scala.util.{Random, Success}
 import scala.concurrent.duration._
 
 class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
 
   "OfferMatcherManagerActor" should {
-    "The list of OfferMatchers is random without precedence" in {
+    "The list of OfferMatchers is random without precedence" in new Fixture {
       Given("OfferMatcher with num normal matchers")
       val num = 5
-      val f = new Fixture
-      val appId = PathId("/some/app")
-      val manager = f.offerMatcherManager
-      val matchers = 1.to(num).map(_ => f.matcher())
+      val appId = AbsolutePathId("/some/app")
+      val manager = offerMatcherManager
+      val matchers = 1.to(num).map(_ => matcher())
       matchers.map { matcher => manager ? OfferMatcherManagerDelegate.AddOrUpdateMatcher(matcher) }
 
       When("The list of offer matchers is fetched")
-      val orderedMatchers = manager.underlyingActor.offerMatchers(f.reservedOffer(appId))
+      val orderedMatchers = manager.underlyingActor.offerMatchers(reservedOffer(appId))
 
       Then("The list is sorted in the correct order")
       orderedMatchers should have size num.toLong
       orderedMatchers should contain theSameElementsAs matchers
     }
 
-    "The list of OfferMatchers is sorted by precedence" in {
+    "The list of OfferMatchers is sorted by precedence" in new Fixture {
       Given("OfferMatcher with num precedence and num normal matchers, registered in mixed order")
       val num = 5
-      val f = new Fixture
-      val appId = PathId("/some/app")
-      val manager = f.offerMatcherManager
-      1.to(num).flatMap(_ => Seq(f.matcher(), f.matcher(Some(appId)))).map { matcher =>
+      val appId = AbsolutePathId("/some/app")
+      val manager = offerMatcherManager
+      1.to(num).flatMap(_ => Seq(matcher(), matcher(Some(appId)))).map { matcher =>
         manager ? OfferMatcherManagerDelegate.AddOrUpdateMatcher(matcher)
       }
 
       When("The list of offer matchers is fetched")
-      val sortedMatchers = manager.underlyingActor.offerMatchers(f.reservedOffer(appId))
+      val sortedMatchers = manager.underlyingActor.offerMatchers(reservedOffer(appId))
 
       Then("The list is sorted in the correct order")
       sortedMatchers should have size 2 * num.toLong
@@ -153,7 +153,9 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
       offerMatch2.future.futureValue.opsWithSource should be('empty)
     }
 
-    "overdue offers are rejected after the deadline" in new Fixture(Seq("--max_parallel_offers", "1", "--max_queued_offers", "100", "--offer_matching_timeout", "10")) {
+    "overdue offers are rejected after the deadline" in new Fixture(
+      Seq("--max_parallel_offers", "1", "--max_queued_offers", "100", "--offer_matching_timeout", "10")
+    ) {
       Given("OfferMatcher with one matcher")
       val offer1 = offer()
       val offer2 = offer()
@@ -167,7 +169,7 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
       When("1 offer is send, which is passed to the matcher, 2 offers are send and queued with a 10 millis gap")
       offerMatcherManager ! ActorOfferMatcher.MatchOffer(offer1, offerMatch1)
       offerMatcherManager ! ActorOfferMatcher.MatchOffer(offer2, offerMatch2)
-      clock += 10.millis
+      clock.advanceBy(10.millis)
       offerMatcherManager ! ActorOfferMatcher.MatchOffer(offer3, offerMatch3)
 
       Then("offer-2 is declined, due to timeout but not offer-3")
@@ -176,12 +178,14 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
       offerMatch1.isCompleted should be(false)
 
       And("After 10 millis also offer-2 is declined")
-      clock += 10.millis
+      clock.advanceBy(10.millis)
       offerMatch3.future.futureValue.opsWithSource should be('empty)
       offerMatch1.isCompleted should be(false)
     }
 
-    "offers are rejected if the matcher does not respond in time" in new Fixture(Seq("--max_parallel_offers", "1", "--max_queued_offers", "100", "--offer_matching_timeout", "10")) {
+    "offers are rejected if the matcher does not respond in time" in new Fixture(
+      Seq("--max_parallel_offers", "1", "--max_queued_offers", "100", "--offer_matching_timeout", "10")
+    ) {
       Given("OfferMatcher with one matcher")
       val offer1 = offer()
       val offerMatch1 = Promise[OfferMatcher.MatchedInstanceOps]
@@ -190,7 +194,7 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
 
       When("1 offer is send, which is passed to the matcher, but the matcher does not respond")
       offerMatcherManager ! ActorOfferMatcher.MatchOffer(offer1, offerMatch1)
-      clock += 30.millis
+      clock.advanceBy(30.millis)
 
       Then("offer-1 is declined, since the actor did not respond in time")
       offerMatch1.future.futureValue.opsWithSource should be('empty)
@@ -199,15 +203,18 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
 
   implicit val timeout = Timeout(3, TimeUnit.SECONDS)
   class Fixture(config: Seq[String] = Seq("--max_parallel_offers", "1", "--max_queued_offers", "1")) {
-    val metrics = new OfferMatcherManagerActorMetrics()
+    val metrics = DummyMetrics
+    val actorMetrics = new OfferMatcherManagerActorMetrics(metrics)
     val random = new Random(new util.Random())
     val idGen = 1.to(Int.MaxValue).iterator
-    val clock = ConstantClock()
-    val observer = Observer.apply[Boolean]((a: Boolean) => ())
+    val clock = new SettableClock()
+    val observer = Source.queue[Boolean](16, OverflowStrategy.fail).to(Sink.ignore).run
+
     object Config extends ScallopConf(config) with OfferMatcherManagerConfig {
       verify()
     }
-    val offerMatcherManager = TestActorRef[OfferMatcherManagerActor](OfferMatcherManagerActor.props(metrics, random, clock, Config, observer))
+    val offerMatcherManager =
+      TestActorRef[OfferMatcherManagerActor](OfferMatcherManagerActor.props(actorMetrics, random, clock, Config, observer))
 
     def matcher(precedence: Option[PathId] = None): OfferMatcher = {
       val matcher = mock[OfferMatcher]
@@ -226,7 +233,8 @@ class OfferMatcherManagerActorTest extends AkkaUnitTest with Eventually {
       matcher
     }
 
-    def offer(): Offer = MarathonTestHelper.makeBasicOffer().setId(org.apache.mesos.Protos.OfferID.newBuilder().setValue("offer-" + idGen.next())).build()
+    def offer(): Offer =
+      MarathonTestHelper.makeBasicOffer().setId(org.apache.mesos.Protos.OfferID.newBuilder().setValue("offer-" + idGen.next())).build()
     def reservedOffer(appId: PathId, path: String = "test"): Offer = {
       import MarathonTestHelper._
       makeBasicOffer().addResources(reservedDisk(LocalVolumeId(appId, path, "uuid").idString, containerPath = path)).build()

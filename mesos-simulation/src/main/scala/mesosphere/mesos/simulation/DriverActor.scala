@@ -2,16 +2,16 @@ package mesosphere.mesos.simulation
 
 import java.util.UUID
 
-import akka.actor.{ Actor, ActorRef, Cancellable, Props }
+import akka.actor.{Actor, ActorRef, Cancellable, Props}
 import akka.event.LoggingReceive
-import mesosphere.marathon.stream.Implicits._
+import com.typesafe.scalalogging.StrictLogging
 import mesosphere.mesos.simulation.DriverActor._
 import mesosphere.mesos.simulation.SchedulerActor.ResourceOffers
 import org.apache.mesos.Protos._
 import org.apache.mesos.SchedulerDriver
-import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
 import scala.util.Random
 
 object DriverActor {
@@ -63,8 +63,7 @@ object DriverActor {
   private case class SendTaskStatusAt(taskStatus: TaskStatus, create: Boolean, at: Deadline)
 }
 
-class DriverActor(schedulerProps: Props) extends Actor {
-  private val log = LoggerFactory.getLogger(getClass)
+class DriverActor(schedulerProps: Props) extends Actor with StrictLogging {
 
   // probability of a failing start or a lost message [ 0=no error, 1=always error ]
   private[this] val taskFailProbability = 0.1
@@ -76,7 +75,7 @@ class DriverActor(schedulerProps: Props) extends Actor {
   // use a fixed seed to get reproducible results
   private[this] val random = {
     val seed = 1L
-    log.info(s"Random seed for this test run: $seed")
+    logger.info(s"Random seed for this test run: $seed")
     new Random(new java.util.Random(seed))
   }
 
@@ -85,7 +84,8 @@ class DriverActor(schedulerProps: Props) extends Actor {
   private[this] var scheduler: ActorRef = _
 
   private[this] var tasks: Map[String, TaskStatus] = Map.empty.withDefault { taskId =>
-    TaskStatus.newBuilder()
+    TaskStatus
+      .newBuilder()
       .setSource(TaskStatus.Source.SOURCE_SLAVE)
       .setTaskId(TaskID.newBuilder().setValue(taskId).build())
       .setState(TaskState.TASK_LOST)
@@ -94,30 +94,36 @@ class DriverActor(schedulerProps: Props) extends Actor {
 
   private[this] def offer(index: Int): Offer = {
     def resource(name: String, value: Double): Resource = {
-      Resource.newBuilder()
+      Resource
+        .newBuilder()
         .setName(name)
         .setType(Value.Type.SCALAR)
         .setScalar(Value.Scalar.newBuilder().setValue(value))
         .build()
     }
-    Offer.newBuilder()
+    Offer
+      .newBuilder()
       .setId(OfferID.newBuilder().setValue(UUID.randomUUID().toString))
       .setFrameworkId(FrameworkID.newBuilder().setValue("notanidframework"))
       .setSlaveId(SlaveID.newBuilder().setValue(s"notanidslave-$index"))
       .setHostname("hostname")
-      .addAllResources(Seq(
-        resource("cpus", 100),
-        resource("mem", 500000),
-        resource("disk", 1000000000),
-        Resource.newBuilder()
-          .setName("ports")
-          .setType(Value.Type.RANGES)
-          .setRanges(
-            Value.Ranges
-              .newBuilder()
-              .addRange(Value.Range.newBuilder().setBegin(10000).setEnd(20000)))
-          .build()
-      ).asJava)
+      .addAllResources(
+        Seq(
+          resource("cpus", 100),
+          resource("mem", 500000),
+          resource("disk", 1000000000),
+          Resource
+            .newBuilder()
+            .setName("ports")
+            .setType(Value.Type.RANGES)
+            .setRanges(
+              Value.Ranges
+                .newBuilder()
+                .addRange(Value.Range.newBuilder().setBegin(10000).setEnd(20000))
+            )
+            .build()
+        ).asJava
+      )
       .build()
   }
   private[this] def offers: ResourceOffers =
@@ -140,55 +146,56 @@ class DriverActor(schedulerProps: Props) extends Actor {
     super.postStop()
   }
 
-  override def receive: Receive = LoggingReceive {
-    case driver: SchedulerDriver =>
-      log.debug(s"pass on driver to scheduler $scheduler")
-      scheduler ! driver
+  override def receive: Receive =
+    LoggingReceive {
+      case driver: SchedulerDriver =>
+        logger.debug(s"pass on driver to scheduler $scheduler")
+        scheduler ! driver
 
-    case LaunchTasks(offers, tasks) =>
-      simulateTaskLaunch(offers, tasks)
+      case LaunchTasks(offers, tasks) =>
+        simulateTaskLaunch(offers, tasks)
 
-    case AcceptOffers(offers, ops, filters) =>
-      val taskInfos = extractTaskInfos(ops)
-      simulateTaskLaunch(offers, taskInfos)
+      case AcceptOffers(offers, ops, filters) =>
+        val taskInfos = extractTaskInfos(ops)
+        simulateTaskLaunch(offers, taskInfos)
 
-    case KillTask(taskId) =>
-      log.debug(s"kill task $taskId")
+      case KillTask(taskId) =>
+        logger.debug(s"kill task $taskId")
 
-      tasks.get(taskId.getValue) match {
-        case Some(task) =>
-          scheduleStatusChange(toState = TaskState.TASK_KILLED, afterDuration = 2.seconds)(taskID = taskId)
-        case None =>
-          scheduleStatusChange(toState = TaskState.TASK_LOST, afterDuration = 1.second)(taskID = taskId)
-      }
+        tasks.get(taskId.getValue) match {
+          case Some(task) =>
+            scheduleStatusChange(toState = TaskState.TASK_KILLED, afterDuration = 2.seconds)(taskID = taskId)
+          case None =>
+            scheduleStatusChange(toState = TaskState.TASK_LOST, afterDuration = 1.second)(taskID = taskId)
+        }
 
-    case SuppressOffers => ()
+      case SuppressOffers => ()
 
-    case ReviveOffers =>
-      scheduler ! offers
+      case ReviveOffers =>
+        scheduler ! offers
 
-    case TaskStateTick =>
-      val (sendNow, later) = taskUpdates.partition(_.at.isOverdue())
-      sendNow.foreach(update => changeTaskStatus(update.taskStatus, update.create))
-      taskUpdates = later
+      case TaskStateTick =>
+        val (sendNow, later) = taskUpdates.partition(_.at.isOverdue())
+        sendNow.foreach(update => changeTaskStatus(update.taskStatus, update.create))
+        taskUpdates = later
 
-    case ReconcileTask(taskStatuses) =>
-      if (taskStatuses.isEmpty) {
-        tasks.values.foreach(scheduler ! _)
-      } else {
-        taskStatuses.view.map(_.getTaskId.getValue).map(tasks).foreach(scheduler ! _)
-      }
-  }
+      case ReconcileTask(taskStatuses) =>
+        if (taskStatuses.isEmpty) {
+          tasks.values.foreach(scheduler ! _)
+        } else {
+          taskStatuses.view.map(_.getTaskId.getValue).map(tasks).foreach(scheduler ! _)
+        }
+    }
 
   private[this] def extractTaskInfos(ops: Seq[Offer.Operation]): Seq[TaskInfo] = {
     ops.withFilter(_.getType == Offer.Operation.Type.LAUNCH).flatMap { op =>
-      Option(op.getLaunch).map(_.getTaskInfosList.toSeq).getOrElse(Seq.empty)
+      Option(op.getLaunch).map(_.getTaskInfosList.asScala.toSeq).getOrElse(Seq.empty)
     }
   }
 
   private[this] def simulateTaskLaunch(offers: Seq[OfferID], tasksToLaunch: Seq[TaskInfo]): Unit = {
     if (random.nextDouble() > lostMessageProbability) {
-      log.debug(s"launch tasksToLaunch $offers, $tasksToLaunch")
+      logger.debug(s"launch tasksToLaunch $offers, $tasksToLaunch")
 
       if (random.nextDouble() > taskFailProbability) {
         tasksToLaunch.map(_.getTaskId).foreach {
@@ -200,7 +207,7 @@ class DriverActor(schedulerProps: Props) extends Actor {
         }
       }
     } else {
-      log.info(s"simulating lost launch for $tasksToLaunch")
+      logger.info(s"simulating lost launch for $tasksToLaunch")
     }
   }
 
@@ -212,23 +219,23 @@ class DriverActor(schedulerProps: Props) extends Actor {
         case _ =>
           tasks += (status.getTaskId.getValue -> status)
       }
-      log.debug(s"${tasks.size} tasks")
+      logger.debug(s"${tasks.size} tasks")
       scheduler ! status
     } else {
       if (status.getState == TaskState.TASK_LOST) {
         scheduler ! status
       } else {
-        log.debug(s"${status.getTaskId.getValue} does not exist anymore")
+        logger.debug(s"${status.getTaskId.getValue} does not exist anymore")
       }
     }
   }
 
-  private[this] def scheduleStatusChange(
-    toState: TaskState,
-    afterDuration: FiniteDuration,
-    create: Boolean = false)(taskID: TaskID): Unit = {
+  private[this] def scheduleStatusChange(toState: TaskState, afterDuration: FiniteDuration, create: Boolean = false)(
+      taskID: TaskID
+  ): Unit = {
 
-    val newStatus = TaskStatus.newBuilder()
+    val newStatus = TaskStatus
+      .newBuilder()
       .setSource(TaskStatus.Source.SOURCE_EXECUTOR)
       .setTaskId(taskID)
       .setState(toState)

@@ -7,34 +7,48 @@ import akka.Done
 import akka.http.scaladsl.marshalling.Marshaller
 import akka.http.scaladsl.unmarshalling.Unmarshaller
 import akka.stream.scaladsl.Sink
+import com.mesosphere.utils.zookeeper.ZookeeperServerTest
 import mesosphere.AkkaUnitTest
+import mesosphere.marathon.core.base.JvmExitsCrashStrategy
 import mesosphere.marathon.core.storage.store.impl.InMemoryTestClass1Serialization
 import mesosphere.marathon.core.storage.store.impl.memory.InMemoryPersistenceStore
-import mesosphere.marathon.core.storage.store.impl.zk.{ ZkPersistenceStore, ZkTestClass1Serialization }
-import mesosphere.marathon.core.storage.store.{ IdResolver, PersistenceStoreTest, TestClass1 }
-import mesosphere.marathon.integration.setup.ZookeeperServerTest
+import mesosphere.marathon.core.storage.store.impl.zk.{RichCuratorFramework, ZkPersistenceStore, ZkTestClass1Serialization}
+import mesosphere.marathon.core.storage.store.{IdResolver, PersistenceStoreTest, TestClass1}
+import mesosphere.marathon.metrics.dummy.DummyMetrics
 import mesosphere.marathon.storage.store.InMemoryStoreSerialization
 import mesosphere.marathon.test.SettableClock
 
 import scala.concurrent.duration._
 
-class LazyCachingPersistenceStoreTest extends AkkaUnitTest
-    with PersistenceStoreTest with ZkTestClass1Serialization with ZookeeperServerTest
-    with InMemoryStoreSerialization with InMemoryTestClass1Serialization {
+class LazyCachingPersistenceStoreTest
+    extends AkkaUnitTest
+    with PersistenceStoreTest
+    with ZkTestClass1Serialization
+    with ZookeeperServerTest
+    with InMemoryStoreSerialization
+    with InMemoryTestClass1Serialization {
+
+  private val metrics = DummyMetrics
 
   private def cachedInMemory = {
-    LazyCachingPersistenceStore(new InMemoryPersistenceStore())
+    val store = LazyCachingPersistenceStore(metrics, new InMemoryPersistenceStore(metrics))
+    store.markOpen()
+    store
   }
 
-  private def withLazyVersionCaching = LazyVersionCachingPersistentStore(cachedInMemory)
+  private def withLazyVersionCaching = {
+    val store = LazyVersionCachingPersistentStore(metrics, new InMemoryPersistenceStore(metrics))
+    store.markOpen()
+    store
+  }
 
-  def zkStore: ZkPersistenceStore = {
+  private def cachedZk = {
     val root = UUID.randomUUID().toString
-    val client = zkClient(namespace = Some(root))
-    new ZkPersistenceStore(client, Duration.Inf, 8)
+    val client = RichCuratorFramework(zkClient(namespace = Some(root)), JvmExitsCrashStrategy)
+    val store = LazyCachingPersistenceStore(metrics, new ZkPersistenceStore(metrics, client))
+    store.markOpen()
+    store
   }
-
-  private def cachedZk = LazyCachingPersistenceStore(zkStore)
 
   behave like basicPersistenceStore("LazyCache(InMemory)", cachedInMemory)
   behave like basicPersistenceStore("LazyCache(Zk)", cachedZk)
@@ -44,13 +58,11 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
 
   behave like cachingPersistenceStore("cache internals(InMemory)", withLazyVersionCaching)
 
-  def cachingPersistenceStore[K, C, Serialized](
-    name: String,
-    newStore: => LazyVersionCachingPersistentStore[K, C, Serialized])(
-    implicit
-    ir: IdResolver[String, TestClass1, C, K],
-    m: Marshaller[TestClass1, Serialized],
-    um: Unmarshaller[Serialized, TestClass1]): Unit = {
+  def cachingPersistenceStore[K, C, Serialized](name: String, newStore: => LazyVersionCachingPersistentStore[K, C, Serialized])(implicit
+      ir: IdResolver[String, TestClass1, C, K],
+      m: Marshaller[TestClass1, Serialized],
+      um: Unmarshaller[Serialized, TestClass1]
+  ): Unit = {
 
     name should {
       "purge the cache appropriately" in {
@@ -58,7 +70,7 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         val store = newStore
         1.to(100).foreach { i =>
           val obj = TestClass1("abc", i)
-          clock.plus(1.second)
+          clock.advanceBy(1.second)
           store.store("task-1", obj).futureValue should be(Done)
         }
         store.versionedValueCache.size should be(100) // sanity
@@ -70,14 +82,13 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done) // redundant store should not lead to dup data
 
         val storageId = ir.toStorageId("task-1", None)
-        val cacheKey = (ir.category, storageId)
 
         store.versionedValueCache.size should be(2)
         store.versionedValueCache((storageId, original.version)) should be(Some(original))
@@ -88,14 +99,13 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
         store.deleteVersion("task-1", original.version).futureValue should be(Done)
 
-        val storageId = ir.toStorageId("task-1", None)
-        val cacheKey = (ir.category, storageId)
+        ir.toStorageId("task-1", None)
 
         store.versionCache.size should be(0)
         store.versionedValueCache.size should be(0)
@@ -105,7 +115,7 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
@@ -123,7 +133,7 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
@@ -145,7 +155,7 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
@@ -168,9 +178,9 @@ class LazyCachingPersistenceStoreTest extends AkkaUnitTest
 
         // 1 version available in the cache and 2 in the underlying store
         store.store("test", TestClass1("abc", 1)).futureValue should be(Done)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         underlying.store("test", TestClass1("abc", 2)).futureValue should be(Done)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         underlying.store("test", TestClass1("abc", 3)).futureValue should be(Done)
 
         store.versionCache.size should be(0)

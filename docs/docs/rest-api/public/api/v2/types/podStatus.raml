@@ -4,12 +4,14 @@ uses:
   container: podContainer.raml
   env: environmentVariable.raml
   label: label.raml
+  localVolumes: localVolumes.raml
   net: network.raml
   numbers: numberTypes.raml
   pod: pod.raml
   resources: resources.raml
   strings: stringTypes.raml
   volumes: volumes.raml
+
 types:
   StatusCondition:
     type: object
@@ -150,6 +152,18 @@ types:
         description: |
           Hostname that this instance was launched on.
           May be an IP address if the agent was configured to advertise its hostname that way.
+      agentId?:
+        type: string
+        description: |
+          The Mesos-generated ID of the agent upon which the instance was launched.
+      agentRegion?:
+        type: string
+        description:
+          The @region property of the agent.
+      agentZone?:
+        type: string
+        description:
+          The @zone property of the agent.
       resources?:
         type: resources.Resources
         description: |
@@ -167,6 +181,8 @@ types:
         type: strings.Uri
         description: |
           Location of the version of the pod specification this instance was created from.
+      localVolumes?:
+        type: localVolumes.LocalVolumeId[]
       lastUpdated:
         type: datetime
         description: |
@@ -175,6 +191,10 @@ types:
         type: datetime
         description: |
           Time that this status was last modified (some aspect of status did change)
+      role:
+        type: string
+        description: |
+          The Mesos allocation role of the resources used by this instance.
   ContainerTerminationHistory:
     type: object
     properties:

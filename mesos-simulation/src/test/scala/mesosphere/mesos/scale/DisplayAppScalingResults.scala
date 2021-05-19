@@ -34,9 +34,14 @@ object DisplayAppScalingResults {
     val allMetrics: Seq[JsObject] = ScalingTestResultFiles.readJson[Seq[JsObject]](fileName)
 
     def subMetric(name: String): Map[String, JsObject] = {
-      (allMetrics.last \ name).as[JsObject].value.map {
-        case (name, value) => name -> value.as[JsObject]
-      }(collection.breakOut)
+      (allMetrics.last \ name)
+        .as[JsObject]
+        .value
+        .iterator
+        .map {
+          case (name, value) => name -> value.as[JsObject]
+        }
+        .toMap
     }
 
     println()
@@ -59,16 +64,26 @@ object DisplayAppScalingResults {
 
         IndexedSeq[Any](
           shortenName(histogram),
-          d("count"), d("mean"),
-          d("min"), d("p50"), d("p75"), d("p95"), d("p98"), d("p99"), d("p999"), d("max"))
+          d("count"),
+          d("mean"),
+          d("min"),
+          d("p50"),
+          d("p75"),
+          d("p95"),
+          d("p98"),
+          d("p99"),
+          d("p999"),
+          d("max")
+        )
     }.toSeq
 
     val sortedRows = rows.sortBy(-_(1).asInstanceOf[Long])
 
-    import DisplayHelpers.{ left, right }
+    import DisplayHelpers.{left, right}
     DisplayHelpers.printTable(
       Seq(left, right, right, right, right, right, right, right, right, right, right),
-      DisplayHelpers.withUnderline(header) ++ sortedRows)
+      DisplayHelpers.withUnderline(header) ++ sortedRows
+    )
   }
 
   def main(args: Array[String]): Unit = {

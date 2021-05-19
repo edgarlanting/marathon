@@ -2,47 +2,53 @@ package mesosphere.marathon
 package core.instance.update
 
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.task.{ TaskCondition, Task }
-import mesosphere.marathon.state.Timestamp
+import mesosphere.marathon.core.instance.{Goal, Instance, Reservation}
+import mesosphere.marathon.core.instance.Instance.AgentInfo
+import mesosphere.marathon.core.task.{Task, TaskCondition}
+import mesosphere.marathon.state.{RunSpec, Timestamp}
 import org.apache.mesos
-
-import scala.collection.immutable.Seq
 
 sealed trait InstanceUpdateOperation {
   def instanceId: Instance.Id
-  /**
-    * The possible task state if processing the state op succeeds. If processing the
-    * state op fails, this state will never be persisted, so be cautious when using it.
-    */
-  def possibleNewState: Option[Instance] = None
+
+  def shortString: String = s"${this.getClass.getSimpleName} instance update operation for $instanceId"
 }
 
 object InstanceUpdateOperation {
-  /** Launch (aka create) an ephemeral task*/
-  case class LaunchEphemeral(instance: Instance) extends InstanceUpdateOperation {
-    override def instanceId: Instance.Id = instance.instanceId
-    override def possibleNewState: Option[Instance] = Some(instance)
-  }
 
   /** Revert a task to the given state. Used in case TaskOps are rejected. */
   case class Revert(instance: Instance) extends InstanceUpdateOperation {
     override def instanceId: Instance.Id = instance.instanceId
-    override def possibleNewState: Option[Instance] = Some(instance)
   }
 
-  // TODO(PODS): this should work on an instance, not a task
-  case class Reserve(instance: Instance) extends InstanceUpdateOperation {
+  /**
+    * * Reschedules resident instance that already has a reservation but became terminal (reserved).
+    *
+    * @param instanceId id of existing reserved instance that is now in scheduled state.
+    */
+  case class RescheduleReserved(instanceId: Instance.Id, runSpec: RunSpec) extends InstanceUpdateOperation
+
+  case class Reserve(instanceId: Instance.Id, reservation: Reservation, agentInfo: AgentInfo) extends InstanceUpdateOperation
+  case class Unreserve(instanceId: Instance.Id) extends InstanceUpdateOperation
+
+  /**
+    * Creates a new instance. Scheduled instance has no information where it might run.
+    *
+    * @param instance The new instance.
+    */
+  case class Schedule(instance: Instance) extends InstanceUpdateOperation {
     override def instanceId: Instance.Id = instance.instanceId
-    override def possibleNewState: Option[Instance] = Some(instance)
   }
 
-  case class LaunchOnReservation(
-    instanceId: Instance.Id,
-    runSpecVersion: Timestamp,
-    timestamp: Timestamp,
-    status: Task.Status, // TODO(PODS): the taskStatus must be created for each task and not passed in here
-    hostPorts: Seq[Int]) extends InstanceUpdateOperation
+  /**
+    * Changes the instance state from being scheduled to [[Condition.Provisioned]].
+    *
+    * Scheduled instance have no agent info. Provisioned instances have such info. They are created when offer is
+    * matched.
+    *
+    */
+  case class Provision(instanceId: Instance.Id, agentInfo: Instance.AgentInfo, runSpec: RunSpec, tasks: Map[Task.Id, Task], now: Timestamp)
+      extends InstanceUpdateOperation
 
   /**
     * Describes an instance update.
@@ -52,11 +58,13 @@ object InstanceUpdateOperation {
     * @param mesosStatus New Mesos status
     * @param now Time when update was received
     */
-  case class MesosUpdate(
-      instance: Instance, condition: Condition,
-      mesosStatus: mesos.Protos.TaskStatus, now: Timestamp) extends InstanceUpdateOperation {
+  case class MesosUpdate(instance: Instance, condition: Condition, mesosStatus: mesos.Protos.TaskStatus, now: Timestamp)
+      extends InstanceUpdateOperation {
 
     override def instanceId: Instance.Id = instance.instanceId
+
+    override def shortString: String =
+      s"${this.getClass.getSimpleName} update operation for $instanceId with new status ${mesosStatus.getState}"
   }
 
   object MesosUpdate {
@@ -66,6 +74,10 @@ object InstanceUpdateOperation {
   }
 
   case class ReservationTimeout(instanceId: Instance.Id) extends InstanceUpdateOperation
+
+  case class ChangeGoal(instanceId: Instance.Id, goal: Goal) extends InstanceUpdateOperation {
+    override def shortString: String = s"${this.getClass.getSimpleName} instance update operation for $instanceId with new goal $goal"
+  }
 
   /** Expunge a task whose TaskOp was rejected */
   case class ForceExpunge(instanceId: Instance.Id) extends InstanceUpdateOperation

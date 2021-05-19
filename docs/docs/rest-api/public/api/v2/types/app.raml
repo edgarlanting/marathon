@@ -8,16 +8,19 @@ uses:
   constraints: constraint.raml
   env: environmentVariable.raml
   health: healthCheck.raml
+  check: check.raml
   label: label.raml
   network: network.raml
   number: numberTypes.raml
   readiness: readinessCheck.raml
   secrets: secrets.raml
   strings: stringTypes.raml
+  task: task.raml
   versionInfo: versionInfo.raml
   pragma: pragma.raml
   unreachableStrategy: unreachableStrategy.raml
   killSelection: killSelection.raml
+  resources: resources.raml
 
 types:
   AppResidency:
@@ -31,11 +34,14 @@ types:
         format: int64
         minimum: 0
         default: 3600
-        description: |
+        description:
+          This property is deprecated and it has no effect.
           When a task using persistent local volumes cannot be restarted on the
           agent it's been pinned to, Marathon will try to launch this task on
           another node after this timeout. Defaults to 3600 (one hour).",
       taskLostBehavior:
+        description:
+          This property is deprecated and it has no effect.
         type: strings.TaskLostBehavior
         default: WAIT_FOREVER
   UpgradeStrategy:
@@ -86,8 +92,8 @@ types:
           If no `--default_accepted_resource_roles` was given on startup,
           Marathon considers all resource offers. To register Marathon for a role,
           you need to specify the `--mesos_role` command line flag on startup.
-          If you want to assign all resources of a slave to a role,
-          you can use the `--default_role` argument when starting up the slave.
+          If you want to assign all resources of a agent to a role,
+          you can use the `--default_role` argument when starting up the agent.
           If you need a more fine-grained configuration, you can use the
           `--resources` argument to specify resource shares per role.
           See [the Mesos attribute and resources documentation](http://mesos.apache.org/documentation/latest/attributes-resources/) for details
@@ -112,7 +118,7 @@ types:
         description: |
           Configures exponential backoff behavior when launching potentially sick
           apps. This prevents sandboxes associated with consecutively failing tasks
-          from filling up the hard disk on Mesos slaves.
+          from filling up the hard disk on Mesos agents.
           The backoff period is multiplied by the factor for each consecutive
           failure until it reaches maxLaunchDelaySeconds.
           This applies also to tasks that are killed due to failing too
@@ -125,7 +131,7 @@ types:
         description: |
           Configures exponential backoff behavior when launching potentially sick
           apps. This prevents sandboxes associated with consecutively failing tasks
-          from filling up the hard disk on Mesos slaves.
+          from filling up the hard disk on Mesos agents.
           The backoff period is multiplied by the factor for each consecutive
           failure until it reaches maxLaunchDelaySeconds.
           This applies also to tasks that are killed due to failing too
@@ -182,6 +188,9 @@ types:
           Different executors are available.
           The simplest one (and the one configured by default if none is given) is `//cmd`,
           which takes the cmd and executes that on the shell level.
+      executorResources?:
+        type: resources.ExecutorResources
+        description: The resources to allocate to the executor.
       fetch?:
         type: artifact.Artifact[]
         (pragma.omitEmpty):
@@ -190,6 +199,8 @@ types:
         type: health.AppHealthCheck[]
         (pragma.omitEmpty):
         uniqueItems: true
+      check?:
+        type: check.AppCheck
       instances?:
         type: integer
         format: int32
@@ -204,11 +215,11 @@ types:
         type: integer
         format: int32
         minimum: 0
-        default: 3600
+        default: 300
         description: |
           Configures exponential backoff behavior when launching potentially sick
           apps. This prevents sandboxes associated with consecutively failing tasks
-          from filling up the hard disk on Mesos slaves.
+          from filling up the hard disk on Mesos agents.
           The backoff period is multiplied by the factor for each consecutive
           failure until it reaches maxLaunchDelaySeconds.
           This applies also to tasks that are killed due to failing too many health checks.
@@ -263,7 +274,15 @@ types:
       readinessChecks?:
         type: readiness.ReadinessCheck[]
         (pragma.omitEmpty):
-      residency?: AppResidency
+      residency?:
+        type: AppResidency
+        description:
+          This property is deprecated and it has no effect.
+      resourceLimits?:
+        type: resources.ResourceLimits
+        description: |
+          Specify optional resource limits for a container, allowing the task to consume more cpu and memory resources
+          than requested, if available.
       requirePorts?:
         type: boolean
         description: |
@@ -313,7 +332,48 @@ types:
         type: boolean
         description: |
           Describes if (pseudo) TTY sould be allocated for the process of this container.
+      role?:
+        type: string
+        minLength: 1
+        description: |
+          The role to use. If not specified, uses the role of the enclosing group, or the default role.
+          At the moment, only the default role or the group role are allowed
   AppList:
     type: object
+    (pragma.serializeOnly): # Used only for serialization
     properties:
-      apps: App[]
+      apps: AppInfo[]
+
+  VersionList:
+    type: object
+    properties:
+      versions: datetime[]
+
+  AppInfo:
+    type: App
+    (pragma.serializeOnly): # Used only for serialization
+    properties:
+      tasksStaged?:
+        type: integer
+        format: int32
+      tasksRunning?:
+        type: integer
+        format: int32
+      tasksHealthy?:
+        type: integer
+        format: int32
+      tasksUnhealthy?:
+        type: integer
+        format: int32
+      deployments?:
+        type: strings.Identifiable[]
+        (pragma.forceOptional):
+      readinessCheckResults?:
+        type: readiness.TaskReadinessCheckResult[]
+        (pragma.forceOptional):
+      tasks?:
+        type: task.Task[]
+        (pragma.forceOptional):
+      lastTaskFailure?: task.TaskFailure
+      tasksStats?: task.TaskStatsByVersion
+

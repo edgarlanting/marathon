@@ -3,22 +3,19 @@ package core.event.impl.stream
 
 import java.io.EOFException
 
-import akka.actor.{ Actor, Status }
+import akka.actor.{Actor, Status}
 import akka.event.EventStream
 import akka.pattern.pipe
 import com.typesafe.scalalogging.StrictLogging
+import com.mesosphere.usi.async.ThreadPoolContext
 import mesosphere.marathon.core.event.impl.stream.HttpEventStreamHandleActor._
-import mesosphere.marathon.core.event.{ EventStreamAttached, EventStreamDetached, MarathonEvent }
-import mesosphere.util.ThreadPoolContext
+import mesosphere.marathon.core.event.{EventStreamAttached, EventStreamDetached, MarathonEvent}
 
 import scala.concurrent.Future
 import scala.util.Try
 import scala.util.control.NonFatal
 
-class HttpEventStreamHandleActor(
-    handle: HttpEventStreamHandle,
-    stream: EventStream,
-    maxOutStanding: Int) extends Actor with StrictLogging {
+class HttpEventStreamHandleActor(handle: HttpEventStreamHandle, stream: EventStream, maxOutStanding: Int) extends Actor with StrictLogging {
 
   private[impl] var outstanding = Seq.empty[MarathonEvent]
 
@@ -42,10 +39,11 @@ class HttpEventStreamHandleActor(
       sendAllMessages()
   }
 
-  def stashEvents: Receive = handleWorkDone orElse {
-    case event: MarathonEvent if outstanding.size >= maxOutStanding => dropEvent(event)
-    case event: MarathonEvent => outstanding = event +: outstanding
-  }
+  def stashEvents: Receive =
+    handleWorkDone orElse {
+      case event: MarathonEvent if outstanding.size >= maxOutStanding => dropConnection()
+      case event: MarathonEvent => outstanding = event +: outstanding
+    }
 
   def handleWorkDone: Receive = {
     case WorkDone => sendAllMessages()
@@ -71,22 +69,24 @@ class HttpEventStreamHandleActor(
     }
   }
 
-  private[this] def handleException(ex: Throwable): Unit = ex match {
-    case eof: EOFException =>
-      logger.info(s"Received EOF from stream handle $handle. Ignore subsequent events.")
-      //We know the connection is dead, but it is not finalized from the container.
-      //Do not act any longer on any event.
-      context.become(Actor.emptyBehavior)
-    case NonFatal(e) =>
-      logger.warn(s"Could not send message to $handle reason:", e)
-  }
+  private[this] def handleException(ex: Throwable): Unit =
+    ex match {
+      case eof: EOFException =>
+        logger.info(s"Received EOF from stream handle $handle. Ignore subsequent events.")
+        //We know the connection is dead, but it is not finalized from the container.
+        //Do not act any longer on any event.
+        context.become(Actor.emptyBehavior)
+      case NonFatal(e) =>
+        logger.warn(s"Could not send message to $handle reason:", e)
+    }
 
-  private[this] def dropEvent(event: MarathonEvent): Unit = {
-    logger.warn(s"Ignore event $event for handle $handle (slow consumer)")
+  private[this] def dropConnection(): Unit = {
+    logger.warn(s"Closing connection for slow event consumer $handle.")
+    handle.close()
+    context.stop(self)
   }
 }
 
 object HttpEventStreamHandleActor {
   object WorkDone
 }
-

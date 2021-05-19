@@ -4,14 +4,9 @@ package upgrade
 import java.util.concurrent.TimeUnit
 
 import mesosphere.marathon.core.deployment.DeploymentPlan
-import mesosphere.marathon.state.AppDefinition.AppKey
-import mesosphere.marathon.state.Group.GroupKey
-import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state._
-import org.openjdk.jmh.annotations.{ Group => _, _ }
+import org.openjdk.jmh.annotations.{Group => _, _}
 import org.openjdk.jmh.infra.Blackhole
-
-import scala.collection.breakOut
 import scala.util.Random
 
 @State(Scope.Benchmark)
@@ -24,73 +19,43 @@ object DependencyGraphBenchmark {
   val version1 = VersionInfo.forNewConfig(Timestamp(1))
   val version2 = VersionInfo.forNewConfig(Timestamp(2))
 
-  val superGroups: Map[GroupKey, Group] = superGroupIds.map { superGroupId =>
-
-    val paths: Vector[Vector[PathId]] =
-      groupIds.map { groupId =>
-        appIds.map { appId =>
-          s"/supergroup-${superGroupId}/group-${groupId}/app-${appId}".toPath
+  val superGroups: Map[AbsolutePathId, Group] = superGroupIds.iterator.map { superGroupId =>
+    val paths: Vector[Vector[AbsolutePathId]] =
+      groupIds.iterator.map { groupId =>
+        appIds.iterator.map { appId =>
+          AbsolutePathId(s"/supergroup-${superGroupId}/group-${groupId}/app-${appId}")
         }.toVector
-      }(breakOut)
+      }.toVector
 
-    val appDefs: Map[AppKey, AppDefinition] =
-      groupIds.flatMap { groupId =>
-        appIds.map { appId =>
-          val dependencies = for {
-            depGroupId <- groupIds if depGroupId < groupId
-            depAppId <- appIds
-            if r.nextBoolean
-          } yield paths(depGroupId)(depAppId)
+    val subGroups = groupIds.map { groupId =>
+      val id = AbsolutePathId(s"/supergroup-${superGroupId}/group-${groupId}")
+      Group.empty(id = id)
+    }
 
-          val path = paths(groupId)(appId)
-          path -> AppDefinition(
-            id = path,
-            dependencies = dependencies.toSet,
-            labels = Map("ID" -> appId.toString),
-            versionInfo = version1
-          )
-        }(breakOut)
-      }(breakOut)
-
-    val subGroups: Map[GroupKey, Group] = groupIds.map { groupId =>
-      val id = s"supergroup-${superGroupId}/group-${groupId}".toPath
-      id -> Group(
-        id = id,
-        transitiveAppsById = appDefs,
-        transitivePodsById = Map.empty)
-    }(breakOut)
-
-    val id = s"/supergroup-${superGroupId}".toPath
-    id -> Group(
+    val id = AbsolutePathId(s"/supergroup-${superGroupId}")
+    id -> Builders.newGroup.withoutParentAutocreation(
       id = id,
-      groupsById = subGroups,
-      transitiveAppsById = subGroups.flatMap(_._2.transitiveAppsById)(breakOut),
-      transitivePodsById = Map.empty)
-  }(breakOut)
+      groups = subGroups
+    )
+  }.toMap
 
-  val rootGroup = RootGroup(
-    groupsById = superGroups)
+  val rootGroup = Builders.newRootGroup.withoutParentAutocreation(groups = superGroups.values)
 
-  val upgraded = RootGroup(
-    groupsById = superGroups.map {
+  val upgraded = Builders.newRootGroup.withoutParentAutocreation(
+    groups = superGroups.map {
       case (superGroupId, superGroup) =>
-        if (superGroupId == "/supergroup-0".toPath) {
-          superGroupId -> Group(
+        if (superGroupId == AbsolutePathId("/supergroup-0")) {
+          Builders.newGroup.withoutParentAutocreation(
             id = superGroupId,
-            groupsById = superGroup.groupsById.map {
+            groups = superGroup.groupsById.map {
               case (id, subGroup) =>
-                id -> Group(
-                  id = id,
-                  transitiveAppsById = subGroup.transitiveAppsById.mapValues(_.copy(versionInfo = version2)),
-                  transitivePodsById = Map.empty)
-            },
-            transitiveAppsById = superGroup.groupsById.flatMap { case (_, group) => group.transitiveAppsById.mapValues(_.copy(versionInfo = version2)) },
-            transitivePodsById = Map.empty
+                Group.empty(id = id)
+            }
           )
         } else {
-          superGroupId -> superGroup
+          superGroup
         }
-    }(breakOut)
+    }
   )
 }
 

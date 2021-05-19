@@ -1,0 +1,58 @@
+# ----------------------------------------------------------- #
+# Configuration Fragment : Measure Deployment Failures        #
+# ----------------------------------------------------------- #
+# This fragment installs a counter tracker that tracks the    #
+# number of failed deployments.                               #
+# ----------------------------------------------------------- #
+
+
+# Global test configuration
+# ===========================
+config:
+
+  # Define the metrics we are measuring
+  metrics:
+    - name: failedDeployments
+      uuid: f1c4a1d569564600b7afe69e5f6a6548
+      desc: How many deployment failures occurred
+      summarize:
+        - class: summarize.PercentileSummarizer
+          name: p50
+          percentile: 50
+        - class: summarize.PercentileSummarizer
+          name: p75
+          percentile: 75
+        - class: summarize.PercentileSummarizer
+          name: p95
+          percentile: 95
+        - class: summarize.PercentileSummarizer
+          name: p98
+          percentile: 98
+        - class: summarize.PercentileSummarizer
+          name: p99
+          percentile: 99
+        - class: "@mean_err"
+        - class: "@min"
+        - class: "@max"
+      units: deployments
+
+  # Define the indicators that can summarise our values
+  indicators:
+
+    # Calculate `meanFailedDeployments` by calculating the normalizing average
+    # of all the `failedDeployments` mean values, normalized against each test's
+    # normalization expression
+    - name: meanFailedDeployments
+      class: indicator.NormalizedMeanMetricIndicator
+      metric: failedDeployments.mean_err
+      normalizeto: "{{normalize_to}}"
+
+# Tracker configuration
+# ===========================
+trackers:
+
+  # Track failedDeployments as the number of failed deployment events in the
+  # tracking session
+  - class: tracker.CountTracker
+    metric: failedDeployments
+    events: MarathonDeploymentFailedEvent MarathonDeploymentRequestFailedEvent

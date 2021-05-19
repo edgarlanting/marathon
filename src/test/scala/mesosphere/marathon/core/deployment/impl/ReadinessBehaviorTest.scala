@@ -1,28 +1,29 @@
 package mesosphere.marathon
 package core.deployment.impl
 
-import akka.actor.{ Actor, ActorRef }
-import akka.testkit.{ TestActorRef, TestProbe }
+import akka.actor.{Actor, ActorRef, Cancellable}
+import akka.stream.scaladsl.Source
+import akka.testkit.{TestActorRef, TestProbe}
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.condition.Condition
 import mesosphere.marathon.core.condition.Condition.Running
-import mesosphere.marathon.core.deployment.{ DeploymentPlan, DeploymentStep }
+import mesosphere.marathon.core.deployment.{DeploymentPlan, DeploymentStep}
 import mesosphere.marathon.core.event._
-import mesosphere.marathon.core.health.{ MesosCommandHealthCheck, MesosTcpHealthCheck }
-import mesosphere.marathon.core.instance.Instance
+import mesosphere.marathon.core.health.{MesosCommandHealthCheck, MesosTcpHealthCheck}
+import mesosphere.marathon.core.instance.{Goal, Instance}
 import mesosphere.marathon.core.instance.Instance.InstanceState
-import mesosphere.marathon.core.pod.{ MesosContainer, PodDefinition }
+import mesosphere.marathon.core.pod.{MesosContainer, PodDefinition}
 import mesosphere.marathon.core.readiness.ReadinessCheckExecutor.ReadinessCheckSpec
-import mesosphere.marathon.core.readiness.{ ReadinessCheck, ReadinessCheckExecutor, ReadinessCheckResult }
+import mesosphere.marathon.core.readiness.{ReadinessCheck, ReadinessCheckExecutor, ReadinessCheckResult}
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.bus.MesosTaskStatusTestHelper
 import mesosphere.marathon.core.task.state.NetworkInfo
 import mesosphere.marathon.core.task.tracker.InstanceTracker
-import mesosphere.marathon.raml.Resources
+import mesosphere.marathon.raml.{Raml, Resources}
 import mesosphere.marathon.state._
 import mesosphere.marathon.test.GroupCreation
+import mesosphere.marathon.util.CancellableOnce
 import org.scalatest.concurrent.Eventually
-import rx.lang.scala.Observable
 
 import scala.concurrent.Future
 
@@ -34,9 +35,11 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var taskIsReady = false
       val appWithReadyCheck = AppDefinition(
         f.appId,
+        role = "*",
         portDefinitions = Seq(PortDefinition(123, "tcp", name = Some("http-api"))),
         versionInfo = VersionInfo.OnlyVersion(f.version),
-        readinessChecks = Seq(ReadinessCheck("test")))
+        readinessChecks = Seq(ReadinessCheck("test"))
+      )
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsReady, _ => taskIsReady = true)
 
       When("The task becomes running")
@@ -53,10 +56,12 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var taskIsReady = false
       val appWithReadyCheck = AppDefinition(
         f.appId,
+        role = "*",
         portDefinitions = Seq(PortDefinition(123, "tcp", name = Some("http-api"))),
         versionInfo = VersionInfo.OnlyVersion(f.version),
         healthChecks = Set(MesosCommandHealthCheck(command = Command("true"))),
-        readinessChecks = Seq(ReadinessCheck("test")))
+        readinessChecks = Seq(ReadinessCheck("test"))
+      )
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsReady, _ => taskIsReady = true)
 
       When("The task becomes healthy")
@@ -74,9 +79,11 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var taskIsReady = false
       val appWithReadyCheck = AppDefinition(
         f.appId,
+        role = "*",
         portDefinitions = Seq(PortDefinition(123, "tcp", name = Some("http-api"))),
         versionInfo = VersionInfo.OnlyVersion(f.version),
-        healthChecks = Set(MesosCommandHealthCheck(command = Command("true"))))
+        healthChecks = Set(MesosCommandHealthCheck(command = Command("true")))
+      )
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsReady, _ => taskIsReady = true)
 
       When("The task becomes healthy")
@@ -93,6 +100,7 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var podIsReady = false
       val podWithReadyCheck = PodDefinition(
         f.appId,
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "container",
@@ -100,7 +108,7 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
             resources = Resources()
           )
         ),
-        version = f.version
+        versionInfo = VersionInfo.OnlyVersion(f.version)
       )
 
       val actor = f.readinessActor(podWithReadyCheck, f.checkIsReady, _ => podIsReady = true)
@@ -117,9 +125,7 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       Given("An app with one instance")
       val f = new Fixture
       var taskIsReady = false
-      val appWithReadyCheck = AppDefinition(
-        f.appId,
-        versionInfo = VersionInfo.OnlyVersion(f.version))
+      val appWithReadyCheck = AppDefinition(f.appId, role = "*", versionInfo = VersionInfo.OnlyVersion(f.version))
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsReady, _ => taskIsReady = true)
 
       When("The task becomes running")
@@ -136,10 +142,12 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var taskIsReady = false
       val appWithReadyCheck = AppDefinition(
         f.appId,
+        role = "*",
         portDefinitions = Seq(PortDefinition(123, "tcp", name = Some("http-api"))),
         versionInfo = VersionInfo.OnlyVersion(f.version),
         healthChecks = Set(MesosCommandHealthCheck(command = Command("true"))),
-        readinessChecks = Seq(ReadinessCheck("test")))
+        readinessChecks = Seq(ReadinessCheck("test"))
+      )
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsReady, _ => taskIsReady = true)
 
       When("The task becomes running")
@@ -167,9 +175,11 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       var taskIsReady = false
       val appWithReadyCheck = AppDefinition(
         f.appId,
+        role = "*",
         portDefinitions = Seq(PortDefinition(123, "tcp", name = Some("http-api"))),
         versionInfo = VersionInfo.OnlyVersion(f.version),
-        readinessChecks = Seq(ReadinessCheck("test")))
+        readinessChecks = Seq(ReadinessCheck("test"))
+      )
       val actor = f.readinessActor(appWithReadyCheck, f.checkIsNotReady, _ => taskIsReady = true)
       system.eventStream.publish(f.instanceRunning)
       eventually(actor.underlyingActor.healthyInstances should have size 1)
@@ -180,7 +190,7 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
       Then("Task should be removed from healthy, ready and subscriptions.")
       actor.underlyingActor.healthyInstances should be(empty)
       actor.underlyingActor.readyInstances should be(empty)
-      actor.underlyingActor.subscriptionKeys should be(empty)
+      eventually(actor.underlyingActor.subscriptionKeys should be(empty))
       actor.stop()
     }
   }
@@ -191,11 +201,12 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
     val deploymentManagerProbe = TestProbe()
     val step = DeploymentStep(Seq.empty)
     val plan = DeploymentPlan("deploy", createRootGroup(), createRootGroup(), Seq(step), Timestamp.now())
-    val deploymentStatus = DeploymentStatus(plan, step)
+    val deploymentStatus = DeploymentStatus(Raml.toRaml(plan), Raml.toRaml(step))
     val tracker = mock[InstanceTracker]
-    val appId = PathId("/test")
+    val appId = AbsolutePathId("/test")
+    val app = AppDefinition(appId, role = "*")
     val instanceId = Instance.Id.forRunSpec(appId)
-    val taskId = Task.Id.forInstanceId(instanceId, container = None)
+    val taskId = Task.Id(instanceId)
     val hostName = "some.host"
     val agentInfo = mock[Instance.AgentInfo]
     agentInfo.host returns hostName
@@ -206,7 +217,8 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
         startedAt = Some(Timestamp.now()),
         mesosStatus = Some(mesosStatus),
         condition = Condition.Running,
-        networkInfo = NetworkInfo(hostName, hostPorts = Seq(1, 2, 3), ipAddresses = Nil))
+        networkInfo = NetworkInfo(hostName, hostPorts = Seq(1, 2, 3), ipAddresses = Nil)
+      )
 
       val t = mock[Task]
       t.taskId returns taskId
@@ -220,8 +232,14 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
     def instance = {
       val task = mockTask
       val instance = Instance(
-        instanceId, agentInfo, InstanceState(Running, version, Some(version), healthy = Some(true)),
-        Map(task.taskId -> task), runSpecVersion = version, UnreachableStrategy.default())
+        instanceId,
+        Some(agentInfo),
+        InstanceState(Running, version, Some(version), healthy = Some(true), Goal.Running),
+        Map(task.taskId -> task),
+        app,
+        None,
+        "*"
+      )
       tracker.instance(any) returns Future.successful(Some(instance))
       instance
     }
@@ -233,8 +251,8 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
 
     def readinessActor(spec: RunSpec, readinessCheckResults: Seq[ReadinessCheckResult], readyFn: Instance.Id => Unit) = {
       val executor = new ReadinessCheckExecutor {
-        override def execute(readinessCheckInfo: ReadinessCheckSpec): Observable[ReadinessCheckResult] = {
-          Observable.from(readinessCheckResults)
+        override def execute(readinessCheckInfo: ReadinessCheckSpec): Source[ReadinessCheckResult, Cancellable] = {
+          Source(readinessCheckResults).mapMaterializedValue { _ => new CancellableOnce(() => ()) }
         }
       }
       TestActorRef(new Actor with ReadinessBehavior {
@@ -243,16 +261,16 @@ class ReadinessBehaviorTest extends AkkaUnitTest with Eventually with GroupCreat
           system.eventStream.subscribe(self, classOf[InstanceHealthChanged])
         }
         override def runSpec: RunSpec = spec
-        override def deploymentManager: ActorRef = deploymentManagerProbe.ref
+        override def deploymentManagerActor: ActorRef = deploymentManagerProbe.ref
         override def status: DeploymentStatus = deploymentStatus
         override def readinessCheckExecutor: ReadinessCheckExecutor = executor
         override def instanceTracker: InstanceTracker = tracker
-        override def receive: Receive = readinessBehavior orElse {
-          case notHandled => throw new RuntimeException(notHandled.toString)
-        }
+        override def receive: Receive =
+          readinessBehavior orElse {
+            case notHandled => throw new RuntimeException(notHandled.toString)
+          }
         override def instanceConditionChanged(instanceId: Instance.Id): Unit = if (targetCountReached(1)) readyFn(instanceId)
-      }
-      )
+      })
     }
   }
 }

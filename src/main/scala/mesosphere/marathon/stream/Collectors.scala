@@ -2,13 +2,13 @@ package mesosphere.marathon
 package stream
 
 import java.util
-import java.util.function.{ BiConsumer, BinaryOperator, Function, Supplier }
+import java.util.function.{BiConsumer, BinaryOperator, Function, Supplier}
 import java.util.stream.Collector
 import java.util.stream.Collector.Characteristics
 
 import mesosphere.marathon.functional._
 
-import scala.collection.immutable.{ IndexedSeq, Seq }
+import scala.collection.immutable.{IndexedSeq, Seq}
 import scala.collection.mutable
 
 private class GenericCollector[T, C <: TraversableOnce[T]](builder: () => mutable.Builder[T, C])
@@ -18,8 +18,8 @@ private class GenericCollector[T, C <: TraversableOnce[T]](builder: () => mutabl
   override def combiner(): BinaryOperator[mutable.Builder[T, C]] =
     (buf1: mutable.Builder[T, C], buf2: mutable.Builder[T, C]) => buf1 ++= buf2.result
 
-  override def finisher(): Function[mutable.Builder[T, C], C] = {
-    (buf: mutable.Builder[T, C]) => buf.result()
+  override def finisher(): Function[mutable.Builder[T, C], C] = { (buf: mutable.Builder[T, C]) =>
+    buf.result()
   }
 
   override def accumulator(): BiConsumer[mutable.Builder[T, C], T] = { (buf: mutable.Builder[T, C], v: T) =>
@@ -29,8 +29,7 @@ private class GenericCollector[T, C <: TraversableOnce[T]](builder: () => mutabl
   override def characteristics(): util.Set[Characteristics] = util.Collections.emptySet()
 }
 
-private class MapCollector[K, V]()
-    extends Collector[util.Map.Entry[K, V], mutable.Builder[(K, V), Map[K, V]], Map[K, V]] {
+private class MapCollector[K, V]() extends Collector[util.Map.Entry[K, V], mutable.Builder[(K, V), Map[K, V]], Map[K, V]] {
 
   override def supplier(): Supplier[mutable.Builder[(K, V), Map[K, V]]] = () => Map.newBuilder[K, V]
 
@@ -39,8 +38,8 @@ private class MapCollector[K, V]()
       buf1 ++= buf2.result()
   }
 
-  override def finisher(): Function[mutable.Builder[(K, V), Map[K, V]], Map[K, V]] = {
-    (buf: mutable.Builder[(K, V), Map[K, V]]) => buf.result()
+  override def finisher(): Function[mutable.Builder[(K, V), Map[K, V]], Map[K, V]] = { (buf: mutable.Builder[(K, V), Map[K, V]]) =>
+    buf.result()
   }
 
   override def accumulator(): BiConsumer[mutable.Builder[(K, V), Map[K, V]], util.Map.Entry[K, V]] = {

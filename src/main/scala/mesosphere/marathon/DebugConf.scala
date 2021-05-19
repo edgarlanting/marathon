@@ -2,14 +2,14 @@ package mesosphere.marathon
 
 import java.net.URI
 
-import ch.qos.logback.classic.{ AsyncAppender, Level, LoggerContext }
+import ch.qos.logback.classic.{AsyncAppender, Level, LoggerContext}
 import ch.qos.logback.core.net.ssl.SSLConfiguration
 import com.getsentry.raven.logback.SentryAppender
 import com.google.inject.AbstractModule
 import net.logstash.logback.appender._
 import net.logstash.logback.composite.loggingevent.ArgumentsJsonProvider
 import org.rogach.scallop.ScallopConf
-import org.slf4j.{ Logger, LoggerFactory }
+import org.slf4j.{Logger, LoggerFactory}
 
 /**
   * Options related to debugging marathon.
@@ -18,13 +18,12 @@ trait DebugConf extends ScallopConf {
 
   lazy val metrics = toggle(
     "metrics",
-    descrYes =
-      "(Deprecated) Ignored",
-    descrNo =
-      "(Deprecated) Ignored",
+    descrYes = "(Deprecated) Ignored",
+    descrNo = "(Deprecated) Ignored",
     default = Some(false),
     noshort = true,
-    prefix = "disable_")
+    prefix = "disable_"
+  )
 
   lazy val logLevel = opt[String](
     "logging_level",
@@ -53,7 +52,7 @@ trait DebugConf extends ScallopConf {
 class DebugModule(conf: DebugConf) extends AbstractModule {
   override def configure(): Unit = {
     //set trace log levelN
-    conf.logLevel.get.foreach { levelName =>
+    conf.logLevel.foreach { levelName =>
       val level = Level.toLevel(if ("fatal".equalsIgnoreCase(levelName)) "fatal" else levelName)
       LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) match {
         case l: ch.qos.logback.classic.Logger => l.setLevel(level)
@@ -61,12 +60,12 @@ class DebugModule(conf: DebugConf) extends AbstractModule {
       }
     }
 
-    conf.logstash.get.foreach {
+    conf.logstash.foreach {
       configureLogstash
     }
 
-    conf.sentryUrl.get.foreach {
-      configureSentry(_, conf.sentryTags.get)
+    conf.sentryUrl.foreach {
+      configureSentry(_, conf.sentryTags.toOption)
     }
   }
 
@@ -87,7 +86,6 @@ class DebugModule(conf: DebugConf) extends AbstractModule {
   private def configureLogstash(destination: URI): Unit = {
     LoggerFactory.getILoggerFactory match {
       case context: LoggerContext =>
-
         val encoder = new net.logstash.logback.encoder.LogstashEncoder()
         encoder.setContext(context)
         encoder.addProvider(new ArgumentsJsonProvider())

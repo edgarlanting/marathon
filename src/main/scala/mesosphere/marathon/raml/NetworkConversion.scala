@@ -2,9 +2,9 @@ package mesosphere.marathon
 package raml
 
 import mesosphere.marathon.core.pod
-import mesosphere.marathon.stream.Implicits._
 import mesosphere.mesos.protos.Implicits._
-import org.apache.mesos.Protos.ContainerInfo.DockerInfo.{ Network => DockerNetworkMode }
+import org.apache.mesos.Protos.ContainerInfo.DockerInfo.{Network => DockerNetworkMode}
+import scala.jdk.CollectionConverters._
 
 trait NetworkConversion {
 
@@ -15,12 +15,13 @@ trait NetworkConversion {
       raml.mode match {
         case NetworkMode.Host => pod.HostNetwork
         case NetworkMode.ContainerBridge => pod.BridgeNetwork(raml.labels)
-        case NetworkMode.Container => pod.ContainerNetwork(
-          // we expect validation to catch this problem first. but it's possible that migration
-          // also runs into this problem so we handle it explicitly.
-          raml.name.getOrElse(throw SerializationFailedException(ContainerNetworkRequiresName)),
-          raml.labels
-        )
+        case NetworkMode.Container =>
+          pod.ContainerNetwork(
+            // we expect validation to catch this problem first. but it's possible that migration
+            // also runs into this problem so we handle it explicitly.
+            raml.name.getOrElse(throw SerializationFailedException(ContainerNetworkRequiresName)),
+            raml.labels
+          )
       }
     }
 
@@ -40,7 +41,12 @@ trait NetworkConversion {
   }
 
   implicit val protocolWrites: Writes[String, NetworkProtocol] = Writes { protocol =>
-    NetworkProtocol.fromString(protocol).getOrElse(throw new IllegalStateException(s"unsupported protocol $protocol"))
+    // Regression MARATHON-8575
+    if (protocol == "tcp,udp") {
+      NetworkProtocol.UdpTcp
+    } else {
+      NetworkProtocol.fromString(protocol).getOrElse(throw new IllegalStateException(s"unsupported protocol $protocol"))
+    }
   }
 
   implicit val portDefinitionWrites: Writes[state.PortDefinition, PortDefinition] = Writes { port =>
@@ -82,23 +88,32 @@ trait NetworkConversion {
       )
   }
 
-  implicit val containerPortMappingProtoRamlWriter: Writes[Protos.ExtendedContainerInfo.PortMapping, ContainerPortMapping] = Writes { mapping =>
-    ContainerPortMapping(
-      containerPort = mapping.whenOrElse(_.hasContainerPort, _.getContainerPort, ContainerPortMapping.DefaultContainerPort),
-      hostPort = mapping.when(_.hasHostPort, _.getHostPort).orElse(ContainerPortMapping.DefaultHostPort),
-      labels = mapping.whenOrElse(_.getLabelsCount > 0, _.getLabelsList.flatMap(_.fromProto)(collection.breakOut), ContainerPortMapping.DefaultLabels),
-      name = mapping.when(_.hasName, _.getName).orElse(ContainerPortMapping.DefaultName),
-      protocol = mapping.when(_.hasProtocol, _.getProtocol).flatMap(NetworkProtocol.fromString).getOrElse(ContainerPortMapping.DefaultProtocol),
-      servicePort = mapping.whenOrElse(_.hasServicePort, _.getServicePort, ContainerPortMapping.DefaultServicePort),
-      networkNames = mapping.whenOrElse(_.getNetworkNamesList.size > 0, _.getNetworkNamesList.toList, ContainerPortMapping.DefaultNetworkNames)
-    )
+  implicit val containerPortMappingProtoRamlWriter: Writes[Protos.ExtendedContainerInfo.PortMapping, ContainerPortMapping] = Writes {
+    mapping =>
+      ContainerPortMapping(
+        containerPort = mapping.whenOrElse(_.hasContainerPort, _.getContainerPort, ContainerPortMapping.DefaultContainerPort),
+        hostPort = mapping.when(_.hasHostPort, _.getHostPort).orElse(ContainerPortMapping.DefaultHostPort),
+        labels = mapping.whenOrElse(
+          _.getLabelsCount > 0,
+          _.getLabelsList.asScala.iterator.flatMap(_.fromProto).toMap,
+          ContainerPortMapping.DefaultLabels
+        ),
+        name = mapping.when(_.hasName, _.getName).orElse(ContainerPortMapping.DefaultName),
+        protocol =
+          mapping.when(_.hasProtocol, _.getProtocol).flatMap(NetworkProtocol.fromString).getOrElse(ContainerPortMapping.DefaultProtocol),
+        servicePort = mapping.whenOrElse(_.hasServicePort, _.getServicePort, ContainerPortMapping.DefaultServicePort),
+        networkNames =
+          mapping.whenOrElse(_.getNetworkNamesList.size > 0, _.getNetworkNamesList.asScala.toList, ContainerPortMapping.DefaultNetworkNames)
+      )
   }
 
-  implicit val dockerPortMappingProtoRamlWriter: Writes[Protos.ExtendedContainerInfo.DockerInfo.ObsoleteDockerPortMapping, ContainerPortMapping] = Writes { mapping =>
+  implicit val dockerPortMappingProtoRamlWriter
+      : Writes[Protos.ExtendedContainerInfo.DockerInfo.ObsoleteDockerPortMapping, ContainerPortMapping] = Writes { mapping =>
     ContainerPortMapping(
       containerPort = mapping.whenOrElse(_.hasContainerPort, _.getContainerPort, ContainerPortMapping.DefaultContainerPort),
       hostPort = mapping.when(_.hasHostPort, _.getHostPort).orElse(ContainerPortMapping.DefaultHostPort),
-      labels = mapping.whenOrElse(_.getLabelsCount > 0, _.getLabelsList.flatMap(_.fromProto)(collection.breakOut), ContainerPortMapping.DefaultLabels),
+      labels = mapping
+        .whenOrElse(_.getLabelsCount > 0, _.getLabelsList.asScala.iterator.flatMap(_.fromProto).toMap, ContainerPortMapping.DefaultLabels),
       name = mapping.when(_.hasName, _.getName).orElse(ContainerPortMapping.DefaultName),
       protocol = mapping.whenOrElse(_.hasProtocol, _.getProtocol.toRaml[NetworkProtocol], ContainerPortMapping.DefaultProtocol),
       servicePort = mapping.whenOrElse(_.hasServicePort, _.getServicePort, ContainerPortMapping.DefaultServicePort)
@@ -123,7 +138,7 @@ trait NetworkConversion {
     Network(
       name = if (net.hasName) Option(net.getName) else Network.DefaultName,
       mode = mode,
-      labels = if (net.getLabelsCount > 0) net.getLabelsList.to[Seq].fromProto else Network.DefaultLabels
+      labels = if (net.getLabelsCount > 0) net.getLabelsList.asScala.to(Seq).fromProto else Network.DefaultLabels
     )
   }
 }

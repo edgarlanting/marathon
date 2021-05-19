@@ -17,6 +17,7 @@ See the detailed docs on
 {
     "id": "simple-docker",
     "container": {
+      "type" : "DOCKER",
       "docker": {
         "image": "busybox"
       }
@@ -34,6 +35,7 @@ See the detailed docs on
 {
     "id": "simple-docker",
     "container": {
+      "type" : "DOCKER",
       "docker": {
         "image": "mesosphere/inky"
       }
@@ -49,7 +51,7 @@ where the "mesosphere/inky" Dockerfile is defined as:
 
 ```Dockerfile
 FROM busybox
-MAINTAINER support@mesosphere.io
+LABEL maintainer="support@mesosphere.io"
 
 CMD ["inky"]
 ENTRYPOINT ["echo"]
@@ -126,7 +128,11 @@ See the detailed docs on
   "instances": 2,
   "mem": 32.0,
   "ports": [0],
-  "uris": ["http://downloads.mesosphere.com/misc/toggle.tgz"]
+  "fetch": [
+    {
+      "uri": "http://downloads.mesosphere.com/misc/toggle.tgz"
+    }
+  ]
 }
 ```
 
@@ -151,13 +157,17 @@ See the detailed docs on
   "instances": 2,
   "mem": 32.0,
   "ports": [0],
-  "uris": ["http://downloads.mesosphere.com/misc/toggle.tgz"]
+  "fetch": [
+    {
+      "uri": "http://downloads.mesosphere.com/misc/toggle.tgz"
+    }
+  ]
 }
 ```
 
 ### Command (executor) health checks
 
-Command health checks are executed on the slave where the task is running.
+Command health checks are executed on the agent where the task is running.
 To enable this feature for marathon versions prior to `0.7.4`, start Marathon with the `--executor_health_checks` flag (not required/allowed since `0.7.4`). Requires Mesos version `0.20.0` or later.
 
 ```json
@@ -179,7 +189,11 @@ To enable this feature for marathon versions prior to `0.7.4`, start Marathon wi
   "instances": 2,
   "mem": 32.0,
   "ports": [0],
-  "uris": ["http://downloads.mesosphere.com/misc/toggle.tgz"]
+  "fetch": [
+    {
+      "uri": "http://downloads.mesosphere.com/misc/toggle.tgz"
+    }
+  ]
 }
 ```
 
@@ -236,7 +250,7 @@ that you quote the "*" correctly)
 ### Using constraints
 
 You can use constraints to restrict where to run the tasks for your apps. See
-[constraints]({ site.baseurl }}/docs/constraints.html) for details.
+[constraints]({{ site.baseurl }}/docs/constraints.html) for details.
 
 The advantage of using constraints to restrict where tasks run is that you only have to provide appropriate attributes on the Mesos agents.
 
@@ -262,5 +276,3 @@ Often, multiple instances of legacy applications cannot be run concurrently. The
     "maximumOverCapacity": 0
   }
 ```
-
-

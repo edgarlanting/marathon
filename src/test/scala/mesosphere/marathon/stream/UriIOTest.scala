@@ -1,10 +1,11 @@
 package mesosphere.marathon
 package stream
 
-import java.io.{ File, IOException }
+import java.io.File
 import java.net.URI
+import java.nio.charset.Charset
 
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
 import mesosphere.AkkaUnitTest
 import org.apache.commons.io.FileUtils
@@ -29,10 +30,13 @@ class UriIOTest extends AkkaUnitTest {
       val file = File.createTempFile("marathon-file", ".test")
       file.deleteOnExit()
       val content = s"Hello World ${System.currentTimeMillis()}"
-      FileUtils.write(file, content)
-      UriIO.reader(new URI(s"file://${file.getAbsolutePath}")).runWith(Sink.foreach[ByteString]{ bs =>
-        bs.utf8String shouldBe content
-      }).futureValue
+      FileUtils.write(file, content, Charset.defaultCharset)
+      UriIO
+        .reader(new URI(s"file://${file.getAbsolutePath}"))
+        .runWith(Sink.foreach[ByteString] { bs =>
+          bs.utf8String shouldBe content
+        })
+        .futureValue
       file.delete()
     }
 
@@ -41,7 +45,7 @@ class UriIOTest extends AkkaUnitTest {
       file.deleteOnExit()
       val content = s"Hello World ${System.currentTimeMillis()}"
       Source.single(ByteString(content)).runWith(UriIO.writer(new URI(s"file://${file.getAbsolutePath}"))).futureValue
-      FileUtils.readFileToString(file) shouldBe content
+      FileUtils.readFileToString(file, Charset.defaultCharset) shouldBe content
       file.delete()
     }
 
@@ -50,7 +54,7 @@ class UriIOTest extends AkkaUnitTest {
       // creating a file and disable reading does not work with root privileges.
       val tmpDir = new File(sys.props("java.io.tmpdir"))
       val future = UriIO.reader(new URI(s"file://${tmpDir.getAbsolutePath}")).runWith(Sink.ignore)
-      future.failed.futureValue shouldBe a[IOException]
+      future.failed.futureValue shouldBe a[IllegalArgumentException]
     }
 
     "write to a file that is not writable fails" in {
@@ -59,7 +63,7 @@ class UriIOTest extends AkkaUnitTest {
       val tmpDir = new File(sys.props("java.io.tmpdir"))
       val content = s"Hello World ${System.currentTimeMillis()}"
       val future = Source.single(ByteString(content)).runWith(UriIO.writer(new URI(s"file://${tmpDir.getAbsolutePath}")))
-      future.failed.futureValue shouldBe a[IOException]
+      future.failed.futureValue shouldBe a[akka.stream.IOOperationIncompleteException]
     }
   }
 }

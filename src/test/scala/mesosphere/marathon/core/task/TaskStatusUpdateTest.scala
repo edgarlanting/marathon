@@ -2,12 +2,12 @@ package mesosphere.marathon
 package core.task
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.base.ConstantClock
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.instance.TestTaskBuilder
+import mesosphere.marathon.core.instance.{Instance, TestTaskBuilder}
 import mesosphere.marathon.core.task.bus.MesosTaskStatusTestHelper
-import mesosphere.marathon.core.task.update.{ TaskUpdateEffect, TaskUpdateOperation }
-import mesosphere.marathon.state.PathId
+import mesosphere.marathon.core.task.update.TaskUpdateEffect
+import mesosphere.marathon.state.AbsolutePathId
+import mesosphere.marathon.test.SettableClock
 import org.apache.mesos.Protos.TaskState
 
 import scala.concurrent.duration._
@@ -38,13 +38,14 @@ class TaskStatusUpdateTest extends UnitTest {
       val f = new Fixture
 
       val task = TestTaskBuilder.Helper.minimalRunning(appId = f.appId, since = f.clock.now())
+      val instance = mock[Instance]
+      instance.hasReservation returns false
 
-      f.clock += 5.seconds
+      f.clock.advanceBy(5.seconds)
 
       val status = MesosTaskStatusTestHelper.unreachable(task.taskId, f.clock.now())
-      val update = TaskUpdateOperation.MesosUpdate(TaskCondition(status), status, f.clock.now())
 
-      val effect = task.update(update)
+      val effect = task.update(instance, TaskCondition(status), status, f.clock.now())
 
       behave like unreachableEffect(effect)
     }
@@ -53,23 +54,22 @@ class TaskStatusUpdateTest extends UnitTest {
   "LaunchedOnReservation" when {
     "updating a running task with a TASK_UNREACHABLE" should {
       val f = new Fixture
+      val task = TestTaskBuilder.Helper.residentLaunchedTask(f.appId)
+      val instance = mock[Instance]
+      instance.hasReservation returns true
 
-      val volumeId = Task.LocalVolumeId(f.appId, "persistent-volume", "uuid")
-      val task = TestTaskBuilder.Helper.residentLaunchedTask(f.appId, volumeId)
-
-      f.clock += 5.seconds
+      f.clock.advanceBy(5.seconds)
 
       val status = MesosTaskStatusTestHelper.unreachable(task.taskId, f.clock.now())
-      val update = TaskUpdateOperation.MesosUpdate(TaskCondition(status), status, f.clock.now())
 
-      val effect = task.update(update)
+      val effect = task.update(instance, TaskCondition(status), status, f.clock.now())
 
       behave like unreachableEffect(effect)
     }
   }
 
   class Fixture {
-    val appId = PathId("/app")
-    val clock = ConstantClock()
+    val appId = AbsolutePathId("/app")
+    val clock = new SettableClock()
   }
 }

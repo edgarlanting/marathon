@@ -3,7 +3,7 @@ package core.task.state
 
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon.state._
-import mesosphere.marathon.stream.Implicits._
+import scala.jdk.CollectionConverters._
 import org.apache.mesos
 
 import scala.annotation.tailrec
@@ -15,10 +15,7 @@ import scala.annotation.tailrec
   * @param hostName the agent's hostName
   * @param ipAddresses all associated IP addresses, computed from mesosStatus
   */
-case class NetworkInfo(
-    hostName: String,
-    hostPorts: Seq[Int],
-    ipAddresses: Seq[mesos.Protos.NetworkInfo.IPAddress]) {
+case class NetworkInfo(hostName: String, hostPorts: Seq[Int], ipAddresses: Seq[mesos.Protos.NetworkInfo.IPAddress]) {
 
   import NetworkInfo._
 
@@ -88,18 +85,19 @@ object NetworkInfo extends StrictLogging {
 
   def resolveIpAddresses(mesosStatus: mesos.Protos.TaskStatus): Seq[mesos.Protos.NetworkInfo.IPAddress] = {
     if (mesosStatus.hasContainerStatus && mesosStatus.getContainerStatus.getNetworkInfosCount > 0) {
-      mesosStatus.getContainerStatus.getNetworkInfosList.flatMap(_.getIpAddressesList)(collection.breakOut)
+      mesosStatus.getContainerStatus.getNetworkInfosList.asScala.iterator.flatMap(_.getIpAddressesList.asScala).toSeq
     } else {
       Nil
     }
   }
 
   private def computePortAssignments(
-    app: AppDefinition,
-    hostName: String,
-    hostPorts: Seq[Int],
-    effectiveIpAddress: Option[String],
-    includeUnresolved: Boolean): Seq[PortAssignment] = {
+      app: AppDefinition,
+      hostName: String,
+      hostPorts: Seq[Int],
+      effectiveIpAddress: Option[String],
+      includeUnresolved: Boolean
+  ): Seq[PortAssignment] = {
 
     def fromPortMappings(container: Container): Seq[PortAssignment] = {
       import Container.PortMapping
@@ -113,7 +111,8 @@ object NetworkInfo extends StrictLogging {
               effectiveIpAddress = Option(hostName),
               effectivePort = hostPort,
               hostPort = Option(hostPort),
-              containerPort = Option(containerPort)
+              // See [[TaskBuilder.computeContainerInfo.boundPortMappings]] for more info.
+              containerPort = if (containerPort == 0) Option(hostPort) else Option(containerPort)
             )
             gen(xs, rs, assignment :: assignments)
           case (_, mapping :: rs) if mapping.hostPort.isEmpty =>
@@ -133,10 +132,11 @@ object NetworkInfo extends StrictLogging {
             assignments
           case _ =>
             throw new IllegalStateException(
-              s"failed to align remaining allocated host ports $ports with remaining declared port mappings $mappings")
+              s"failed to align remaining allocated host ports $ports with remaining declared port mappings $mappings in app ${app.id}"
+            )
         }
       }
-      gen(hostPorts.to[List], container.portMappings.to[List], Nil).reverse
+      gen(hostPorts.to(List), container.portMappings.to(List), Nil).reverse
     }
 
     def fromPortDefinitions: Seq[PortAssignment] =
@@ -146,7 +146,8 @@ object NetworkInfo extends StrictLogging {
             portName = portDefinition.name,
             effectiveIpAddress = effectiveIpAddress,
             effectivePort = hostPort,
-            hostPort = Some(hostPort))
+            hostPort = Some(hostPort)
+          )
       }
 
     app.container.collect {

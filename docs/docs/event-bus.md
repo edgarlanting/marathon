@@ -8,7 +8,7 @@ Marathon has an internal event bus that captures all API requests and scaling ev
 By subscribing to the event bus, you can be informed about every event instantly, without pulling.
 The event bus is useful for integrating with any entity that acts based on the state of Marathon, like load balancers, or to compile statistics.
 
-For more information, see the `/v2/events` entry in the [Marathon REST API Reference](https://mesosphere.github.io/marathon/docs/generated/api.html).
+For more information, see the `/v2/events` entry in the [Marathon REST API Reference](https://mesosphere.github.io/marathon/api-console/index.html).
 
 ## Subscription to Events via The Event Stream
 
@@ -41,15 +41,19 @@ attaching to or detaching from the event stream.
 curl -H "Accept: text/event-stream"  <MARATHON_HOST>:<MARATHON_PORT>/v2/events?event_type=event_stream_detached\&event_type=event_stream_attached
 ```
 
+## Event ordering guarantees
+
+The events are emitted by asynchronous components inside of Marathon. Generally speaking, the ordering of events is not guaranteed. If one is wanting to replicate Marathon's state, the event stream should only be used as a cache-invalidation mechanism (pull snapshots, and then pull bits of state as the event stream says something related has changed).
+
 ## Event Types
 
-Below are example JSON bodies that are send by Marathon.
+Below are example JSON bodies that are sent by Marathon.
 
 ### API Request
 
 Fired every time Marathon receives an API request that modifies an app (create, update, delete):
 
-``` json
+```json
 {
   "eventType": "api_post_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -76,10 +80,39 @@ Fired every time Marathon receives an API request that modifies an app (create, 
     "upgradeStrategy": {
         "minimumHealthCapacity": 1.0
     },
-    "uris": [],
+    "fetch": [],
     "user": null,
     "version": "2014-09-09T05:57:50.866Z"
   }
+}
+```
+
+Pod-related events:
+
+```json
+{
+  "clientIp": "0:0:0:0:0:0:0:1",
+  "uri": "/v2/pods/my-pod",
+  "eventType": "pod_created_event",
+  "timestamp": "2014-03-01T23:29:30.158Z"
+}
+```
+
+```json
+{
+  "clientIp": "0:0:0:0:0:0:0:1",
+  "uri": "/v2/pods/my-pod",
+  "eventType": "pod_updated_event",
+  "timestamp": "2014-03-01T23:29:30.158Z"
+}
+```
+
+```json
+{
+  "clientIp": "0:0:0:0:0:0:0:1",
+  "uri": "/v2/pods/my-pod",
+  "eventType": "pod_deleted_event",
+  "timestamp": "2014-03-01T23:29:30.158Z"
 }
 ```
 
@@ -87,7 +120,7 @@ Fired every time Marathon receives an API request that modifies an app (create, 
 
 Fired every time the status of a task changes:
 
-``` json
+```json
 {
   "eventType": "status_update_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -114,9 +147,68 @@ The possible values for `taskStatus` are:
 
 where the last four states are terminal.
 
+```json
+{
+  "eventType": "app_terminated_event",
+  "timestamp": "2014-03-01T23:29:30.158Z",
+  "appId": "/my-app"
+}
+```
+
+
+```json
+{
+ "instanceId": "my-app.instance-c7c311a4-b669-11e6-a48f-0ea4f4b1778c",
+ "condition": "Running",
+ "runSpecId": "/app-id",
+ "agentId": "20140909-054127-177048842-5050-1494-0",
+ "host": "slave-1234.acme.org",
+ "runSpecVersion": "2014-03-01T23:29:30.158Z",
+ "timestamp": "2014-03-01T23:29:30.158Z",
+ "eventType": "instance_changed_event"
+}
+```
+
+The possible values for `condition` are:
+
+- `Error`
+- `Failed`
+- `Finished`
+- `Killed`
+- `Killing`
+- `Running`
+- `Staging`
+- `Starting`
+- `Unreachable `
+- `UnreachableInactive`
+- `Gone`
+- `Dropped`
+- `Unknown`
+
+```json
+{
+  "instanceId": "my-app.instance-c7c311a4-b669-11e6-a48f-0ea4f4b1778c",
+  "runSpecId": "/app-id",
+  "condition": "Running",
+  "timestamp": "2014-03-01T23:29:30.158Z",
+  "eventType": "unknown_instance_terminated_event"
+}
+```
+
+```json
+{
+  "instanceId": "my-app.instance-c7c311a4-b669-11e6-a48f-0ea4f4b1778c",
+  "runSpecVersion": "2014-03-01T23:29:30.158Z",
+  "healthy": true,
+  "runSpecId": "/app-id",
+  "timestamp": "2014-03-01T23:29:30.158Z",
+  "eventType": "instance_health_changed_event"
+}
+```
+
 ### Framework Message
 
-``` json
+```json
 {
   "eventType": "framework_message_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -130,7 +222,7 @@ where the last four states are terminal.
 
 Fired when a new http callback subscriber is added or removed:
 
-``` json
+```json
 {
   "eventType": "subscribe_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -139,7 +231,7 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
-``` json
+```json
 {
   "eventType": "unsubscribe_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -148,9 +240,27 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
+```json
+{
+  "eventType": "event_stream_attached",
+  "timestamp": "2014-03-01T23:29:30.158Z",
+  "clientIp": "1.2.3.4",
+  "callbackUrl": "http://subscriber.acme.org/callbacks"
+}
+```
+
+```json
+{
+  "eventType": "event_stream_detached",
+  "timestamp": "2014-03-01T23:29:30.158Z",
+  "clientIp": "1.2.3.4",
+  "callbackUrl": "http://subscriber.acme.org/callbacks"
+}
+```
+
 ### Health Checks
 
-``` json
+```json
 {
   "eventType": "add_health_check_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -167,7 +277,7 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
-``` json
+```json
 {
   "eventType": "remove_health_check_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -184,7 +294,7 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
-``` json
+```json
 {
   "eventType": "failed_health_check_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -202,7 +312,7 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
-``` json
+```json
 {
   "eventType": "health_status_changed_event",
   "timestamp": "2014-03-01T23:29:30.158Z",
@@ -213,7 +323,7 @@ Fired when a new http callback subscriber is added or removed:
 }
 ```
 
-``` json
+```json
 {
   "appId": "/my-app",
   "taskId": "my-app_0-1396592784349",
@@ -225,6 +335,21 @@ Fired when a new http callback subscriber is added or removed:
   "timestamp": "2016-03-21T09:15:10.764Z"
 }
 ```
+
+```json
+{
+  "appId": "/my-app",
+  "taskId": "my-app_0-1396592784349",
+  "instanceId": "my-app.instance-c7c311a4-b669-11e6-a48f-0ea4f4b1778c",
+  "version": "2016-03-16T13:05:00.590Z",
+  "reason": "500 Internal Server Error",
+  "host": "localhost",
+  "slaveId": "4fb620fa-ba8d-4eb0-8ae3-f2912aaf015c-S0",
+  "eventType": "unhealthy_instance_kill_event",
+  "timestamp": "2016-03-21T09:15:10.764Z"
+}
+```
+
 
 ### Deployments
 
@@ -269,46 +394,6 @@ Fired when a new http callback subscriber is added or removed:
   "timestamp": "2014-03-01T23:29:30.158Z",
   "plan": {
     "id": "867ed450-f6a8-4d33-9b0e-e11c5513990b",
-    "original": {
-      "apps": [],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T06:30:49.667Z"
-    },
-    "target": {
-      "apps": [
-        {
-          "args": [],
-          "backoffFactor": 1.15,
-          "backoffSeconds": 1,
-          "cmd": "sleep 30",
-          "constraints": [],
-          "container": null,
-          "cpus": 0.2,
-          "dependencies": [],
-          "disk": 0.0,
-          "env": {},
-          "executor": "",
-          "healthChecks": [],
-          "id": "/my-app",
-          "instances": 2,
-          "mem": 32.0,
-          "ports": [10001],
-          "requirePorts": false,
-          "upgradeStrategy": {
-              "minimumHealthCapacity": 1.0
-          },
-          "uris": [],
-          "user": null,
-          "version": "2014-09-09T05:57:50.866Z"
-        }
-      ],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T05:57:50.866Z"
-    },
     "steps": [
       {
         "action": "ScaleApplication",
@@ -334,46 +419,6 @@ Fired when a new http callback subscriber is added or removed:
   "timestamp": "2014-03-01T23:29:30.158Z",
   "plan": {
     "id": "867ed450-f6a8-4d33-9b0e-e11c5513990b",
-    "original": {
-      "apps": [],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T06:30:49.667Z"
-    },
-    "target": {
-      "apps": [
-        {
-          "args": [],
-          "backoffFactor": 1.15,
-          "backoffSeconds": 1,
-          "cmd": "sleep 30",
-          "constraints": [],
-          "container": null,
-          "cpus": 0.2,
-          "dependencies": [],
-          "disk": 0.0,
-          "env": {},
-          "executor": "",
-          "healthChecks": [],
-          "id": "/my-app",
-          "instances": 2,
-          "mem": 32.0,
-          "ports": [10001],
-          "requirePorts": false,
-          "upgradeStrategy": {
-              "minimumHealthCapacity": 1.0
-          },
-          "uris": [],
-          "user": null,
-          "version": "2014-09-09T05:57:50.866Z"
-        }
-      ],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T05:57:50.866Z"
-    },
     "steps": [
       {
         "action": "ScaleApplication",
@@ -399,46 +444,6 @@ Fired when a new http callback subscriber is added or removed:
   "timestamp": "2014-03-01T23:29:30.158Z",
   "plan": {
     "id": "867ed450-f6a8-4d33-9b0e-e11c5513990b",
-    "original": {
-      "apps": [],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T06:30:49.667Z"
-    },
-    "target": {
-      "apps": [
-        {
-          "args": [],
-          "backoffFactor": 1.15,
-          "backoffSeconds": 1,
-          "cmd": "sleep 30",
-          "constraints": [],
-          "container": null,
-          "cpus": 0.2,
-          "dependencies": [],
-          "disk": 0.0,
-          "env": {},
-          "executor": "",
-          "healthChecks": [],
-          "id": "/my-app",
-          "instances": 2,
-          "mem": 32.0,
-          "ports": [10001],
-          "requirePorts": false,
-          "upgradeStrategy": {
-              "minimumHealthCapacity": 1.0
-          },
-          "uris": [],
-          "user": null,
-          "version": "2014-09-09T05:57:50.866Z"
-        }
-      ],
-      "dependencies": [],
-      "groups": [],
-      "id": "/",
-      "version": "2014-09-09T05:57:50.866Z"
-    },
     "steps": [
       {
         "action": "ScaleApplication",

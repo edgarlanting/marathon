@@ -1,11 +1,10 @@
 package mesosphere.marathon
 package state
 
-import java.time.Instant
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 import java.time.temporal.ChronoUnit
 
 import mesosphere.UnitTest
-import org.joda.time.{ DateTime, DateTimeZone }
 
 import scala.concurrent.duration._
 
@@ -46,17 +45,23 @@ class TimestampTest extends UnitTest {
       }
       "independent of timezone" in {
         val t1 = Timestamp(1024)
-        val t2 = Timestamp(new DateTime(1024).toDateTime(DateTimeZone.forOffsetHours(2))) // linter:ignore TypeToType
+        val t2 = Timestamp(OffsetDateTime.ofInstant(Instant.ofEpochMilli(1024), ZoneOffset.ofHours(2))) // linter:ignore TypeToType
 
         (t1 == t2) shouldBe true
         (t1.hashCode == t2.hashCode) shouldBe true
+      }
+      "fail for incorrect string" in {
+        intercept[IllegalArgumentException] {
+          Timestamp("20:39:32.972Z")
+        }
       }
     }
     "converting from Mesos" should {
       import org.apache.mesos
       "resolve TaskStatus.timestamp correctly" in {
         val instant = Instant.now()
-        val taskStatus = mesos.Protos.TaskStatus.newBuilder()
+        val taskStatus = mesos.Protos.TaskStatus
+          .newBuilder()
           .setTimestamp(instant.getEpochSecond.toDouble)
           .setTaskId(mesos.Protos.TaskID.newBuilder().setValue("task-1").build())
           .setState(mesos.Protos.TaskState.TASK_STAGING)

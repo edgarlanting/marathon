@@ -64,7 +64,9 @@ types:
         description: The number of seconds to wait, before the next launch attempt is started.
       overdue:
         type: boolean
-        description: true, if this run spec is backed off. Otherwise false.
+        description: |
+          true, if this runspec is waiting on offers. If false, it means runspec is backed off and waits until
+          timeLeftSeconds for the next launch attempt.
 
   QueueObject:
     properties:
@@ -72,9 +74,14 @@ types:
         type: number
         format: int32
         description: The number of instances left to launch.
-      delay?:
+      role:
+        type: string
+        description: |
+          The role of the instances attempting to be launched; this can differ from the RunSpec for resident services
+          that have had their role changed.
+      delay:
         type: QueueDelay
-        description: If a runspec has failed to often the launch will be delayed. See backoff to tune this behavior.
+        description: If a runspec has failed too often the launch will be delayed. See backoff to tune this behavior.
       since:
         type: datetime
         description: point in time since Marathon has started to launch tasks.

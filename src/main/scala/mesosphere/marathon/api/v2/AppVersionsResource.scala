@@ -3,47 +3,58 @@ package api.v2
 
 import javax.servlet.http.HttpServletRequest
 import javax.ws.rs._
-import javax.ws.rs.core.{ Context, MediaType, Response }
-
-import mesosphere.marathon.api.v2.json.Formats._
-import mesosphere.marathon.api.{ AuthResource, MarathonMediaType }
+import javax.ws.rs.container.{AsyncResponse, Suspended}
+import javax.ws.rs.core.{Context, MediaType}
+import mesosphere.marathon.api.AuthResource
 import mesosphere.marathon.core.group.GroupManager
-import mesosphere.marathon.plugin.auth.{ Authenticator, Authorizer, ViewRunSpec }
+import mesosphere.marathon.plugin.auth.{Authenticator, Authorizer, ViewRunSpec}
+import mesosphere.marathon.raml.Raml
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.Timestamp
-import org.slf4j.LoggerFactory
 
-@Produces(Array(MarathonMediaType.PREFERRED_APPLICATION_JSON))
+import scala.async.Async.{async, await}
+import scala.concurrent.ExecutionContext
+
+@Produces(Array(MediaType.APPLICATION_JSON))
 @Consumes(Array(MediaType.APPLICATION_JSON))
 class AppVersionsResource(
     service: MarathonSchedulerService,
     groupManager: GroupManager,
     val authenticator: Authenticator,
     val authorizer: Authorizer,
-    val config: MarathonConf) extends AuthResource {
-
-  val log = LoggerFactory.getLogger(getClass.getName)
+    val config: MarathonConf
+)(implicit val executionContext: ExecutionContext)
+    extends AuthResource {
 
   @GET
-  def index(
-    @PathParam("appId") appId: String,
-    @Context req: HttpServletRequest): Response = authenticated(req) { implicit identity =>
-    val id = appId.toRootPath
-    withAuthorization(ViewRunSpec, groupManager.app(id), unknownApp(id)) { _ =>
-      ok(jsonObjString("versions" -> service.listAppVersions(id)))
+  def index(@PathParam("appId") appId: String, @Context req: HttpServletRequest, @Suspended asyncResponse: AsyncResponse): Unit =
+    sendResponse(asyncResponse) {
+      async {
+        implicit val identity = await(authenticatedAsync(req))
+        val id = appId.toAbsolutePath
+        withAuthorization(ViewRunSpec, groupManager.app(id), unknownApp(id)) { _ =>
+          val versions = raml.VersionList(service.listAppVersions(id).map(_.toOffsetDateTime))
+          ok(versions)
+        }
+      }
     }
-  }
 
   @GET
   @Path("{version}")
   def show(
-    @PathParam("appId") appId: String,
-    @PathParam("version") version: String,
-    @Context req: HttpServletRequest): Response = authenticated(req) { implicit identity =>
-    val id = appId.toRootPath
-    val timestamp = Timestamp(version)
-    withAuthorization(ViewRunSpec, service.getApp(id, timestamp), unknownApp(id, Some(timestamp))) { app =>
-      ok(jsonString(app))
+      @PathParam("appId") appId: String,
+      @PathParam("version") version: String,
+      @Context req: HttpServletRequest,
+      @Suspended asyncResponse: AsyncResponse
+  ): Unit =
+    sendResponse(asyncResponse) {
+      async {
+        implicit val identity = await(authenticatedAsync(req))
+        val id = appId.toAbsolutePath
+        val timestamp = Timestamp(version)
+        withAuthorization(ViewRunSpec, service.getApp(id, timestamp), unknownApp(id, Some(timestamp))) { app =>
+          ok(Raml.toRaml(app))
+        }
+      }
     }
-  }
 }

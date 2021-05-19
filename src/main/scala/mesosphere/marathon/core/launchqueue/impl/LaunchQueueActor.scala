@@ -1,46 +1,65 @@
 package mesosphere.marathon
 package core.launchqueue.impl
 
-import akka.Done
+import akka.stream.Materializer
+import akka.stream.scaladsl.Sink
+import akka.{Done, NotUsed}
 import akka.actor.SupervisorStrategy.Stop
-import akka.actor.{ Actor, ActorRef, OneForOneStrategy, Props, SupervisorStrategy, Terminated }
+import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props, Stash, Status, SupervisorStrategy}
 import akka.event.LoggingReceive
-import akka.pattern.{ ask, pipe }
+import akka.pattern.pipe
+import akka.stream.scaladsl.Source
 import akka.util.Timeout
-import mesosphere.marathon.core.launchqueue.{ LaunchQueue, LaunchQueueConfig }
-import mesosphere.marathon.state.{ PathId, RunSpec }
-import LaunchQueue.QueuedInstanceInfo
 import com.typesafe.scalalogging.StrictLogging
+import mesosphere.marathon.core.group.GroupManager
 import mesosphere.marathon.core.instance.update.InstanceChange
+import mesosphere.marathon.core.instance.update.InstanceUpdateOperation.RescheduleReserved
+import mesosphere.marathon.core.instance.{Goal, Instance}
+import mesosphere.marathon.core.launchqueue.LaunchQueueConfig
+import mesosphere.marathon.core.launchqueue.impl.LaunchQueueActor.{AddFinished, QueuedAdd}
+import mesosphere.marathon.core.launchqueue.impl.LaunchQueueDelegate.Add
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.state.{PathId, RunSpec}
 
+import scala.async.Async.{async, await}
+import scala.collection.mutable.Queue
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
 
 private[launchqueue] object LaunchQueueActor {
   def props(
-    config: LaunchQueueConfig,
-    offerMatcherStatisticsActor: ActorRef,
-    runSpecActorProps: (RunSpec, Int) => Props): Props = {
-    Props(new LaunchQueueActor(config, offerMatcherStatisticsActor, runSpecActorProps))
+      config: LaunchQueueConfig,
+      instanceTracker: InstanceTracker,
+      runSpecActorProps: RunSpec => Props,
+      delayUpdates: Source[RateLimiter.DelayUpdate, NotUsed]
+  ): Props = {
+    Props(new LaunchQueueActor(config, instanceTracker, runSpecActorProps, delayUpdates))
   }
 
   case class FullCount(appId: PathId)
+  private case class QueuedAdd(sender: ActorRef, add: Add)
+  private case class AddFinished(queuedAdd: QueuedAdd)
 }
 
 /**
-  * An actor-based implementation of the [[LaunchQueue]] interface.
+  * An actor-based implementation of the LaunchQueue interface.
   *
   * The methods of that interface are translated to messages in the [[LaunchQueueDelegate]] implementation.
   */
 private[impl] class LaunchQueueActor(
     launchQueueConfig: LaunchQueueConfig,
-    offerMatchStatisticsActor: ActorRef,
-    runSpecActorProps: (RunSpec, Int) => Props) extends Actor with StrictLogging {
+    instanceTracker: InstanceTracker,
+    runSpecActorProps: RunSpec => Props,
+    delayUpdates: Source[RateLimiter.DelayUpdate, NotUsed]
+) extends Actor
+    with Stash
+    with StrictLogging {
   import LaunchQueueDelegate._
 
   /** Currently active actors by pathId. */
   var launchers = Map.empty[PathId, ActorRef]
+
   /** Maps actorRefs to the PathId they handle. */
   var launcherRefs = Map.empty[ActorRef, PathId]
 
@@ -50,159 +69,153 @@ private[impl] class LaunchQueueActor(
   // See [[receiveHandlePurging]]
   /** A message with a sender for later processing. */
   case class DeferredMessage(sender: ActorRef, message: Any)
-  /** PathIds for which the actors have been currently suspended because we wait for their termination. */
-  var suspendedLauncherPathIds = Set.empty[PathId]
-  /** ActorRefs of the actors have been currently suspended because we wait for their termination. */
-  var suspendedLaunchersMessages = Map.empty[ActorRef, Vector[DeferredMessage]].withDefaultValue(Vector.empty)
+
+  private[this] val queuedAddOperations = Queue.empty[QueuedAdd]
+  private[this] var processingAddOperation = false
 
   /** The timeout for asking any children of this actor. */
   implicit val askTimeout: Timeout = launchQueueConfig.launchQueueRequestTimeout().milliseconds
 
-  override def receive: Receive = LoggingReceive {
-    Seq(
-      receiveHandlePurging,
-      receiveInstanceUpdateToSuspendedActor,
-      receiveMessagesToSuspendedActor,
-      receiveInstanceUpdate,
-      receiveHandleNormalCommands
-    ).reduce(_.orElse[Any, Unit](_))
+  override def preStart(): Unit = {
+    super.preStart()
+
+    import akka.pattern.pipe
+    import context.dispatcher
+    instanceTracker.instancesBySpec().pipeTo(self)
+
+    // Using an Materializer that encompasses this context will cause the stream to auto-terminate when this actor does
+    implicit val materializer = Materializer(context)
+    delayUpdates.runWith(Sink.actorRef(self, Status.Failure(new RuntimeException("The delay updates stream closed"))))
   }
+
+  override def receive: Receive = initializing
+
+  def initializing: Receive = {
+    case instances: InstanceTracker.InstancesBySpec =>
+      instances.allInstances
+        .filter(_.isScheduled)
+        .map(_.runSpec)
+        .distinct
+        .foreach { scheduledRunSpec =>
+          launchers.getOrElse(scheduledRunSpec.id, createAppTaskLauncher(scheduledRunSpec))
+        }
+
+      context.become(initialized)
+
+      unstashAll()
+
+    case Status.Failure(cause: akka.stream.AbruptStageTerminationException) =>
+      logger.info(s"Ignoring AbruptStageTerminationException; was likely emitted from crash of former actor instance", cause)
+    case Status.Failure(cause) =>
+      // escalate this failure
+      throw new IllegalStateException("while loading instances", cause)
+
+    case _: AnyRef =>
+      stash()
+  }
+
+  def initialized: Receive =
+    LoggingReceive {
+      Seq(
+        receiveInstanceUpdate,
+        receiveHandleNormalCommands
+      ).reduce(_.orElse[Any, Unit](_))
+    }
 
   /**
-    * Handles purging of an actor.
-    *
-    * Terminating an actor with a PoisonPill is not instantaneous. It will still process
-    * all prior messages. While waiting for the termination of the actor, we might
-    * receive further messages to the actor which would potentially lead to recreating it.
-    *
-    * Thus, we mark the actor as suspended and save all messages which would normally
-    * have been sent to this actor. When we receive confirmation of the actor's death (Terminated),
-    * we will replay these messages to ourselves with the correct sender.
+    * Fetch an existing actorRef, or create a new actor if the given instance is scheduled.
+    * We don't need an actor ref to handle update for non-scheduled instances.
     */
-  private[this] def receiveHandlePurging: Receive = {
-    case Purge(runSpecId) =>
-      launchers.get(runSpecId) match {
-        case Some(actorRef) =>
-          val deferredMessages: Vector[DeferredMessage] =
-            suspendedLaunchersMessages(actorRef) :+ DeferredMessage(sender(), ConfirmPurge)
-          suspendedLaunchersMessages += actorRef -> deferredMessages
-          suspendedLauncherPathIds += runSpecId
-          actorRef ! TaskLauncherActor.Stop
-        case None => sender() ! Done
-      }
-
-    case ConfirmPurge => sender() ! Done
-
-    case Terminated(actorRef) =>
-      launcherRefs.get(actorRef) match {
-        case Some(pathId) =>
-          launcherRefs -= actorRef
-          launchers -= pathId
-
-          suspendedLaunchersMessages.get(actorRef) match {
-            case None =>
-              logger.warn(s"Got unexpected terminated for runSpec $pathId: $actorRef")
-            case Some(deferredMessages) =>
-              deferredMessages.foreach(msg => self.tell(msg.message, msg.sender))
-
-              suspendedLauncherPathIds -= pathId
-              suspendedLaunchersMessages -= actorRef
-          }
-        case None =>
-          logger.warn(s"Don't know anything about terminated actor: $actorRef")
-      }
-  }
-
-  private[this] def receiveInstanceUpdateToSuspendedActor: Receive = {
-    case update: InstanceChange if suspendedLauncherPathIds(update.runSpecId) =>
-      // Do not defer. If an AppTaskLauncherActor restarts, it retrieves a new task list.
-      // If we defer this, there is a potential deadlock (resolved by timeout):
-      //   * AppTaskLauncher waits for in-flight tasks
-      //   * TaskOp gets processed and one of the update steps calls this here
-      //   * ... blocked until timeout ...
-      //   * The task launch notification (that the AppTaskLauncherActor waits for) gets sent to the actor
-      sender() ! Done
-  }
-
-  private[this] def receiveMessagesToSuspendedActor: Receive = {
-    case msg @ Count(appId) if suspendedLauncherPathIds(appId) =>
-      // Deferring this would also block List.
-      sender() ! None
-
-    case msg @ Add(app, count) if suspendedLauncherPathIds(app.id) =>
-      deferMessageToSuspendedActor(msg, app.id)
-
-    case msg @ RateLimiterActor.DelayUpdate(app, _) if suspendedLauncherPathIds(app.id) =>
-      deferMessageToSuspendedActor(msg, app.id)
-  }
-
-  private[this] def deferMessageToSuspendedActor(msg: Any, appId: PathId): Unit = {
-    val actorRef = launchers(appId)
-    val deferredMessages: Vector[DeferredMessage] =
-      suspendedLaunchersMessages(actorRef) :+ DeferredMessage(sender(), msg)
-    suspendedLaunchersMessages += actorRef -> deferredMessages
+  private def actorRefFor(instance: Instance): Option[ActorRef] = {
+    launchers.get(instance.runSpecId).orElse {
+      if (instance.isScheduled) {
+        logger.info(s"No active taskLauncherActor for scheduled ${instance.instanceId}, will create one.")
+        Some(createAppTaskLauncher(instance.runSpec))
+      } else None
+    }
   }
 
   private[this] def receiveInstanceUpdate: Receive = {
     case update: InstanceChange =>
-      launchers.get(update.runSpecId) match {
+      actorRefFor(update.instance) match {
         case Some(actorRef) => actorRef.forward(update)
         case None => sender() ! Done
       }
   }
 
-  private[this] def list(): Future[Seq[QueuedInstanceInfo]] = {
-    import context.dispatcher
-    val scatter = launchers
-      .keys
-      .map(appId => (self ? Count(appId)).mapTo[Option[QueuedInstanceInfo]])
-    Future.sequence(scatter).map(_.flatten.to[Seq])
-  }
-
+  @SuppressWarnings(Array("all")) // async/await
   private[this] def receiveHandleNormalCommands: Receive = {
-    case List =>
-      import context.dispatcher
-      val to = sender()
-      val infos: Future[Seq[QueuedInstanceInfo]] = list()
-      infos.pipeTo(to)
+    case add @ Add(spec, count) =>
+      logger.debug(s"Adding $count instances for the ${spec.configRef}")
+      // we cannot process more Add requests for one runSpec in parallel because it leads to race condition.
+      // See MARATHON-8320 for details. The queue handling is helping us ensure we add an instance at a time.
 
-    case ListWithStatistics =>
-      import context.dispatcher
-      val to = sender()
-      list().map(OfferMatchStatisticsActor.SendStatistics(to, _)).pipeTo(offerMatchStatisticsActor)
-
-    case Count(appId) =>
-      import context.dispatcher
-      launchers.get(appId) match {
-        case Some(actorRef) =>
-          val eventualCount: Future[QueuedInstanceInfo] =
-            (actorRef ? TaskLauncherActor.GetCount).mapTo[QueuedInstanceInfo]
-          eventualCount.map(Some(_)).pipeTo(sender())
-        case None => sender() ! None
+      if (queuedAddOperations.isEmpty && !processingAddOperation) {
+        // start processing the just received operation
+        processNextAdd(QueuedAdd(sender(), add))
+      } else {
+        queuedAddOperations += QueuedAdd(sender(), add)
       }
 
-    case Add(app, count) =>
-      launchers.get(app.id) match {
-        case None =>
-          import context.dispatcher
-          val actorRef = createAppTaskLauncher(app, count)
-          val eventualCount: Future[QueuedInstanceInfo] =
-            (actorRef ? TaskLauncherActor.GetCount).mapTo[QueuedInstanceInfo]
-          eventualCount.map(_ => Done).pipeTo(sender())
+    case AddFinished(queuedAdd) =>
+      queuedAdd.sender ! Done
 
-        case Some(actorRef) =>
-          import context.dispatcher
-          val eventualCount: Future[QueuedInstanceInfo] =
-            (actorRef ? TaskLauncherActor.AddInstances(app, count)).mapTo[QueuedInstanceInfo]
-          eventualCount.map(_ => Done).pipeTo(sender())
+      logger.info(s"Finished processing $queuedAdd and sent done to sender.")
+
+      processingAddOperation = false
+
+      if (queuedAddOperations.nonEmpty) {
+        processNextAdd(queuedAddOperations.dequeue())
       }
 
-    case msg @ RateLimiterActor.DelayUpdate(app, _) =>
+    case msg @ RateLimiter.DelayUpdate(app, _) =>
       launchers.get(app.id).foreach(_.forward(msg))
+
+    case Status.Failure(cause) =>
+      // escalate this failure
+      throw new IllegalStateException("after initialized", cause)
   }
 
-  private[this] def createAppTaskLauncher(app: RunSpec, initialCount: Int): ActorRef = {
-    val actorRef = context.actorOf(runSpecActorProps(app, initialCount), s"$childSerial-${app.id.safePath}")
+  @SuppressWarnings(Array("all")) /* async/await */
+  private def processNextAdd(queuedItem: QueuedAdd): Unit = {
+    logger.debug(s"Processing new queue item: $queuedItem")
+    import context.dispatcher
+    processingAddOperation = true
+
+    val future = async {
+      val runSpec = queuedItem.add.spec
+      // Trigger TaskLaunchActor creation and sync with instance tracker.
+      launchers.getOrElse(runSpec.id, createAppTaskLauncher(runSpec))
+
+      // Reuse resident instances that are stopped.
+      val existingReservedStoppedInstances = await(instanceTracker.specInstances(runSpec.id))
+        .filter(i => i.hasReservation && i.state.condition.isTerminal && i.state.goal == Goal.Stopped) // resident to relaunch
+        .take(queuedItem.add.count)
+      await(Future.sequence(existingReservedStoppedInstances.map { instance =>
+        instanceTracker.process(RescheduleReserved(instance.instanceId, runSpec))
+      }))
+
+      logger.debug(s"Rescheduled existing instances for ${runSpec.id}")
+
+      // Schedule additional resident instances or all ephemeral instances
+      val instancesToSchedule = existingReservedStoppedInstances.length.until(queuedItem.add.count).map { _ =>
+        Instance.scheduled(runSpec, Instance.Id.forRunSpec(runSpec.id))
+      }
+      if (instancesToSchedule.nonEmpty) {
+        await(instanceTracker.schedule(instancesToSchedule))
+      }
+      logger.info(
+        s"Scheduling ${instancesToSchedule.length} new instances (first five: ${instancesToSchedule.take(5)} ) " +
+          s"and rescheduling (${existingReservedStoppedInstances.length}) reserved instances due to LaunchQueue.Add for ${runSpec.id}"
+      )
+
+      AddFinished(queuedItem)
+    }
+    future.pipeTo(self)
+  }
+
+  private[this] def createAppTaskLauncher(app: RunSpec): ActorRef = {
+    val actorRef = context.actorOf(runSpecActorProps(app), s"$childSerial-${app.id.safePath}")
     childSerial += 1
     launchers += app.id -> actorRef
     launcherRefs += actorRef -> app.id
@@ -210,12 +223,18 @@ private[impl] class LaunchQueueActor(
     actorRef
   }
 
-  override def supervisorStrategy: SupervisorStrategy = OneForOneStrategy() {
-    case NonFatal(e) =>
-      // We periodically check if scaling is needed, so we should eventually recover.
-      // TODO: Spead up recovery, e.g. by initiating a scale check.
-      // Just restarting an AppTaskLauncherActor will potentially lead to starting too many tasks.
-      Stop
-    case m: Any => SupervisorStrategy.defaultDecider(m)
+  override def postStop(): Unit = {
+    super.postStop()
+
+    // Answer all outstanding requests.
+    queuedAddOperations.foreach { item =>
+      item.sender ! Status.Failure(new IllegalStateException("LaunchQueueActor stopped"))
+    }
   }
+
+  override def supervisorStrategy: SupervisorStrategy =
+    OneForOneStrategy() {
+      case NonFatal(e) => Stop
+      case m: Any => SupervisorStrategy.defaultDecider(m)
+    }
 }

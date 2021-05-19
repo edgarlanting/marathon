@@ -1,83 +1,168 @@
 package mesosphere.marathon
 package core.instance
 
-import java.util.Base64
+import java.util.{Base64, UUID}
 
-import com.fasterxml.uuid.{ EthernetAddress, Generators }
+import com.fasterxml.uuid.{EthernetAddress, Generators}
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.instance.Instance.{ AgentInfo, InstanceState }
+import mesosphere.marathon.core.instance.Instance.{AgentInfo, InstanceState}
+import mesosphere.marathon.core.pod.PodDefinition
 import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.state.{ MarathonState, PathId, Timestamp, UnreachableStrategy, UnreachableDisabled, UnreachableEnabled }
-import mesosphere.marathon.stream.Implicits._
-import mesosphere.mesos.Placed
-import mesosphere.marathon.raml.Raml
+import mesosphere.marathon.state.Role
+import mesosphere.marathon.state.{PathId, Timestamp, UnreachableDisabled, UnreachableEnabled, UnreachableStrategy, _}
+import scala.jdk.CollectionConverters._
+import mesosphere.marathon.tasks.OfferUtil
 import org.apache._
 import org.apache.mesos.Protos.Attribute
-import play.api.libs.json._
 import play.api.libs.functional.syntax._
+import play.api.libs.json.Reads._
+import play.api.libs.json._
 
 import scala.annotation.tailrec
+import scala.collection.immutable.Seq
 import scala.concurrent.duration._
 import scala.util.matching.Regex
 
-// TODO: remove MarathonState stuff once legacy persistence is gone
+/**
+  * Internal state of a instantiated [[RunSpec]], ie instance of an [[AppDefinition]]
+  * or [[mesosphere.marathon.core.pod.PodDefinition]].
+  *
+  * Also has an [[mesosphere.marathon.state.Instance]] which is the storage model and an
+  * [[mesosphere.marathon.raml.Instance]] for the API
+  *
+  * @param role The Mesos role for the resources allocated to this instance. It isn't possible to change a
+  *             reservation's role. In the case of resident services, we allow the operator to change the
+  *             service role without deleting existing instances reserved to the former role. Because of this,
+  *             the instance role can differ from the service role, and must be persisted separately.
+  */
 case class Instance(
     instanceId: Instance.Id,
-    agentInfo: Instance.AgentInfo,
+    agentInfo: Option[Instance.AgentInfo],
     state: InstanceState,
     tasksMap: Map[Task.Id, Task],
-    runSpecVersion: Timestamp,
-    unreachableStrategy: UnreachableStrategy) extends MarathonState[Protos.Json, Instance] with Placed {
+    runSpec: RunSpec,
+    reservation: Option[Reservation],
+    role: Role
+) {
 
-  val runSpecId: PathId = instanceId.runSpecId
-  val isLaunched: Boolean = state.condition.isActive
+  def runSpecId: AbsolutePathId = runSpec.id
 
-  def isReserved: Boolean = state.condition == Condition.Reserved
-  def isCreated: Boolean = state.condition == Condition.Created
-  def isError: Boolean = state.condition == Condition.Error
-  def isFailed: Boolean = state.condition == Condition.Failed
-  def isFinished: Boolean = state.condition == Condition.Finished
-  def isKilled: Boolean = state.condition == Condition.Killed
+  def runSpecVersion: Timestamp = runSpec.version
+
+  def unreachableStrategy = runSpec.unreachableStrategy
+
+  /**
+    * An instance is scheduled for launching when its goal is to be running but it's not active.
+    *
+    * This does will not return true for following conditions:
+    * - Provisioned (already being launched)
+    * - Active condition (already running - the goal is fullfilled)
+    * - UnreachableInactive - handled by scale check and via 'considerTerminal' while in deployment
+    */
+  val isScheduled: Boolean = state.goal == Goal.Running && (state.condition.isTerminal || state.condition == Condition.Scheduled)
+
+  val isProvisioned: Boolean = state.condition == Condition.Provisioned && state.goal == Goal.Running
+
   def isKilling: Boolean = state.condition == Condition.Killing
+
   def isRunning: Boolean = state.condition == Condition.Running
-  def isStaging: Boolean = state.condition == Condition.Staging
-  def isStarting: Boolean = state.condition == Condition.Starting
+
   def isUnreachable: Boolean = state.condition == Condition.Unreachable
+
   def isUnreachableInactive: Boolean = state.condition == Condition.UnreachableInactive
-  def isGone: Boolean = state.condition == Condition.Gone
-  def isUnknown: Boolean = state.condition == Condition.Unknown
-  def isDropped: Boolean = state.condition == Condition.Dropped
-  def isTerminated: Boolean = state.condition.isTerminal
+
   def isActive: Boolean = state.condition.isActive
-  def hasReservation =
-    tasksMap.values.exists {
-      case _: Task.ReservedTask => true
-      case _ => false
+
+  def hasReservation: Boolean = reservation.isDefined
+
+  def hostname: Option[String] = agentInfo.map(_.host)
+
+  def attributes: Seq[Attribute] = agentInfo.map(_.attributes).getOrElse(Seq.empty)
+
+  def zone: Option[String] = agentInfo.flatMap(_.zone)
+
+  def region: Option[String] = agentInfo.flatMap(_.region)
+
+  /**
+    * Factory method for creating provisioned instance from Scheduled instance
+    *
+    * @return new instance in a provisioned state
+    */
+  def provisioned(agentInfo: Instance.AgentInfo, runSpec: RunSpec, tasks: Map[Task.Id, Task], now: Timestamp): Instance = {
+    require(
+      isScheduled,
+      s"Instance '$instanceId' must not be in state '${state.condition}'. Scheduled instance is required to create provisioned instance."
+    )
+
+    this.copy(
+      agentInfo = Some(agentInfo),
+      state = Instance.InstanceState(Condition.Provisioned, now, None, None, this.state.goal),
+      tasksMap = tasks,
+      runSpec = runSpec
+    )
+  }
+
+  /**
+    * Creates new instance that is scheduled and has reservation (for resident run specs)
+    */
+  def reserved(reservation: Reservation, agentInfo: AgentInfo): Instance = {
+    this.copy(reservation = Some(reservation), agentInfo = Some(agentInfo))
+  }
+
+  /**
+    * Allow to know if instance should be healthy or if it has no health check
+    *
+    * @return true if runSpec has some health checks defined. false if there is not any health check defined on this app/pod
+    */
+  def hasConfiguredHealthChecks: Boolean =
+    this.runSpec match {
+      case app: AppDefinition => {
+        app.healthChecks.nonEmpty || app.check.nonEmpty || app.readinessChecks.nonEmpty
+      }
+      case pod: PodDefinition => pod.containers.exists(!_.healthCheck.isEmpty)
+      case _ => false // non-app/pod RunSpecs don't have health checks
     }
 
-  override def mergeFromProto(message: Protos.Json): Instance = {
-    Json.parse(message.getJson).as[Instance]
-  }
-  override def mergeFromProto(bytes: Array[Byte]): Instance = {
-    mergeFromProto(Protos.Json.parseFrom(bytes))
-  }
-  override def toProto: Protos.Json = {
-    Protos.Json.newBuilder().setJson(Json.stringify(Json.toJson(this))).build()
-  }
-  override def version: Timestamp = runSpecVersion
-
-  override def hostname: String = agentInfo.host
-
-  override def attributes: Seq[Attribute] = agentInfo.attributes
+  def consideredHealthy: Boolean = !hasConfiguredHealthChecks || state.healthy.getOrElse(false)
 }
 
-@SuppressWarnings(Array("DuplicateImport"))
 object Instance {
 
   import mesosphere.marathon.api.v2.json.Formats.TimestampFormat
 
-  def instancesById(tasks: Seq[Instance]): Map[Instance.Id, Instance] =
-    tasks.map(task => task.instanceId -> task)(collection.breakOut)
+  def instancesById(instances: Seq[Instance]): Map[Instance.Id, Instance] =
+    instances.iterator.map(instance => instance.instanceId -> instance).toMap
+
+  object Running {
+    def unapply(instance: Instance): Option[Tuple3[Instance.Id, Instance.AgentInfo, Map[Task.Id, Task]]] =
+      instance match {
+        case Instance(instanceId, Some(agentInfo), InstanceState(Condition.Running, _, _, _, _), tasksMap, _, _, _) =>
+          Some((instanceId, agentInfo, tasksMap))
+        case _ =>
+          Option.empty[Tuple3[Instance.Id, Instance.AgentInfo, Map[Task.Id, Task]]]
+      }
+  }
+
+  /**
+    * Factory method for an instance in a [[Condition.Scheduled]] state.
+    *
+    * @param runSpec The run spec the instance will be started for.
+    * @param instanceId The id of the new instance.
+    * @return An instance in the scheduled state.
+    */
+  def scheduled(runSpec: RunSpec, instanceId: Instance.Id): Instance = {
+    val state = InstanceState(Condition.Scheduled, Timestamp.now(), None, None, Goal.Running)
+
+    Instance(instanceId, None, state, Map.empty, runSpec, None, runSpec.role)
+  }
+
+  /*
+   * Factory method for an instance in a [[Condition.Scheduled]] state.
+   *
+   * @param runSpec The run spec the instance will be started for.
+   * @return An instance in the scheduled state.
+   */
+  def scheduled(runSpec: RunSpec): Instance = scheduled(runSpec, Id.forRunSpec(runSpec.id))
 
   /**
     * Describes the state of an instance which is an accumulation of task states.
@@ -87,7 +172,7 @@ object Instance {
     * @param activeSince Denotes the first task startedAt timestamp if any.
     * @param healthy Tells if all tasks run healthily if health checks have been enabled.
     */
-  case class InstanceState(condition: Condition, since: Timestamp, activeSince: Option[Timestamp], healthy: Option[Boolean])
+  case class InstanceState(condition: Condition, since: Timestamp, activeSince: Option[Timestamp], healthy: Option[Boolean], goal: Goal)
 
   object InstanceState {
 
@@ -105,10 +190,8 @@ object Instance {
       Condition.Starting,
       Condition.Staging,
       Condition.Unknown,
-
-      //From here on all tasks are either Created, Reserved, Running, Finished, or Killed
-      Condition.Created,
-      Condition.Reserved,
+      //From here on all tasks are only in one of the following states
+      Condition.Provisioned,
       Condition.Running,
       Condition.Finished,
       Condition.Killed
@@ -117,17 +200,18 @@ object Instance {
     /**
       * Construct a new InstanceState.
       *
-      * @param maybeOldState The old state of the instance if any.
+      * @param maybeOldInstanceState The old state instance if any.
       * @param newTaskMap    New tasks and their status that form the update instance.
       * @param now           Timestamp of update.
       * @return new InstanceState
       */
-    @SuppressWarnings(Array("TraversableHead"))
-    def apply(
-      maybeOldState: Option[InstanceState],
-      newTaskMap: Map[Task.Id, Task],
-      now: Timestamp,
-      unreachableStrategy: UnreachableStrategy): InstanceState = {
+    def transitionTo(
+        maybeOldInstanceState: Option[InstanceState],
+        newTaskMap: Map[Task.Id, Task],
+        now: Timestamp,
+        unreachableStrategy: UnreachableStrategy,
+        goal: Goal
+    ): InstanceState = {
 
       val tasks = newTaskMap.values
 
@@ -137,9 +221,9 @@ object Instance {
       val active: Option[Timestamp] = activeSince(tasks)
 
       val healthy = computeHealth(tasks.toVector)
-      maybeOldState match {
+      maybeOldInstanceState match {
         case Some(state) if state.condition == condition && state.healthy == healthy => state
-        case _ => InstanceState(condition, now, active, healthy)
+        case _ => InstanceState(condition, now, active, healthy, goal)
       }
     }
 
@@ -225,10 +309,37 @@ object Instance {
     }
   }
 
-  case class Id(idString: String) extends Ordered[Id] {
-    lazy val runSpecId: PathId = Id.runSpecId(idString)
-    lazy val executorIdString: String = Id.executorIdString(idString)
+  sealed trait Prefix {
+    val value: String
+    override def toString: String = value
+  }
+  case object PrefixInstance extends Prefix {
+    override val value = "instance-"
+  }
+  case object PrefixMarathon extends Prefix {
+    override val value = "marathon-"
+  }
+  object Prefix {
+    def fromString(prefix: String) = {
+      if (prefix == PrefixInstance.value) PrefixInstance
+      else PrefixMarathon
+    }
+  }
 
+  case class Id(runSpecId: AbsolutePathId, prefix: Prefix, uuid: UUID) extends Ordered[Id] {
+    lazy val safeRunSpecId: String = runSpecId.safePath
+    lazy val executorIdString: String = prefix + safeRunSpecId + "." + uuid
+
+    // Must match Id.InstanceIdRegex
+    // TODO: Unit test against regex
+    lazy val idString: String = safeRunSpecId + "." + prefix + uuid
+
+    /**
+      * String representation used for logging and debugging. Should *not* be used for Mesos task ids. Use `idString`
+      * instead.
+      *
+      * @return String representation of id.
+      */
     override def toString: String = s"instance [$idString]"
 
     override def compare(that: Instance.Id): Int =
@@ -244,53 +355,42 @@ object Instance {
 
     private val uuidGenerator = Generators.timeBasedGenerator(EthernetAddress.fromInterface())
 
-    def runSpecId(instanceId: String): PathId = {
-      instanceId match {
-        case InstanceIdRegex(runSpecId, prefix, uuid) => PathId.fromSafePath(runSpecId)
-        case _ => throw new MatchError("unable to extract runSpecId from instanceId " + instanceId)
+    def forRunSpec(id: AbsolutePathId): Id = Instance.Id(id, PrefixInstance, uuidGenerator.generate())
+
+    def fromIdString(idString: String): Instance.Id = {
+      idString match {
+        case InstanceIdRegex(safeRunSpecId, prefix, uuid) =>
+          val runSpec = PathId.fromSafePath(safeRunSpecId)
+          Id(runSpec, Prefix.fromString(prefix), UUID.fromString(uuid))
+        case _ => throw new MatchError(s"instance id $idString is not a valid identifier")
       }
     }
-
-    private def executorIdString(instanceId: String): String = {
-      instanceId match {
-        case InstanceIdRegex(runSpecId, prefix, uuid) => prefix + runSpecId + "." + uuid
-        case _ => throw new MatchError("unable to extract executorId from instanceId " + instanceId)
-      }
-    }
-
-    def forRunSpec(id: PathId): Id = Instance.Id(id.safePath + ".instance-" + uuidGenerator.generate())
   }
 
   /**
     * Info relating to the host on which the Instance has been launched.
     */
-  case class AgentInfo(
-    host: String,
-    agentId: Option[String],
-    attributes: Seq[mesos.Protos.Attribute])
+  case class AgentInfo(host: String, agentId: Option[String], region: Option[String], zone: Option[String], attributes: Seq[Attribute])
 
   object AgentInfo {
-    def apply(offer: org.apache.mesos.Protos.Offer): AgentInfo = AgentInfo(
-      host = offer.getHostname,
-      agentId = Some(offer.getSlaveId.getValue),
-      attributes = offer.getAttributesList.toIndexedSeq
-    )
+    def apply(offer: org.apache.mesos.Protos.Offer): AgentInfo =
+      AgentInfo(
+        host = offer.getHostname,
+        agentId = Some(offer.getSlaveId.getValue),
+        region = OfferUtil.region(offer),
+        zone = OfferUtil.zone(offer),
+        attributes = offer.getAttributesList.asScala.to(IndexedSeq)
+      )
   }
-
-  /**
-    * Marathon has requested (or will request) that this instance be launched by Mesos.
-    *
-    * @param instance is the thing that Marathon wants to launch
-    */
-  case class LaunchRequest(instance: Instance)
 
   implicit class LegacyInstanceImprovement(val instance: Instance) extends AnyVal {
+
     /** Convenient access to a legacy instance's only task */
-    def appTask: Task = instance.tasksMap.headOption.map(_._2).getOrElse(
-      throw new IllegalStateException(s"No task in ${instance.instanceId}"))
+    def appTask: Task =
+      instance.tasksMap.headOption.map(_._2).getOrElse(throw new IllegalStateException(s"No task in ${instance.instanceId}"))
   }
 
-  implicit object AttributeFormat extends Format[mesos.Protos.Attribute] {
+  implicit object AttributeFormat extends Format[Attribute] {
     override def reads(json: JsValue): JsResult[Attribute] = {
       json.validate[String].map { base64 =>
         mesos.Protos.Attribute.parseFrom(Base64.getDecoder.decode(base64))
@@ -312,40 +412,43 @@ object Instance {
     }
   }
 
-  implicit val agentFormat: Format[AgentInfo] = Json.format[AgentInfo]
-  implicit val idFormat: Format[Instance.Id] = Json.format[Instance.Id]
-  implicit val instanceConditionFormat: Format[Condition] = Json.format[Condition]
-  implicit val instanceStateFormat: Format[InstanceState] = Json.format[InstanceState]
+  // host: String,
+  // agentId: Option[String],
+  // region: String,
+  // zone: String,
+  // attributes: Seq[mesos.Protos.Attribute])
+  // private val agentFormatWrites: Writes[AgentInfo] = Json.format[AgentInfo]
+  private val agentReads: Reads[AgentInfo] = (
+    (__ \ "host").read[String] ~
+      (__ \ "agentId").readNullable[String] ~
+      (__ \ "region").readNullable[String] ~
+      (__ \ "zone").readNullable[String] ~
+      (__ \ "attributes").read[Seq[mesos.Protos.Attribute]]
+  )(AgentInfo(_, _, _, _, _))
 
-  implicit val instanceJsonWrites: Writes[Instance] = {
-    (
-      (__ \ "instanceId").write[Instance.Id] ~
-      (__ \ "agentInfo").write[AgentInfo] ~
-      (__ \ "tasksMap").write[Map[Task.Id, Task]] ~
-      (__ \ "runSpecVersion").write[Timestamp] ~
-      (__ \ "state").write[InstanceState] ~
-      (__ \ "unreachableStrategy").write[raml.UnreachableStrategy]
-    ) { (i) => (i.instanceId, i.agentInfo, i.tasksMap, i.runSpecVersion, i.state, Raml.toRaml(i.unreachableStrategy)) }
-  }
+  implicit val agentFormat: Format[AgentInfo] = Format(agentReads, Json.writes[AgentInfo])
 
-  implicit val unreachableStrategyReads: Reads[Instance] = {
-    (
-      (__ \ "instanceId").read[Instance.Id] ~
-      (__ \ "agentInfo").read[AgentInfo] ~
-      (__ \ "tasksMap").read[Map[Task.Id, Task]] ~
-      (__ \ "runSpecVersion").read[Timestamp] ~
-      (__ \ "state").read[InstanceState] ~
-      (__ \ "unreachableStrategy").readNullable[raml.UnreachableStrategy]
-    ) { (instanceId, agentInfo, tasksMap, runSpecVersion, state, maybeUnreachableStrategy) =>
-        val unreachableStrategy = maybeUnreachableStrategy.
-          map(Raml.fromRaml(_)).getOrElse(UnreachableStrategy.default())
-        new Instance(instanceId, agentInfo, state, tasksMap, runSpecVersion, unreachableStrategy)
+  // TODO(karsten): Someone with more patience for Play Json is happily invited to change the parsing.
+  implicit object InstanceIdFormat extends Format[Instance.Id] {
+    override def reads(json: JsValue): JsResult[Id] = {
+      (json \ "idString") match {
+        case JsDefined(JsString(id)) => JsSuccess(Instance.Id.fromIdString(id), JsPath \ "idString")
+        case _ => JsError(JsPath \ "idString", "Could not parse instance id.")
       }
+    }
+
+    override def writes(id: Id): JsValue = {
+      Json.obj("idString" -> id.idString)
+    }
   }
+
+  implicit val instanceConditionFormat: Format[Condition] = Condition.conditionFormat
+
+  implicit val instanceStateFormat: Format[InstanceState] = Json.format[InstanceState]
 
   implicit lazy val tasksMapFormat: Format[Map[Task.Id, Task]] = Format(
     Reads.of[Map[String, Task]].map {
-      _.map { case (k, v) => Task.Id(k) -> v }
+      _.map { case (k, v) => Task.Id.parse(k) -> v }
     },
     Writes[Map[Task.Id, Task]] { m =>
       val stringToTask = m.map {
@@ -354,28 +457,5 @@ object Instance {
       Json.toJson(stringToTask)
     }
   )
-}
 
-/**
-  * Represents legacy handling for instances which was started in behalf of an AppDefinition. Take care that you
-  * do not use this for other use cases than the following three:
-  *
-  * - HealthCheckActor (will be changed soon)
-  * - InstanceOpFactoryHelper and InstanceOpFactoryImpl (start resident and ephemeral tasks for an AppDefinition)
-  * - Migration to 1.4
-  *
-  * @param instanceId calculated instanceId based on the taskId
-  * @param agentInfo according agent information of the task
-  * @param state calculated instanceState based on taskState
-  * @param tasksMap a map of one key/value pair consisting of the actual task
-  * @param runSpecVersion the version of the task related runSpec
-  */
-object LegacyAppInstance {
-  def apply(task: Task, agentInfo: AgentInfo, unreachableStrategy: UnreachableStrategy): Instance = {
-    val since = task.status.startedAt.getOrElse(task.status.stagedAt)
-    val tasksMap = Map(task.taskId -> task)
-    val state = Instance.InstanceState(None, tasksMap, since, unreachableStrategy)
-
-    new Instance(task.taskId.instanceId, agentInfo, state, tasksMap, task.runSpecVersion, unreachableStrategy)
-  }
 }

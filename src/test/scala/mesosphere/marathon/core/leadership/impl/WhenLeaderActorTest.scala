@@ -1,8 +1,8 @@
 package mesosphere.marathon
 package core.leadership.impl
 
-import akka.actor.{ PoisonPill, Props, Status }
-import akka.testkit.{ TestActorRef, TestProbe }
+import akka.actor.{PoisonPill, Props, Status}
+import akka.testkit.{TestActorRef, TestProbe}
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.leadership.PreparationMessages
 
@@ -48,16 +48,6 @@ class WhenLeaderActorTest extends AkkaUnitTest {
       ref.underlying.become(ref.underlyingActor.active(childRef = childProbe.ref))
       probe.send(ref, PreparationMessages.PrepareForStart)
       probe.expectMsg(PreparationMessages.Prepared(ref))
-    }
-
-    "when starting, stop" in new Fixture {
-      val probe = TestProbe()
-      val ref = whenLeaderRef
-      ref.underlying.become(ref.underlyingActor.starting(coordinatorRef = probe.ref, childRef = childProbe.ref))
-      probe.send(ref, WhenLeaderActor.Stop)
-      val failure = probe.expectMsgClass(classOf[Status.Failure])
-      assert(failure.cause.getMessage.contains("starting aborted due to stop"))
-      probe.expectMsg(WhenLeaderActor.Stopped)
     }
 
     "when active, stop" in new Fixture {

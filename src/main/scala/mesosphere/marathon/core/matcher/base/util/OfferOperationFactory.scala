@@ -1,120 +1,165 @@
 package mesosphere.marathon
 package core.matcher.base.util
 
-import mesosphere.marathon.core.launcher.impl.TaskLabels
-import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.core.task.Task.LocalVolume
-import mesosphere.marathon.state.DiskSource
-import mesosphere.marathon.stream.Implicits._
-import mesosphere.util.state.FrameworkId
+import mesosphere.marathon.core.launcher.InstanceOpFactory
+import mesosphere.marathon.core.launcher.impl.ReservationLabels
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.state.VolumeMount
+import scala.jdk.CollectionConverters._
+import mesosphere.mesos.protos.ResourceProviderID
 import org.apache.mesos.Protos.Resource.ReservationInfo
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 
-class OfferOperationFactory(
-    private val principalOpt: Option[String],
-    private val roleOpt: Option[String]) {
+class OfferOperationFactory(metrics: Metrics, private val principalOpt: Option[String]) {
 
-  private[this] lazy val role: String = roleOpt match {
-    case Some(value) => value
-    case _ => throw WrongConfigurationException(
-      "No role set. Set --mesos_role to enable using local volumes in Marathon.")
-  }
+  private[this] val launchOperationCountMetric =
+    metrics.counter("mesos.offer-operations.launch")
+  private[this] val launchGroupOperationCountMetric =
+    metrics.counter("mesos.offer-operations.launch-group")
+  private[this] val reserveOperationCountMetric =
+    metrics.counter("mesos.offer-operations.reserve")
 
   private[this] lazy val principal: String = principalOpt match {
     case Some(value) => value
-    case _ => throw WrongConfigurationException(
-      "No principal set. Set --mesos_authentication_principal to enable using local volumes in Marathon.")
+    case _ =>
+      throw WrongConfigurationException("No principal set. Set --mesos_authentication_principal to enable using local volumes in Marathon.")
   }
 
   /** Create a launch operation for the given taskInfo. */
   def launch(taskInfo: Mesos.TaskInfo): Mesos.Offer.Operation = {
-    val launch = Mesos.Offer.Operation.Launch.newBuilder()
+    val launch = Mesos.Offer.Operation.Launch
+      .newBuilder()
       .addTaskInfos(taskInfo)
       .build()
 
-    Mesos.Offer.Operation.newBuilder()
+    launchOperationCountMetric.increment()
+    Mesos.Offer.Operation
+      .newBuilder()
       .setType(Mesos.Offer.Operation.Type.LAUNCH)
       .setLaunch(launch)
       .build()
   }
 
   def launch(executorInfo: Mesos.ExecutorInfo, groupInfo: Mesos.TaskGroupInfo): Mesos.Offer.Operation = {
-    val launch = Mesos.Offer.Operation.LaunchGroup.newBuilder()
+    val launch = Mesos.Offer.Operation.LaunchGroup
+      .newBuilder()
       .setExecutor(executorInfo)
       .setTaskGroup(groupInfo)
       .build()
-    Mesos.Offer.Operation.newBuilder()
+
+    launchGroupOperationCountMetric.increment()
+    Mesos.Offer.Operation
+      .newBuilder()
       .setType(Mesos.Offer.Operation.Type.LAUNCH_GROUP)
       .setLaunchGroup(launch)
       .build()
   }
 
-  def reserve(frameworkId: FrameworkId, taskId: Task.Id, resources: Seq[Mesos.Resource]): //
-  Mesos.Offer.Operation = {
-    val reservedResources = resources.map { resource =>
+  def reserve(role: String, reservationLabels: ReservationLabels, resources: Seq[Mesos.Resource]): Seq[Mesos.Offer.Operation] = {
 
-      val reservation = ReservationInfo.newBuilder()
-        .setLabels(TaskLabels.labelsForTask(frameworkId, taskId).mesosLabels)
-        .setPrincipal(principal)
+    // Mesos requires that there is an operation per each resource provider ID
+    resources
+      .groupBy(ResourceProviderID.fromResourceProto)
+      .values
+      .map { resources =>
+        val reservedResources = resources.map { resource =>
+          val reservation = ReservationInfo
+            .newBuilder()
+            .setLabels(reservationLabels.mesosLabels)
+            .setPrincipal(principal)
 
-      Mesos.Resource.newBuilder(resource)
-        .setRole(role)
-        .setReservation(reservation)
-        .build()
-    }
+          Mesos.Resource
+            .newBuilder(resource)
+            .setRole(role)
+            .setReservation(reservation)
+            .build(): @silent
+        }
 
-    val reserve = Mesos.Offer.Operation.Reserve.newBuilder()
-      .addAllResources(reservedResources.asJava)
-      .build()
+        val reserve = Mesos.Offer.Operation.Reserve
+          .newBuilder()
+          .addAllResources(reservedResources.asJava)
+          .build()
 
-    Mesos.Offer.Operation.newBuilder()
-      .setType(Mesos.Offer.Operation.Type.RESERVE)
-      .setReserve(reserve)
-      .build()
+        reserveOperationCountMetric.increment()
+        Mesos.Offer.Operation
+          .newBuilder()
+          .setType(Mesos.Offer.Operation.Type.RESERVE)
+          .setReserve(reserve)
+          .build()
+      }
+      .to(Seq)
   }
 
   def createVolumes(
-    frameworkId: FrameworkId,
-    taskId: Task.Id,
-    localVolumes: Seq[(DiskSource, LocalVolume)]): Mesos.Offer.Operation = {
+      role: String,
+      reservationLabels: ReservationLabels,
+      localVolumes: Seq[InstanceOpFactory.OfferedVolume]
+  ): Seq[Mesos.Offer.Operation] = {
 
-    val volumes: Seq[Mesos.Resource] = localVolumes.map {
-      case (source, vol) =>
-        val disk = {
-          val persistence = Mesos.Resource.DiskInfo.Persistence.newBuilder().setId(vol.id.idString)
-          principalOpt.foreach(persistence.setPrincipal)
+    // Mesos requires that there is an operation per each resource provider ID
+    localVolumes
+      .groupBy(_.providerId)
+      .values
+      .map { localVolumes =>
+        val volumes: Seq[Mesos.Resource] = localVolumes.map {
+          case InstanceOpFactory.OfferedVolume(providerId, source, vol) =>
+            val disk = {
+              val persistence = Mesos.Resource.DiskInfo.Persistence.newBuilder().setId(vol.id.idString)
+              principalOpt.foreach(persistence.setPrincipal)
 
-          val volume = Mesos.Volume.newBuilder()
-            .setContainerPath(vol.persistentVolume.containerPath)
-            .setMode(vol.persistentVolume.mode)
+              // Pod volumes have names, whereas app volumes do not. Since pod persistent volumes are created
+              // in the executor container, a persistent volume name is used as its name on the Mesos end. In this case
+              // all the corresponding volume mounts refer to the volume by its name. On the other hand, in case of apps,
+              // volumes do not have names, and since persistent volumes are not shared in this case, the mount path
+              // is used instead.
+              val name = vol.persistentVolume.name.getOrElse(vol.mount.mountPath)
 
-          val builder = Mesos.Resource.DiskInfo.newBuilder()
-            .setPersistence(persistence)
-            .setVolume(volume)
-          source.asMesos.foreach(builder.setSource)
-          builder
+              val mode = VolumeMount.readOnlyToProto(vol.mount.readOnly)
+              val volume = Mesos.Volume
+                .newBuilder()
+                .setContainerPath(name)
+                .setMode(mode)
+
+              val builder = Mesos.Resource.DiskInfo
+                .newBuilder()
+                .setPersistence(persistence)
+                .setVolume(volume)
+              source.asMesos.foreach(builder.setSource)
+              builder
+            }
+
+            val reservation = Mesos.Resource.ReservationInfo
+              .newBuilder()
+              .setLabels(reservationLabels.mesosLabels)
+            principalOpt.foreach(reservation.setPrincipal)
+
+            val builder = Mesos.Resource
+              .newBuilder()
+              .setName("disk")
+              .setType(Mesos.Value.Type.SCALAR)
+              .setScalar(Mesos.Value.Scalar.newBuilder().setValue(vol.persistentVolume.persistent.size.toDouble).build())
+              .setRole(role)
+              .setReservation(reservation)
+              .setDisk(disk): @silent
+
+            providerId.foreach { providerId =>
+              val providerIdProto = Mesos.ResourceProviderID.newBuilder().setValue(providerId.value).build()
+              builder.setProviderId(providerIdProto)
+            }
+
+            builder.build()
         }
 
-        val reservation = Mesos.Resource.ReservationInfo.newBuilder()
-          .setLabels(TaskLabels.labelsForTask(frameworkId, taskId).mesosLabels)
-        principalOpt.foreach(reservation.setPrincipal)
+        val create = Mesos.Offer.Operation.Create
+          .newBuilder()
+          .addAllVolumes(volumes.asJava)
 
-        Mesos.Resource.newBuilder()
-          .setName("disk")
-          .setType(Mesos.Value.Type.SCALAR)
-          .setScalar(Mesos.Value.Scalar.newBuilder().setValue(vol.persistentVolume.persistent.size.toDouble).build())
-          .setRole(role)
-          .setReservation(reservation)
-          .setDisk(disk)
+        Mesos.Offer.Operation
+          .newBuilder()
+          .setType(Mesos.Offer.Operation.Type.CREATE)
+          .setCreate(create)
           .build()
-    }
-
-    val create = Mesos.Offer.Operation.Create.newBuilder()
-      .addAllVolumes(volumes.asJava)
-
-    Mesos.Offer.Operation.newBuilder()
-      .setType(Mesos.Offer.Operation.Type.CREATE)
-      .setCreate(create)
-      .build()
+      }
+      .to(Seq)
   }
 }

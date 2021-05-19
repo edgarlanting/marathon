@@ -1,12 +1,21 @@
 package mesosphere.marathon
 package stream
 
-import akka.actor.Cancellable
+import akka.actor.{Cancellable, PoisonPill}
 import akka.stream.OverflowStrategy
 import akka.stream.scaladsl.Source
-import mesosphere.marathon.util.ActorCancellable
+import mesosphere.marathon.util.CancellableOnce
 
 object EnrichedSource {
+
+  /**
+    * Stream that produces no elements, but is cancellable
+    */
+  val emptyCancellable: Source[Nothing, Cancellable] =
+    Source.maybe[Nothing].mapMaterializedValue { m =>
+      new CancellableOnce(() => m.success(None))
+    }
+
   /**
     * Returns a Source which subscribes to messages of the given type
     *
@@ -28,16 +37,16 @@ object EnrichedSource {
     * @param overflowStrategy Strategy that is  used when incoming elements cannot fit inside the buffer
     */
   def eventBusSource[T](
-    message: Class[T],
-    eventStream: akka.event.EventStream,
-    bufferSize: Int,
-    overflowStrategy: OverflowStrategy): Source[T, Cancellable] = {
+      message: Class[T],
+      eventStream: akka.event.EventStream,
+      bufferSize: Int,
+      overflowStrategy: OverflowStrategy
+  ): Source[T, Cancellable] = {
     val source = Source.actorRef[T](bufferSize, overflowStrategy)
 
-    source.
-      mapMaterializedValue { ref =>
-        eventStream.subscribe(ref, message)
-        new ActorCancellable(ref)
-      }
+    source.mapMaterializedValue { ref =>
+      eventStream.subscribe(ref, message)
+      new CancellableOnce(() => ref ! PoisonPill)
+    }
   }
 }

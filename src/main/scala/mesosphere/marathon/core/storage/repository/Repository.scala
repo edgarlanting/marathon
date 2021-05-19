@@ -4,7 +4,7 @@ package core.storage.repository
 import java.time.OffsetDateTime
 
 import akka.stream.scaladsl.Source
-import akka.{ Done, NotUsed }
+import akka.{Done, NotUsed}
 
 import scala.concurrent.Future
 
@@ -48,4 +48,8 @@ trait VersionedRepository[Id, T] extends ReadOnlyVersionedRepository[Id, T] with
   def storeVersion(v: T): Future[Done]
   // Removes _only_ the current value, leaving all history in place.
   def deleteCurrent(id: Id): Future[Done]
+}
+
+object RepositoryConstants {
+  val maxConcurrency = 8
 }

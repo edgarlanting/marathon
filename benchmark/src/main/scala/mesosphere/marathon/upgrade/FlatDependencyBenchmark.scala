@@ -2,78 +2,74 @@ package mesosphere.marathon
 package upgrade
 
 import java.util.concurrent.TimeUnit
-import mesosphere.marathon.core.pod.{ MesosContainer, BridgeNetwork }
-import mesosphere.marathon.raml.{ Endpoint, Image, ImageType, Resources }
+import mesosphere.marathon.core.pod.{MesosContainer, BridgeNetwork}
+import mesosphere.marathon.raml.{Endpoint, Image, ImageType, Resources}
 import mesosphere.marathon.state.Container
 
-import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state._
 import mesosphere.marathon.core.deployment.DeploymentPlan
 import mesosphere.marathon.core.pod.PodDefinition
-import org.openjdk.jmh.annotations.{ Group => _, _ }
+import org.openjdk.jmh.annotations.{Group => _, _}
 import org.openjdk.jmh.infra.Blackhole
-
-import scala.collection.breakOut
 
 @State(Scope.Benchmark)
 object FlatDependencyBenchmark {
 
   val version = VersionInfo.forNewConfig(Timestamp(1))
 
-  def makeApp(path: PathId) =
+  def makeApp(path: AbsolutePathId) =
     AppDefinition(
       id = path,
+      role = "someRole",
       labels = Map("ID" -> path.toString),
       versionInfo = version,
       networks = Seq(BridgeNetwork()),
-      container = Some(
-        Container.Docker(Nil, "alpine", List(Container.PortMapping(2015, Some(0), 10000, "tcp", Some("thing")))))
+      container = Some(Container.Docker(Nil, "alpine", List(Container.PortMapping(2015, Some(0), 10000, "tcp", Some("thing")))))
     )
 
-  def makePod(path: PathId) =
+  def makePod(path: AbsolutePathId) =
     PodDefinition(
       id = path,
+      role = "someRole",
       networks = Seq(BridgeNetwork()),
       labels = Map("ID" -> path.toString),
-      version = version.lastConfigChangeAt,
-
+      versionInfo = version,
       containers = Seq(
         MesosContainer(
           "container-1",
           resources = Resources(1.0),
           image = Some(Image(ImageType.Docker, "alpine")),
-          endpoints = List(
-            Endpoint(
-              "service",
-              Some(2015),
-              Some(0),
-              Seq("tcp"))))))
+          endpoints = List(Endpoint("service", Some(2015), Some(0), Seq("tcp")))
+        )
+      )
+    )
 
   val ids = 0 to 900
 
-  val podPaths: Vector[PathId] = ids.map { podId =>
-    s"/pod-${podId}".toPath
-  }(breakOut)
+  val podPaths: Vector[AbsolutePathId] = ids.iterator.map { podId =>
+    AbsolutePathId(s"/pod-${podId}")
+  }.toVector
 
-  val appPaths: Vector[PathId] = ids.map { appId =>
-    s"/app-${appId}".toPath
-  }(breakOut)
+  val appPaths: Vector[AbsolutePathId] = ids.iterator.map { appId =>
+    AbsolutePathId(s"/app-${appId}")
+  }.toVector
 
-  val appDefs: Map[PathId, AppDefinition] = appPaths.map { path =>
-    path -> makeApp(path)
-  }(breakOut)
+  val appDefs: Seq[AppDefinition] = appPaths.map { path =>
+    makeApp(path)
+  }
 
-  val podDefs: Map[PathId, PodDefinition] = podPaths.map { path =>
-    path -> makePod(path)
-  }(breakOut)
+  val podDefs: Seq[PodDefinition] = podPaths.map { path =>
+    makePod(path)
+  }
 
-  val rootGroup = RootGroup(apps = appDefs, pods = podDefs)
+  val rootGroup = Builders.newRootGroup(apps = appDefs, pods = podDefs)
   def upgraded = {
-    val pathId = "/app-901".toPath
-    RootGroup(
-      apps = rootGroup.apps + (pathId -> makeApp(pathId)),
-      pods = rootGroup.pods + (pathId -> makePod(pathId))
-    )
+    val appPathId = AbsolutePathId("/app-901")
+    val podPathId = AbsolutePathId("/pod-901")
+
+    rootGroup
+      .updateApp(appPathId, _ => makeApp(appPathId))
+      .updatePod(podPathId, _ => makePod(podPathId))
   }
 }
 

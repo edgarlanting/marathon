@@ -1,31 +1,38 @@
 package mesosphere.mesos
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.health.{ MesosCommandHealthCheck, MesosHttpHealthCheck, MesosTcpHealthCheck, PortReference }
+import mesosphere.marathon.core.health.{MesosCommandHealthCheck, MesosHttpHealthCheck, MesosTcpHealthCheck, PortReference}
 import mesosphere.marathon.core.instance.Instance
+import mesosphere.marathon.silent
 import mesosphere.marathon.core.pod._
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.plugin.task.RunSpecTaskProcessor
-import mesosphere.marathon.plugin.{ ApplicationSpec, PodSpec }
+import mesosphere.marathon.plugin.{ApplicationSpec, PodSpec}
 import mesosphere.marathon.raml
-import mesosphere.marathon.raml.{ Resources, Endpoint }
-import mesosphere.marathon.state.PathId._
+import mesosphere.marathon.raml.{Endpoint, Lifecycle, Resources}
 import mesosphere.marathon.state._
-import mesosphere.marathon.stream.Implicits._
-import mesosphere.marathon.test.MarathonTestHelper
-import org.apache.mesos.Protos.{ ExecutorInfo, TaskGroupInfo, TaskInfo }
-import org.apache.mesos.{ Protos => mesos }
+import mesosphere.marathon.state
+import scala.jdk.CollectionConverters._
+import mesosphere.marathon.test.{MarathonTestHelper, SettableClock}
+import mesosphere.marathon.AllConf
+import mesosphere.mesos.protos.Resource
+import org.apache.mesos.Protos.{ExecutorInfo, TaskGroupInfo, TaskInfo}
+import org.apache.mesos.{Protos => mesos}
 import org.scalatest.Inside
 
 import scala.collection.immutable.Seq
-import scala.collection.JavaConverters._
-import scala.collection.breakOut
+import scala.concurrent.duration._
 
 class TaskGroupBuilderTest extends UnitTest with Inside {
+
+  implicit val clock = new SettableClock()
+  val config = AllConf.withTestConfig()
+
   val defaultBuilderConfig = TaskGroupBuilder.BuilderConfig(
     acceptedResourceRoles = Set(ResourceRole.Unreserved),
     envVarsPrefix = None,
-    mesosBridgeName = raml.Networks.DefaultMesosBridgeName)
+    mesosBridgeName = raml.Networks.DefaultMesosBridgeName
+  )
 
   "A TaskGroupBuilder" must {
 
@@ -36,11 +43,11 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
           List(ContainerNetwork("1"), ContainerNetwork("2")),
           List(
             Endpoint("port-1", containerPort = Some(2001), networkNames = List("1")),
-            Endpoint("port-2", containerPort = Some(2002), networkNames = List("2"))),
-          List(
-            Some(1001),
-            Some(1002)),
-          defaultBuilderConfig.mesosBridgeName)
+            Endpoint("port-2", containerPort = Some(2002), networkNames = List("2"))
+          ),
+          List(Some(1001), Some(1002)),
+          defaultBuilderConfig.mesosBridgeName
+        )
 
         network1.getName shouldBe "1"
         inside(network1.getPortMappingsList.asScala.toList) {
@@ -60,7 +67,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 1.1, mem = 160.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo",
@@ -69,24 +77,31 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
           )
         )
       )
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
-      assert(taskGroupInfo.getTasksList.exists(_.getName == "Foo"))
+      assert(taskGroupInfo.getTasksList.asScala.exists(_.getName == "Foo"))
     }
 
     "build from a PodDefinition with multiple containers" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo",
@@ -102,24 +117,99 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
           )
         )
       )
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 3)
     }
 
+    "use the given matched resources" in {
+      val offer = MarathonTestHelper.makeBasicOffer(cpus = 0.9, mem = 192.0, disk = 60.0, gpus = 8.0, role = "slave0").build
+
+      val podSpec = PodDefinition(
+        id = AbsolutePathId("/slave0/pod"),
+        role = "*",
+        acceptedResourceRoles = Set("slave0"),
+        executorResources = raml.Resources(cpus = 0.1, mem = 32, disk = 10),
+        containers = Seq(
+          MesosContainer(name = "foo", resources = raml.Resources(cpus = 0.3, mem = 64.0, disk = 20, gpus = 3)),
+          MesosContainer(name = "bar", resources = raml.Resources(cpus = 0.5, mem = 96.0, disk = 30, gpus = 5))
+        )
+      )
+
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (executorInfo, taskGroupInfo, _) = TaskGroupBuilder.build(
+        podSpec,
+        offer,
+        instanceId,
+        taskIds,
+        defaultBuilderConfig,
+        RunSpecTaskProcessor.empty,
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
+      )
+
+      assert(executorInfo.getResourcesList.asScala.forall(_.getRole == "slave0"))
+      assert(executorInfo.getResourcesList.asScala.count { r =>
+        r.getRole == "slave0" && r.getName == "cpus" && r.getScalar.getValue == 0.1
+      } == 1)
+      assert(executorInfo.getResourcesList.asScala.count { r =>
+        r.getRole == "slave0" && r.getName == "mem" && r.getScalar.getValue == 32.0
+      } == 1)
+      assert(executorInfo.getResourcesList.asScala.count { r =>
+        r.getRole == "slave0" && r.getName == "disk" && r.getScalar.getValue == 10.0
+      } == 1)
+
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.forall(_.getRole == "slave0")) == 2)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "cpus" && r.getScalar.getValue == 0.3
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "cpus" && r.getScalar.getValue == 0.5
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "mem" && r.getScalar.getValue == 64.0
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "mem" && r.getScalar.getValue == 96.0
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "disk" && r.getScalar.getValue == 20
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "disk" && r.getScalar.getValue == 30
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "gpus" && r.getScalar.getValue == 3.0
+      }) == 1)
+      assert(taskGroupInfo.getTasksList.asScala.count(_.getResourcesList.asScala.exists { r =>
+        r.getRole == "slave0" && r.getName == "gpus" && r.getScalar.getValue == 5.0
+      }) == 1)
+    }: @silent
+
     "set container commands from a MesosContainer definition" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -139,26 +229,32 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 3)
 
-      val command1 = taskGroupInfo.getTasksList.find(_.getName == "Foo1").get.getCommand
+      val command1 = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getCommand
 
       assert(command1.getShell)
       assert(command1.getValue == "foo")
       assert(command1.getArgumentsCount == 0)
 
-      val command2 = taskGroupInfo.getTasksList.find(_.getName == "Foo2").get.getCommand
+      val command2 = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo2").get.getCommand
 
       assert(!command2.getShell)
       assert(command2.getValue.isEmpty)
@@ -167,7 +263,7 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       assert(command2.getArguments(1) == "arg1")
       assert(command2.getArguments(2) == "arg2")
 
-      val command3 = taskGroupInfo.getTasksList.find(_.getName == "Foo3").get.getCommand
+      val command3 = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo3").get.getCommand
 
       assert(!command3.getShell)
       assert(command3.getValue == "foo")
@@ -181,7 +277,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -196,28 +293,35 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         user = Some("user")
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
 
-      assert(taskGroupInfo.getTasksList.find(_.getName == "Foo1").get.getCommand.getUser == "user")
-      assert(taskGroupInfo.getTasksList.find(_.getName == "Foo2").get.getCommand.getUser == "admin")
+      assert(taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getCommand.getUser == "user")
+      assert(taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo2").get.getCommand.getUser == "admin")
     }
 
     "set pod labels and container labels" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -233,20 +337,26 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         labels = Map("a" -> "a", "b" -> "b")
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (executorInfo, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (executorInfo, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(executorInfo.hasLabels)
 
-      val executorLabels = executorInfo.getLabels.getLabelsList.map { label =>
+      val executorLabels = executorInfo.getLabels.getLabelsList.asScala.map { label =>
         label.getKey -> label.getValue
       }.toMap
 
@@ -255,17 +365,25 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
 
       assert(taskGroupInfo.getTasksCount == 2)
 
-      val task1labels = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get
-        .getLabels.getLabelsList
-        .map(label => label.getKey -> label.getValue).toMap
+      val task1labels = taskGroupInfo.getTasksList.asScala
+        .find(_.getName == "Foo1")
+        .get
+        .getLabels
+        .getLabelsList
+        .asScala
+        .map(label => label.getKey -> label.getValue)
+        .toMap
 
       assert(task1labels("b") == "c")
 
-      val task2labels = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get
-        .getLabels.getLabelsList
-        .map(label => label.getKey -> label.getValue).toMap
+      val task2labels = taskGroupInfo.getTasksList.asScala
+        .find(_.getName == "Foo2")
+        .get
+        .getLabels
+        .getLabelsList
+        .asScala
+        .map(label => label.getKey -> label.getValue)
+        .toMap
 
       assert(task2labels("c") == "c")
     }
@@ -281,21 +399,28 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       )
 
       val podSpec = PodDefinition(
-        id = instanceIdStr.toPath,
+        id = AbsolutePathId(instanceIdStr),
+        role = "*",
         containers = Seq(
           mesosContainer
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, instanceId) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 1)
@@ -305,10 +430,13 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         .getCommand
         .getEnvironment
         .getVariablesList
-        .map(ev => (ev.getName, ev.getValue))(breakOut)
+        .asScala
+        .iterator
+        .map(ev => (ev.getName, ev.getValue))
+        .toMap
 
       assert(envVars("MESOS_EXECUTOR_ID") == instanceId.executorIdString)
-      assert(envVars("MESOS_TASK_ID") == Task.Id.forInstanceId(instanceId, Some(mesosContainer)).idString)
+      assert(envVars("MESOS_TASK_ID") == Task.Id(instanceId, Some(mesosContainer)).idString)
       assert(envVars("MARATHON_APP_ID") == instanceIdStr)
       assert(envVars.contains("MARATHON_APP_VERSION"))
       assert(envVars("MARATHON_CONTAINER_ID") == containerIdStr)
@@ -318,7 +446,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -336,26 +465,34 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         labels = Map("a" -> "a")
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
 
-      val task1EnvVars = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get
+      val task1EnvVars = taskGroupInfo.getTasksList.asScala
+        .find(_.getName == "Foo1")
+        .get
         .getCommand
         .getEnvironment
         .getVariablesList
-
-        .map(envVar => envVar.getName -> envVar.getValue).toMap
+        .asScala
+        .map(envVar => envVar.getName -> envVar.getValue)
+        .toMap
 
       assert(task1EnvVars("a") == "a")
       assert(task1EnvVars("b") == "c")
@@ -364,13 +501,15 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       assert(task1EnvVars("MARATHON_APP_LABELS") == "A")
       assert(task1EnvVars("MARATHON_APP_LABEL_A") == "a")
 
-      val task2EnvVars = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get
+      val task2EnvVars = taskGroupInfo.getTasksList.asScala
+        .find(_.getName == "Foo2")
+        .get
         .getCommand
         .getEnvironment
         .getVariablesList
-
-        .map(envVar => envVar.getName -> envVar.getValue).toMap
+        .asScala
+        .map(envVar => envVar.getName -> envVar.getValue)
+        .toMap
 
       assert(task2EnvVars("a") == "a")
       assert(task2EnvVars("b") == "b")
@@ -386,20 +525,25 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
             resources = raml.Resources(cpus = 2.0f, mem = 512.0f),
             volumeMounts = Seq(
-              VolumeMount(
-                name = "volume1",
+              state.VolumeMount(
+                volumeName = Some("volume1"),
                 mountPath = "/mnt/path1"
               ),
-              VolumeMount(
-                name = "volume2",
+              state.VolumeMount(
+                volumeName = Some("volume2"),
                 mountPath = "/mnt/path2",
-                readOnly = Some(true)
+                readOnly = true
+              ),
+              state.VolumeMount(
+                volumeName = Some("volume3"),
+                mountPath = "/mnt/path3"
               )
             )
           ),
@@ -407,129 +551,76 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
             name = "Foo2",
             resources = raml.Resources(cpus = 2.0f, mem = 512.0f),
             volumeMounts = Seq(
-              VolumeMount(
-                name = "volume1",
+              state.VolumeMount(
+                volumeName = Some("volume1"),
                 mountPath = "/mnt/path2",
-                readOnly = Some(false)
+                readOnly = false
+              ),
+              state.VolumeMount(
+                volumeName = Some("volume3"),
+                mountPath = "/mnt/path3"
               )
             )
           )
         ),
-        podVolumes = Seq(
-          HostVolume(
-            name = "volume1",
+        volumes = Seq(
+          state.HostVolume(
+            name = Some("volume1"),
             hostPath = "/mnt/path1"
           ),
-          EphemeralVolume(
-            name = "volume2"
+          state.EphemeralVolume(
+            name = Some("volume2")
+          ),
+          state.PersistentVolume(
+            name = Some("volume3"),
+            persistent = PersistentVolumeInfo(
+              size = 512
+            )
           )
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
 
-      val task1Volumes = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get
-        .getContainer.getVolumesList
+      val task1Volumes = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getContainer.getVolumesList.asScala
 
-      assert(task1Volumes.size == 2)
+      assert(task1Volumes.size == 3)
       assert(task1Volumes.find(_.getContainerPath == "/mnt/path1").get.getHostPath == "/mnt/path1")
       assert(task1Volumes.find(_.getContainerPath == "/mnt/path1").get.getMode == mesos.Volume.Mode.RW)
       assert(task1Volumes.find(_.getContainerPath == "/mnt/path2").get.getMode == mesos.Volume.Mode.RO)
+      assert(task1Volumes.find(_.getContainerPath == "/mnt/path3").get.getMode == mesos.Volume.Mode.RW)
 
-      val task2Volumes = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get
-        .getContainer.getVolumesList
+      val task2Volumes = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo2").get.getContainer.getVolumesList.asScala
 
-      assert(task2Volumes.size == 1)
+      assert(task2Volumes.size == 2)
       assert(task2Volumes.find(_.getContainerPath == "/mnt/path2").get.getHostPath == "/mnt/path1")
       assert(task2Volumes.find(_.getContainerPath == "/mnt/path2").get.getMode == mesos.Volume.Mode.RW)
-    }
-
-    "set container images from an image definition" in {
-      val offer = MarathonTestHelper.makeBasicOffer(cpus = 6.1, mem = 1568.0, disk = 10.0).build
-
-      val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
-        containers = Seq(
-          MesosContainer(
-            name = "Foo1",
-            resources = raml.Resources(cpus = 2.0f, mem = 512.0f),
-            image = Some(
-              raml.Image(
-                kind = raml.ImageType.Docker,
-                id = "alpine",
-                forcePull = Some(true)
-              ))
-          ),
-          MesosContainer(
-            name = "Foo2",
-            resources = raml.Resources(cpus = 2.0f, mem = 512.0f),
-            image = Some(
-              raml.Image(
-                kind = raml.ImageType.Appc,
-                id = "alpine",
-                labels = Map("foo" -> "bla")
-              ))
-          ),
-          MesosContainer(
-            name = "Foo3",
-            resources = raml.Resources(cpus = 2.0f, mem = 512.0f)
-          )
-        )
-      )
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
-
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
-        podSpec,
-        offer,
-        s => Instance.Id.forRunSpec(s),
-        defaultBuilderConfig,
-        RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
-      )
-
-      assert(taskGroupInfo.getTasksCount == 3)
-
-      val task1Container = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get.getContainer
-
-      assert(task1Container.getType == mesos.ContainerInfo.Type.MESOS)
-      assert(task1Container.getMesos.getImage.getType == mesos.Image.Type.DOCKER)
-      assert(task1Container.getMesos.getImage.getDocker.getName == "alpine")
-      assert(!task1Container.getMesos.getImage.getCached)
-
-      val task2Container = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get.getContainer
-
-      assert(task2Container.getType == mesos.ContainerInfo.Type.MESOS)
-      assert(task2Container.getMesos.getImage.getType == mesos.Image.Type.APPC)
-      assert(task2Container.getMesos.getImage.getAppc.getName == "alpine")
-      val appcImageLabels = task2Container.getMesos.getImage.getAppc.getLabels.getLabelsList.map(l => l.getKey -> l.getValue).toMap
-      assert(appcImageLabels == TaskGroupBuilder.LinuxAmd64 ++ Map("foo" -> "bla"))
-
-      val task3 = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo3").get
-
-      assert(!task3.hasContainer)
+      assert(task1Volumes.find(_.getContainerPath == "/mnt/path3").get.getMode == mesos.Volume.Mode.RW)
     }
 
     "create a pod of one container with Docker pull config" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 6.1, mem = 1568.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -540,24 +631,32 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
                 id = "alpine",
                 pullConfig = Some(raml.DockerPullConfig("aSecret")),
                 forcePull = Some(true)
-              ))
-          )))
+              )
+            )
+          )
+        )
+      )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 1)
 
-      val taskContainer = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get.getContainer
+      val taskContainer = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getContainer
 
       assert(taskContainer.getType == mesos.ContainerInfo.Type.MESOS)
       assert(taskContainer.getMesos.getImage.getType == mesos.Image.Type.DOCKER)
@@ -571,7 +670,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 1200, endPort = 1300).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         networks = Seq(HostNetwork),
         containers = Seq(
           MesosContainer(
@@ -604,37 +704,37 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 3)
 
-      val task1HealthCheck = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get
-        .getHealthCheck
+      val task1HealthCheck = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getHealthCheck
 
       assert(task1HealthCheck.getType == mesos.HealthCheck.Type.HTTP)
       assert(task1HealthCheck.getHttp.getPort == 1234)
       assert(task1HealthCheck.getHttp.getPath == "healthcheck")
 
-      val task2HealthCheck = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get
-        .getHealthCheck
+      val task2HealthCheck = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo2").get.getHealthCheck
 
       assert(task2HealthCheck.getType == mesos.HealthCheck.Type.TCP)
       assert(task2HealthCheck.getTcp.getPort == 1235)
 
-      val task3HealthCheck = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo3").get
-        .getHealthCheck
+      val task3HealthCheck = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo3").get.getHealthCheck
 
       assert(task3HealthCheck.getType == mesos.HealthCheck.Type.COMMAND)
       assert(task3HealthCheck.getCommand.getShell)
@@ -645,7 +745,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 1200, endPort = 1300).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         networks = Seq(ContainerNetwork("dcosnetwork")),
         containers = Seq(
           MesosContainer(
@@ -673,30 +774,32 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
 
-      val task1HealthCheck = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo1").get
-        .getHealthCheck
+      val task1HealthCheck = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getHealthCheck
 
       assert(task1HealthCheck.getType == mesos.HealthCheck.Type.HTTP)
       assert(task1HealthCheck.getHttp.getPort == 1234)
       assert(task1HealthCheck.getHttp.getPath == "healthcheck")
 
-      val task2HealthCheck = taskGroupInfo
-        .getTasksList.find(_.getName == "Foo2").get
-        .getHealthCheck
+      val task2HealthCheck = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo2").get.getHealthCheck
 
       assert(task2HealthCheck.getType == mesos.HealthCheck.Type.TCP)
       assert(task2HealthCheck.getTcp.getPort == 1235)
@@ -706,7 +809,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 1200, endPort = 1300).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         networks = Seq(BridgeNetwork()),
         containers = Seq(
           MesosContainer(
@@ -734,37 +838,42 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (executorInfo, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (executorInfo, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
-
-      val task1 = taskGroupInfo.getTasksList.find(_.getName == "Foo1").get
 
       val networkInfo = executorInfo.getContainer.getNetworkInfosList.get(0)
       assert(networkInfo.getName() == defaultBuilderConfig.mesosBridgeName)
 
       val portMappings = networkInfo.getPortMappingsList
 
-      assert(portMappings.count(_.getContainerPort == 1211) == 1)
-      assert(portMappings.count(_.getContainerPort == 1212) == 1)
-      assert(portMappings.find(_.getContainerPort == 1211).get.getHostPort == 1201)
-      assert(portMappings.find(_.getContainerPort == 1212).get.getHostPort != 0)
+      assert(portMappings.asScala.count(_.getContainerPort == 1211) == 1)
+      assert(portMappings.asScala.count(_.getContainerPort == 1212) == 1)
+      assert(portMappings.asScala.find(_.getContainerPort == 1211).get.getHostPort == 1201)
+      assert(portMappings.asScala.find(_.getContainerPort == 1212).get.getHostPort != 0)
     }
 
     "support URL artifacts" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 1.1, mem = 160.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -778,28 +887,35 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
-      val task1Artifacts = taskGroupInfo.getTasksList.find(_.getName == "Foo1").get.getCommand.getUrisList
+      val task1Artifacts = taskGroupInfo.getTasksList.asScala.find(_.getName == "Foo1").get.getCommand.getUrisList
       assert(task1Artifacts.size == 1)
 
-      assert(task1Artifacts.head.getValue == "foo")
+      assert(task1Artifacts.asScala.head.getValue == "foo")
     }
 
     "executor info has correct values" in {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 21.1, mem = 256.0, disk = 10.0).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -814,18 +930,24 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         executorResources = Resources(cpus = 20.0)
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (executorInfo, _, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (executorInfo, _, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
-      val cpuExecutorInfo = executorInfo.getResourcesList.find(info => info.getName == "cpus")
+      val cpuExecutorInfo = executorInfo.getResourcesList.asScala.find(info => info.getName == "cpus")
       assert(cpuExecutorInfo.isDefined)
       assert(cpuExecutorInfo.get.getScalar.getValue == 20.0)
       assert(podSpec.resources.cpus == 21.0)
@@ -835,7 +957,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 8000, endPort = 9000).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -874,58 +997,64 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (executorInfo, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (executorInfo, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
       val task1 = taskGroupInfo.getTasks(0)
       assert(task1.hasDiscovery)
-      val task1Ports = task1.getDiscovery.getPorts.getPortsList.to[Seq]
+      val task1Ports = task1.getDiscovery.getPorts.getPortsList.asScala.to(Seq)
       assert(task1Ports.map(_.getProtocol) == Seq("tcp", "udp"))
       assert(task1Ports.count(_.getName == "webserver") == 2)
 
       withClue("expected network-scope=host and VIP_0 in port discovery info, for both tcp and udp protocols") {
         task1Ports.forall { p =>
           p.getNumber == 8080 && {
-            val labels: Map[String, String] = p.getLabels.getLabelsList.to[Seq].map(l => l.getKey -> l.getValue).toMap
+            val labels: Map[String, String] = p.getLabels.getLabelsList.asScala.to(Seq).map(l => l.getKey -> l.getValue).toMap
             labels.get("network-scope").contains("host") && labels.get("VIP_0").contains("1.1.1.1:8888")
           }
         } shouldBe true
       }
 
       val task2 = taskGroupInfo.getTasks(1)
-      val task2Ports = task2.getDiscovery.getPorts.getPortsList.to[Seq]
+      val task2Ports = task2.getDiscovery.getPorts.getPortsList.asScala.to(Seq)
       assert(task2Ports.map(_.getProtocol) == Seq("tcp", "tcp"))
 
-      task2Ports.exists{ p =>
+      task2Ports.exists { p =>
         p.getName == "webapp" && p.getNumber != 1234 && {
-          val labels: Map[String, String] = p.getLabels.getLabelsList.to[Seq].map(l => l.getKey -> l.getValue).toMap
+          val labels: Map[String, String] = p.getLabels.getLabelsList.asScala.to(Seq).map(l => l.getKey -> l.getValue).toMap
           labels.get("network-scope").contains("host") && !labels.exists { case (k, v) => k.startsWith("VIP_") }
         }
       } shouldBe true
 
-      task2Ports.exists{ p =>
+      task2Ports.exists { p =>
         p.getName == "webapp-tls" && p.getNumber == 1235 && {
-          val labels: Map[String, String] = p.getLabels.getLabelsList.to[Seq].map(l => l.getKey -> l.getValue).toMap
+          val labels: Map[String, String] = p.getLabels.getLabelsList.asScala.to(Seq).map(l => l.getKey -> l.getValue).toMap
           labels.get("network-scope").contains("container") && labels.get("VIP_1").contains("2.2.2.2:9999")
         }
       } shouldBe true
 
       assert(executorInfo.getContainer.getNetworkInfosCount == 1)
 
-      val networkInfo = executorInfo.getContainer.getNetworkInfosList.find(_.getName == "network-a")
+      val networkInfo = executorInfo.getContainer.getNetworkInfosList.asScala.find(_.getName == "network-a")
 
       assert(networkInfo.isDefined)
 
-      val portMappings = networkInfo.get.getPortMappingsList
+      val portMappings = networkInfo.get.getPortMappingsList.asScala
 
       assert(portMappings.filter(_.getContainerPort == 80).find(_.getProtocol == "tcp").get.getHostPort == 8080)
       assert(portMappings.filter(_.getContainerPort == 80).find(_.getProtocol == "udp").get.getHostPort == 8080)
@@ -936,7 +1065,8 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 8000, endPort = 9000).build
 
       val podSpec = PodDefinition(
-        id = "/product/frontend".toPath,
+        id = AbsolutePathId("/product/frontend"),
+        role = "*",
         containers = Seq(
           MesosContainer(
             name = "Foo1",
@@ -967,20 +1097,26 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         )
       )
 
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
         offer,
-        s => Instance.Id.forRunSpec(s),
+        instanceId,
+        taskIds,
         defaultBuilderConfig,
         RunSpecTaskProcessor.empty,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
 
       assert(taskGroupInfo.getTasksCount == 2)
-      val task1Env = taskGroupInfo.getTasks(0).getCommand.getEnvironment.getVariablesList.map(v => v.getName -> v.getValue).toMap
-      val task2Env = taskGroupInfo.getTasks(1).getCommand.getEnvironment.getVariablesList.map(v => v.getName -> v.getValue).toMap
+      val task1Env = taskGroupInfo.getTasks(0).getCommand.getEnvironment.getVariablesList.asScala.map(v => v.getName -> v.getValue).toMap
+      val task2Env = taskGroupInfo.getTasks(1).getCommand.getEnvironment.getVariablesList.asScala.map(v => v.getName -> v.getValue).toMap
       assert(task1Env("ENDPOINT_WEBSERVER") == "80")
       assert(task1Env("ENDPOINT_WEBAPP") == "1234")
       assert(task1Env("EP_HOST_WEBSERVER") == "8080")
@@ -1001,19 +1137,28 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
         override def taskGroup(runSpec: PodSpec, exec: ExecutorInfo.Builder, builder: TaskGroupInfo.Builder): Unit = {
           val taskList = builder.getTasksList
           builder.clearTasks()
-          taskList.foreach { task => builder.addTasks(task.toBuilder.setName(task.getName + "-extended")) }
+          taskList.asScala.foreach { task => builder.addTasks(task.toBuilder.setName(task.getName + "-extended")) }
         }
       }
 
       val offer = MarathonTestHelper.makeBasicOffer(cpus = 4.1, mem = 1056.0, disk = 10.0).build
       val container = MesosContainer(name = "foo", resources = raml.Resources(cpus = 1.0f, mem = 128.0f))
-      val podSpec = PodDefinition(id = "/product/frontend".toPath, containers = Seq(container))
-      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles)
+      val podSpec = PodDefinition(id = AbsolutePathId("/product/frontend"), role = "*", containers = Seq(container))
+      val resourceMatch =
+        RunSpecOfferMatcher.matchOffer(podSpec, offer, Seq.empty, defaultBuilderConfig.acceptedResourceRoles, config, Seq.empty)
 
-      val (_, taskGroupInfo, _, _) = TaskGroupBuilder.build(
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
         podSpec,
-        offer, Instance.Id.forRunSpec, defaultBuilderConfig, runSpecTaskProcessor,
-        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch
+        offer,
+        instanceId,
+        taskIds,
+        defaultBuilderConfig,
+        runSpecTaskProcessor,
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
       )
       taskGroupInfo.getTasksCount should be(1)
       taskGroupInfo.getTasks(0).getName should be(s"${container.name}-extended")
@@ -1021,7 +1166,7 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
 
     "tty defined in a pod container will render ContainerInfo correctly" in {
       val container = MesosContainer(name = "withTTY", resources = Resources(), tty = Some(true))
-      val pod = PodDefinition(id = PathId("/tty"), containers = Seq(container))
+      val pod = PodDefinition(id = AbsolutePathId("/tty"), role = "*", containers = Seq(container))
       val containerInfo = TaskGroupBuilder.computeContainerInfo(pod, container)
       containerInfo should be(defined)
       containerInfo.get.hasTtyInfo should be(true)
@@ -1030,9 +1175,147 @@ class TaskGroupBuilderTest extends UnitTest with Inside {
 
     "no tty defined in a pod container will render ContainerInfo without tty" in {
       val container = MesosContainer(name = "withTTY", resources = Resources())
-      val pod = PodDefinition(id = PathId("/notty"), containers = Seq(container))
+      val pod = PodDefinition(id = AbsolutePathId("/notty"), role = "*", containers = Seq(container))
       val containerInfo = TaskGroupBuilder.computeContainerInfo(pod, container)
-      containerInfo should be(empty)
+      containerInfo.get.hasTtyInfo shouldBe false
     }
+
+    "IpcConfig defined on a pod renders to executor info" in {
+      val ipcShmSize = 64
+      val ipcMode = IpcMode.Private
+
+      val ipcModeContainer = IpcMode.ShareParent
+      val ipcShmSizeContainer = 32
+
+      val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 8000, endPort = 9000).build
+      val containerLinuxInfo =
+        LinuxInfo(seccomp = None, ipcInfo = Some(IPCInfo(ipcMode = ipcModeContainer, shmSize = Some(ipcShmSizeContainer))))
+      val podLinuxInfo = LinuxInfo(seccomp = None, ipcInfo = Some(IPCInfo(ipcMode = ipcMode, shmSize = Some(ipcShmSize))))
+
+      new FixtureWithMatchedOffer(containerLinuxInfo = Some(containerLinuxInfo), podLinuxInfo = Some(podLinuxInfo)) {
+        val (executorInfo, taskGroup, _) = TaskGroupBuilder.build(
+          podSpec,
+          offer,
+          instanceId,
+          taskIds,
+          defaultBuilderConfig,
+          RunSpecTaskProcessor.empty,
+          resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+          None,
+          true
+        )
+
+        executorInfo.hasContainer should be(true)
+        executorInfo.getContainer.hasLinuxInfo should be(true)
+        executorInfo.getContainer.getLinuxInfo.hasIpcMode should be(true)
+        executorInfo.getContainer.getLinuxInfo.getIpcMode should be(mesos.LinuxInfo.IpcMode.PRIVATE)
+        executorInfo.getContainer.getLinuxInfo.hasShmSize should be(true)
+        executorInfo.getContainer.getLinuxInfo.getShmSize should be(ipcShmSize)
+
+        taskGroup.getTasksCount should be(1)
+        val task = taskGroup.getTasksList.get(0)
+        task.hasContainer should be(true)
+        task.getContainer.hasLinuxInfo should be(true)
+        task.getContainer.getLinuxInfo.hasIpcMode should be(true)
+        task.getContainer.getLinuxInfo.getIpcMode should be(mesos.LinuxInfo.IpcMode.SHARE_PARENT)
+        task.getContainer.getLinuxInfo.hasShmSize should be(true)
+        task.getContainer.getLinuxInfo.getShmSize should be(ipcShmSizeContainer)
+      }
+
+    }
+
+    "killPolicy is specified correctly" in {
+      val killDuration = 3.seconds
+      val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 8000, endPort = 9000).build
+      val container = MesosContainer(
+        name = "withTTY",
+        resources = Resources(),
+        tty = Some(true),
+        lifecycle = Some(Lifecycle(Some(killDuration.toSeconds.toDouble)))
+      )
+
+      val podSpec = PodDefinition(id = AbsolutePathId("/tty"), role = "*", containers = Seq(container))
+      val instanceId = Instance.Id.forRunSpec(podSpec.id)
+      val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+      val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Nil, defaultBuilderConfig.acceptedResourceRoles, config, Nil)
+      val (_, taskGroupInfo, _) = TaskGroupBuilder.build(
+        podSpec,
+        offer,
+        instanceId,
+        taskIds,
+        defaultBuilderConfig,
+        RunSpecTaskProcessor.empty,
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
+      )
+
+      taskGroupInfo.getTasks(0).getKillPolicy.getGracePeriod.getNanoseconds shouldBe (killDuration.toNanos)
+    }
+
+    "legacySharedCgroups is propagated to the executorInfo container properly" in new FixtureWithMatchedOffer(
+      legacySharedCgroups = Some(true)
+    ) {
+      val (executorInfo, taskGroup, _) = TaskGroupBuilder.build(
+        podSpec,
+        offer,
+        instanceId,
+        taskIds,
+        defaultBuilderConfig,
+        RunSpecTaskProcessor.empty,
+        resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+        None,
+        true
+      )
+
+      executorInfo.getContainer.getLinuxInfo.getShareCgroups shouldBe true
+    }
+
+    "resource limits are propagated for a container" in {
+      new FixtureWithMatchedOffer(
+        legacySharedCgroups = Some(false),
+        resourceLimits = Some(ResourceLimits(cpus = Some(Double.PositiveInfinity), mem = Some(1024.0)))
+      ) {
+        val (executorInfo, taskGroup, _) = TaskGroupBuilder.build(
+          podSpec,
+          offer,
+          instanceId,
+          taskIds,
+          defaultBuilderConfig,
+          RunSpecTaskProcessor.empty,
+          resourceMatch.asInstanceOf[ResourceMatchResponse.Match].resourceMatch,
+          None,
+          true
+        )
+
+        executorInfo.getContainer.getLinuxInfo.getShareCgroups shouldBe false
+        val limits = taskGroup.getTasks(0).getLimitsMap.asScala
+        limits.keySet shouldBe Set(Resource.CPUS, Resource.MEM)
+
+        limits(Resource.CPUS).getValue shouldBe Double.PositiveInfinity
+        limits(Resource.MEM).getValue shouldBe 1024.0
+      }
+    }
+  }
+
+  class FixtureWithMatchedOffer(
+      podLinuxInfo: Option[LinuxInfo] = None,
+      containerLinuxInfo: Option[LinuxInfo] = None,
+      resourceLimits: Option[ResourceLimits] = None,
+      legacySharedCgroups: Option[Boolean] = None
+  ) {
+    val offer = MarathonTestHelper.makeBasicOffer(cpus = 3.1, mem = 416.0, disk = 10.0, beginPort = 8000, endPort = 9000).build
+    val container = MesosContainer(name = "dummy", resources = Resources(), resourceLimits = resourceLimits, linuxInfo = containerLinuxInfo)
+
+    val podSpec = PodDefinition(
+      id = AbsolutePathId("/ipcConfig"),
+      legacySharedCgroups = legacySharedCgroups,
+      containers = Seq(container),
+      linuxInfo = podLinuxInfo,
+      role = "*"
+    )
+    val instanceId = Instance.Id.forRunSpec(podSpec.id)
+    val taskIds = podSpec.containers.map(c => Task.Id(instanceId, Some(c)))
+    val resourceMatch = RunSpecOfferMatcher.matchOffer(podSpec, offer, Nil, defaultBuilderConfig.acceptedResourceRoles, config, Nil)
   }
 }

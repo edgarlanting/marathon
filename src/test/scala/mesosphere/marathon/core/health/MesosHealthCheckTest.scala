@@ -1,27 +1,31 @@
 package mesosphere.marathon
 package core.health
 
+import java.time.Clock
+
 import com.wix.accord.validate
 import mesosphere.UnitTest
 import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon.api.JsonTestHelper
 import mesosphere.marathon.api.v2.ValidationHelper
-import mesosphere.marathon.core.pod.{ BridgeNetwork, ContainerNetwork, HostNetwork }
+import mesosphere.marathon.core.instance.Instance
+import mesosphere.marathon.core.pod.{BridgeNetwork, ContainerNetwork, HostNetwork}
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.state.NetworkInfo
-import mesosphere.marathon.raml.{ AppHealthCheck, Raml }
+import mesosphere.marathon.raml.{AppHealthCheck, Raml}
 import mesosphere.marathon.state.Container.PortMapping
 import mesosphere.marathon.state._
 import mesosphere.marathon.test.MarathonTestHelper
-import mesosphere.mesos.{ ResourceMatchResponse, RunSpecOfferMatcher, TaskBuilder }
-import org.apache.mesos.{ Protos => MesosProtos }
-import play.api.libs.json.{ Json, Writes }
+import mesosphere.mesos.{ResourceMatchResponse, RunSpecOfferMatcher, TaskBuilder}
+import org.apache.mesos.{Protos => MesosProtos}
+import play.api.libs.json.{Json, Writes}
 
 import scala.collection.immutable.Seq
 import scala.concurrent.duration._
 
 class MesosHealthCheckTest extends UnitTest {
 
+  implicit val clock = Clock.systemUTC()
   implicit val healthCheckWrites: Writes[HealthCheck] = Writes { check =>
     val appCheck: AppHealthCheck = Raml.toRaml(check)
     AppHealthCheck.playJsonFormat.writes(appCheck)
@@ -57,10 +61,12 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 3,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(MesosCommandHealthCheck(command = Command("echo healthy")))
+      JsonTestHelper
+        .assertThatJsonOf(MesosCommandHealthCheck(command = Command("echo healthy")): HealthCheck)
         .correspondsToJsonString(json)
     }
 
@@ -75,7 +81,8 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 3,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
       val expected = MesosCommandHealthCheck(command = Command("echo healthy"))
@@ -127,10 +134,12 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosHttpHealthCheckWithPortIndex)
+      JsonTestHelper
+        .assertThatJsonOf(mesosHttpHealthCheckWithPortIndex: HealthCheck)
         .correspondsToJsonString(portIndexJson)
 
       val portJson =
@@ -143,10 +152,12 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosHttpHealthCheckWithPort)
+      JsonTestHelper
+        .assertThatJsonOf(mesosHttpHealthCheckWithPort: HealthCheck)
         .correspondsToJsonString(portJson)
     }
 
@@ -161,7 +172,8 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
       assert(fromJson(portIndexJson) == mesosHttpHealthCheckWithPortIndex.copy(protocol = Protocol.MESOS_HTTPS))
@@ -176,7 +188,8 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
       assert(fromJson(portJson) == mesosHttpHealthCheckWithPort.copy(protocol = Protocol.MESOS_HTTPS))
@@ -193,10 +206,12 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosHttpHealthCheckWithPortIndex.copy(protocol = Protocol.MESOS_HTTPS))
+      JsonTestHelper
+        .assertThatJsonOf(mesosHttpHealthCheckWithPortIndex.copy(protocol = Protocol.MESOS_HTTPS): HealthCheck)
         .correspondsToJsonString(portIndexJson)
 
       val portJson =
@@ -209,18 +224,22 @@ class MesosHealthCheckTest extends UnitTest {
           "intervalSeconds": 60,
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosHttpHealthCheckWithPort.copy(protocol = Protocol.MESOS_HTTPS))
+      JsonTestHelper
+        .assertThatJsonOf(mesosHttpHealthCheckWithPort.copy(protocol = Protocol.MESOS_HTTPS): HealthCheck)
         .correspondsToJsonString(portJson)
     }
 
     "both port and portIndex are not accepted at the same time for a Mesos HTTP HealthCheck" in {
-      shouldBeInvalid(MesosHttpHealthCheck(
-        port = Some(1),
-        portIndex = Some(PortReference(0))
-      ))
+      shouldBeInvalid(
+        MesosHttpHealthCheck(
+          port = Some(1),
+          portIndex = Some(PortReference(0))
+        )
+      )
     }
 
     "port is accepted for a Mesos HTTP HealthCheck" in {
@@ -259,7 +278,8 @@ class MesosHealthCheckTest extends UnitTest {
         gracePeriod = 10.seconds,
         interval = 60.seconds,
         maxConsecutiveFailures = 0,
-        port = Some(12345)
+        port = Some(12345),
+        ipProtocol = IPv6
       )
 
       val proto = healthCheck.toProto
@@ -271,6 +291,7 @@ class MesosHealthCheckTest extends UnitTest {
       assert(60 == proto.getIntervalSeconds)
       assert(0 == proto.getMaxConsecutiveFailures)
       assert(12345 == proto.getPort)
+      assert(Protos.HealthCheckDefinition.IpProtocol.IPv6 == proto.getIpProtocol)
     }
 
     "ToProto Mesos TCP HealthCheck with port" in {
@@ -278,7 +299,8 @@ class MesosHealthCheckTest extends UnitTest {
         port = Some(80),
         gracePeriod = 7.seconds,
         interval = 35.seconds,
-        maxConsecutiveFailures = 10
+        maxConsecutiveFailures = 10,
+        ipProtocol = IPv6
       )
 
       val proto = healthCheck.toProto
@@ -288,6 +310,7 @@ class MesosHealthCheckTest extends UnitTest {
       assert(7 == proto.getGracePeriodSeconds)
       assert(35 == proto.getIntervalSeconds)
       assert(10 == proto.getMaxConsecutiveFailures)
+      assert(Protos.HealthCheckDefinition.IpProtocol.IPv6 == proto.getIpProtocol)
     }
 
     "FromProto Mesos HTTP HealthCheck with portIndex" in {
@@ -299,6 +322,7 @@ class MesosHealthCheckTest extends UnitTest {
         .setIntervalSeconds(60)
         .setTimeoutSeconds(10)
         .setMaxConsecutiveFailures(10)
+        .setIpProtocol(Protos.HealthCheckDefinition.IpProtocol.IPv6)
         .build
 
       val mergeResult = HealthCheck.fromProto(proto)
@@ -311,7 +335,8 @@ class MesosHealthCheckTest extends UnitTest {
         interval = 60.seconds,
         timeout = 10.seconds,
         maxConsecutiveFailures = 10,
-        port = None
+        port = None,
+        ipProtocol = IPv6
       )
 
       assert(mergeResult == expectedResult)
@@ -379,6 +404,7 @@ class MesosHealthCheckTest extends UnitTest {
         .setIntervalSeconds(60)
         .setTimeoutSeconds(10)
         .setMaxConsecutiveFailures(10)
+        .setIpProtocol(Protos.HealthCheckDefinition.IpProtocol.IPv6)
         .build
 
       val mergeResult = HealthCheck.fromProto(proto)
@@ -390,7 +416,8 @@ class MesosHealthCheckTest extends UnitTest {
         gracePeriod = 10.seconds,
         interval = 60.seconds,
         timeout = 10.seconds,
-        maxConsecutiveFailures = 10
+        maxConsecutiveFailures = 10,
+        ipProtocol = IPv6
       )
 
       assert(mergeResult == expectedResult)
@@ -417,7 +444,8 @@ class MesosHealthCheckTest extends UnitTest {
         portIndex = Some(PortReference(0)),
         gracePeriod = 10.seconds,
         interval = 60.seconds,
-        maxConsecutiveFailures = 0)
+        maxConsecutiveFailures = 0
+      )
 
       val app = MarathonTestHelper.makeBasicApp().withHealthCheck(healthCheck)
 
@@ -431,7 +459,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos HTTP HealthCheck toMesos with Docker HOST networking and portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withDockerNetworks(HostNetwork)
         .withHealthCheck(mesosHttpHealthCheckWithPortIndex)
 
@@ -445,7 +474,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos HTTP HealthCheck toMesos with Docker HOST networking and port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withDockerNetworks(HostNetwork)
         .withHealthCheck(mesosHttpHealthCheckWithPort)
 
@@ -459,13 +489,15 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos HTTP HealthCheck toMesos with Docker BRIDGE networking and portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(BridgeNetwork())
-        .withPortMappings(Seq(
-          PortMapping(containerPort = 80, hostPort = Some(0), servicePort = 0, protocol = "tcp",
-            name = Some("http"))
-        ))
+        .withPortMappings(
+          Seq(
+            PortMapping(containerPort = 80, hostPort = Some(0), servicePort = 0, protocol = "tcp", name = Some("http"))
+          )
+        )
         .withHealthCheck(mesosHttpHealthCheckWithPortIndex)
 
       val task: Option[(MesosProtos.TaskInfo, NetworkInfo)] = buildIfMatches(app)
@@ -478,13 +510,15 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos HTTP HealthCheck toMesos with Docker BRIDGE networking and port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(BridgeNetwork())
-        .withPortMappings(Seq(
-          PortMapping(containerPort = 8080, hostPort = Some(0), servicePort = 0, protocol = "tcp",
-            name = Some("http"))
-        ))
+        .withPortMappings(
+          Seq(
+            PortMapping(containerPort = 8080, hostPort = Some(0), servicePort = 0, protocol = "tcp", name = Some("http"))
+          )
+        )
         .withHealthCheck(mesosHttpHealthCheckWithPort)
 
       val task: Option[(MesosProtos.TaskInfo, NetworkInfo)] = buildIfMatches(app)
@@ -494,10 +528,29 @@ class MesosHealthCheckTest extends UnitTest {
       assertHttpHealthCheckProto(taskInfo, 80, "http")
     }
 
+    "Mesos HTTP HealthCheck toMesos with Docker BRIDGE networking and random container and host ports" in {
+      import MarathonTestHelper.Implicits._
+
+      val app = MarathonTestHelper
+        .makeBasicApp()
+        .withNoPortDefinitions()
+        .withDockerNetworks(ContainerNetwork("whatever"))
+        .withPortMappings(Seq(PortMapping(containerPort = 0, hostPort = Some(0))))
+        .withHealthCheck(mesosHttpHealthCheckWithPortIndex)
+
+      val task: Option[(MesosProtos.TaskInfo, NetworkInfo)] = buildIfMatches(app)
+      assert(task.isDefined)
+
+      val (taskInfo, networkInfo) = task.get
+      val healthCheckPort = networkInfo.hostPorts.head
+      assertHttpHealthCheckProto(taskInfo, port = healthCheckPort, "http")
+    }
+
     "Mesos HTTP HealthCheck toMesos with Docker USER networking and a port mapping NOT requesting a host port, with portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 80, hostPort = None)))
@@ -512,7 +565,8 @@ class MesosHealthCheckTest extends UnitTest {
 
     "Mesos HTTP HealthCheck toMesos with Docker USER networking and a port mapping requesting a host port, with portIndex" in {
       import MarathonTestHelper.Implicits._
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 80, hostPort = Some(0))))
@@ -528,7 +582,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos HTTP HealthCheck toMesos with Docker USER networking with port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 31337, hostPort = Some(0))))
@@ -541,12 +596,23 @@ class MesosHealthCheckTest extends UnitTest {
       assertHttpHealthCheckProto(taskInfo, 80, "http")
     }
 
+    "Mesos HTTP HealthCheck toMesos correctly serializes ip protocol" in {
+      import org.apache.mesos.Protos.NetworkInfo
+
+      val protoHealthCheck =
+        MesosHttpHealthCheck(path = Some("/health"), protocol = Protocol.MESOS_HTTP, port = Some(80), ipProtocol = IPv6).toMesos()
+
+      protoHealthCheck.get.getHttp.getProtocol should be(NetworkInfo.Protocol.IPv6)
+    }
+
     // Mesos TCP health check
     "both port and portIndex are not accepted at the same time for a Mesos TCP HealthCheck" in {
-      shouldBeInvalid(MesosTcpHealthCheck(
-        port = Some(1),
-        portIndex = Some(PortReference(0))
-      ))
+      shouldBeInvalid(
+        MesosTcpHealthCheck(
+          port = Some(1),
+          portIndex = Some(PortReference(0))
+        )
+      )
     }
 
     "port is accepted for a Mesos TCP HealthCheck" in {
@@ -612,7 +678,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker HOST networking and portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withDockerNetworks(HostNetwork)
         .withHealthCheck(mesosTcpHealthCheckWithPortIndex)
 
@@ -626,7 +693,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker HOST networking and port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withDockerNetworks(HostNetwork)
         .withHealthCheck(mesosTcpHealthCheckWithPort)
 
@@ -640,13 +708,15 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker BRIDGE networking and portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(BridgeNetwork())
-        .withPortMappings(Seq(
-          PortMapping(containerPort = 80, hostPort = Some(0), servicePort = 0, protocol = "tcp",
-            name = Some("http"))
-        ))
+        .withPortMappings(
+          Seq(
+            PortMapping(containerPort = 80, hostPort = Some(0), servicePort = 0, protocol = "tcp", name = Some("http"))
+          )
+        )
         .withHealthCheck(mesosTcpHealthCheckWithPortIndex)
 
       val task: Option[(MesosProtos.TaskInfo, NetworkInfo)] = buildIfMatches(app)
@@ -659,13 +729,15 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker BRIDGE networking and port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(BridgeNetwork())
-        .withPortMappings(Seq(
-          PortMapping(containerPort = 8080, hostPort = Some(0), servicePort = 0, protocol = "tcp",
-            name = Some("http"))
-        ))
+        .withPortMappings(
+          Seq(
+            PortMapping(containerPort = 8080, hostPort = Some(0), servicePort = 0, protocol = "tcp", name = Some("http"))
+          )
+        )
         .withHealthCheck(mesosTcpHealthCheckWithPort)
 
       val task: Option[(MesosProtos.TaskInfo, NetworkInfo)] = buildIfMatches(app)
@@ -678,7 +750,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker USER networking and a port mapping NOT requesting a host port, with portIndex" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 80, hostPort = None)))
@@ -693,7 +766,8 @@ class MesosHealthCheckTest extends UnitTest {
 
     "Mesos TCP HealthCheck toMesos with Docker USER networking and a port mapping requesting a host port, with portIndex" in {
       import MarathonTestHelper.Implicits._
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 80, hostPort = Some(0))))
@@ -709,7 +783,8 @@ class MesosHealthCheckTest extends UnitTest {
     "Mesos TCP HealthCheck toMesos with Docker USER networking with port" in {
       import MarathonTestHelper.Implicits._
 
-      val app = MarathonTestHelper.makeBasicApp()
+      val app = MarathonTestHelper
+        .makeBasicApp()
         .withNoPortDefinitions()
         .withDockerNetworks(ContainerNetwork("whatever"))
         .withPortMappings(Seq(PortMapping(containerPort = 31337, hostPort = Some(0))))
@@ -732,7 +807,8 @@ class MesosHealthCheckTest extends UnitTest {
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
           "portIndex": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
       assert(fromJson(portIndexJson) == mesosTcpHealthCheckWithPortIndex)
@@ -746,7 +822,8 @@ class MesosHealthCheckTest extends UnitTest {
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
           "port": 80,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
       assert(fromJson(portJson) == mesosTcpHealthCheckWithPort)
@@ -762,10 +839,12 @@ class MesosHealthCheckTest extends UnitTest {
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
           "portIndex": 0,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosTcpHealthCheckWithPortIndex)
+      JsonTestHelper
+        .assertThatJsonOf(mesosTcpHealthCheckWithPortIndex: HealthCheck)
         .correspondsToJsonString(portIndexJson)
 
       val portJson =
@@ -777,10 +856,12 @@ class MesosHealthCheckTest extends UnitTest {
           "timeoutSeconds": 20,
           "maxConsecutiveFailures": 0,
           "port": 80,
-          "delaySeconds": 15
+          "delaySeconds": 15,
+          "ipProtocol" : "IPv4"
         }
       """
-      JsonTestHelper.assertThatJsonOf(mesosTcpHealthCheckWithPort)
+      JsonTestHelper
+        .assertThatJsonOf(mesosTcpHealthCheckWithPort: HealthCheck)
         .correspondsToJsonString(portJson)
     }
   }
@@ -819,14 +900,18 @@ class MesosHealthCheckTest extends UnitTest {
   }
 
   def buildIfMatches(app: AppDefinition): Option[(MesosProtos.TaskInfo, NetworkInfo)] = {
-    val offer = MarathonTestHelper.makeBasicOfferWithRole(
-      cpus = 1.0, mem = 128.0, disk = 1000.0, beginPort = 31000, endPort = 32000, role = ResourceRole.Unreserved).build
+    val offer = MarathonTestHelper
+      .makeBasicOfferWithRole(cpus = 1.0, mem = 128.0, disk = 1000.0, beginPort = 31000, endPort = 32000, role = ResourceRole.Unreserved)
+      .build
 
     val config = MarathonTestHelper.defaultConfig()
-    val builder = new TaskBuilder(app, s => Task.Id(s.toString), config)
-    val resourceMatch = RunSpecOfferMatcher.matchOffer(app, offer, Seq.empty, config.defaultAcceptedResourceRolesSet)
+    val instanceId = Instance.Id.forRunSpec(app.id)
+    val taskId = Task.Id(instanceId)
+    val builder = new TaskBuilder(app, taskId, config)
+    val resourceMatch =
+      RunSpecOfferMatcher.matchOffer(app, offer, Seq.empty, config.defaultAcceptedResourceRolesSet(app.role), config, Seq.empty)
     resourceMatch match {
-      case matches: ResourceMatchResponse.Match => Some(builder.build(offer, matches.resourceMatch, None))
+      case matches: ResourceMatchResponse.Match => Some(builder.build(offer, matches.resourceMatch, None, enforceRole = true))
       case _ => None
     }
   }
@@ -837,14 +922,12 @@ class MesosHealthCheckTest extends UnitTest {
     portIndex = Some(PortReference(0)),
     gracePeriod = 10.seconds,
     interval = 60.seconds,
-    maxConsecutiveFailures = 0)
+    maxConsecutiveFailures = 0
+  )
   val mesosHttpHealthCheckWithPort = mesosHttpHealthCheckWithPortIndex.copy(portIndex = None, port = Some(80))
 
-  val mesosTcpHealthCheckWithPortIndex = MesosTcpHealthCheck(
-    portIndex = Some(PortReference(0)),
-    gracePeriod = 10.seconds,
-    interval = 60.seconds,
-    maxConsecutiveFailures = 0)
+  val mesosTcpHealthCheckWithPortIndex =
+    MesosTcpHealthCheck(portIndex = Some(PortReference(0)), gracePeriod = 10.seconds, interval = 60.seconds, maxConsecutiveFailures = 0)
   val mesosTcpHealthCheckWithPort = mesosTcpHealthCheckWithPortIndex.copy(portIndex = None, port = Some(80))
 
   private[this] def fromJson(json: String): HealthCheck = {
@@ -859,6 +942,6 @@ class MesosHealthCheckTest extends UnitTest {
 
   private[this] def shouldBeValid(hc: HealthCheck): Unit = {
     val result = validate(hc)
-    assert(result.isSuccess, s"violations: ${ValidationHelper.getAllRuleConstrains(result)}")
+    assert(result.isSuccess, s"violations: ${ValidationHelper.getAllRuleConstraints(result)}")
   }
 }

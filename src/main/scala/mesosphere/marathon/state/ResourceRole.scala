@@ -5,19 +5,31 @@ import com.wix.accord._
 import com.wix.accord.dsl._
 import mesosphere.marathon.api.v2.Validation._
 
+import scala.collection.SortedSet
+
 object ResourceRole {
-  val Unreserved = "*"
+  val Unreserved: String = "*"
+
+  def validForRole(validRole: Role): Validator[Set[String]] = validForRole(Some(validRole))
+
+  def validForRole(validRole: Option[Role]): Validator[Set[String]] = {
+    isTrue(s"""acceptedResourceRoles can only contain ${(SortedSet(Unreserved) ++ validRole).mkString("", " and ", "")}""") {
+      acceptedResourceRoles =>
+        val validRolesSet = SortedSet(Unreserved) ++ validRole
+        acceptedResourceRoles.isEmpty ||
+        ((acceptedResourceRoles.size <= 2) && acceptedResourceRoles.subsetOf(validRolesSet))
+    }
+  }
 
   // NOTE: The validators below use conjunction over `isTrue` in order to provide more user-friendly error messages.
   //       For example, `char is notEqualTo('\u0020')` would print something like "char is equal to  " as opposed to
   //       "A role name must not include a space (\x20) character".
 
-  @SuppressWarnings(Array("ComparisonToEmptySet"))
-  def validAcceptedResourceRoles(isResident: Boolean): Validator[Set[String]] =
+  def validAcceptedResourceRoles(runSpecType: String, isResident: Boolean): Validator[Set[String]] =
     validator[Set[String]] { acceptedResourceRoles =>
       acceptedResourceRoles is notEmpty
-      acceptedResourceRoles.each is valid(ResourceRole.validResourceRole)
-    } and isTrue("""A resident app must have `acceptedResourceRoles = ["*"]`.""") { acceptedResourceRoles =>
+      acceptedResourceRoles.each is ResourceRole.validResourceRole
+    } and isTrue(s"""A resident $runSpecType must have `acceptedResourceRoles = ["*"]`.""") { acceptedResourceRoles =>
       !isResident || acceptedResourceRoles == Set(ResourceRole.Unreserved)
     }
 
@@ -42,7 +54,7 @@ object ResourceRole {
       isTrue[String](message.format("\"..\"")) { role => role != ".."; } and
       isTrue[String]("A role name must not start with a '-'.") { role => !role.startsWith("-") } and
       validator[String] { role =>
-        role.each is valid(validResourceRoleChar)
+        role.each is validResourceRoleChar
       }
   }
 }

@@ -4,8 +4,8 @@ package core.deployment.impl
 import mesosphere.UnitTest
 import mesosphere.marathon.core.condition.Condition
 import mesosphere.marathon.core.deployment.ScalingProposition
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
-import mesosphere.marathon.state.{ KillSelection, PathId, Timestamp }
+import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder}
+import mesosphere.marathon.state.{AbsolutePathId, KillSelection, Timestamp}
 
 import scala.concurrent.duration._
 
@@ -16,15 +16,16 @@ class ScalingPropositionTest extends UnitTest {
       val f = new Fixture
 
       val proposition = ScalingProposition.propose(
-        runningTasks = f.noTasks,
-        toKill = Some(f.noTasks),
+        instances = f.noTasks,
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 0,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "lead to ScalingProposition(None, _)" in {
-        proposition.tasksToKill shouldBe empty
+        proposition.toDecommission shouldBe empty
       }
     }
 
@@ -33,15 +34,16 @@ class ScalingPropositionTest extends UnitTest {
 
       val instance = TestInstanceBuilder.newBuilder(f.appId).addTaskStaged().getInstance()
       val proposition = ScalingProposition.propose(
-        runningTasks = Seq(instance),
-        toKill = Some(Seq(instance)),
+        instances = Seq(instance),
+        toDecommission = Seq(instance),
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 0,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
-      "lead to ScalingProposition(Some(_), _)" in {
-        proposition.tasksToKill shouldBe Some(Seq(instance))
+      "lead to ScalingProposition list of instances to decommission" in {
+        proposition.toDecommission shouldBe Seq(instance)
       }
     }
 
@@ -49,15 +51,16 @@ class ScalingPropositionTest extends UnitTest {
       val f = new Fixture
 
       val proposition = ScalingProposition.propose(
-        runningTasks = f.noTasks,
-        toKill = Some(f.noTasks),
+        instances = f.noTasks,
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 0,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "lead to ScalingProposition(_, None)" in {
-        proposition.tasksToStart shouldBe empty
+        proposition.toStart shouldBe 0
       }
     }
 
@@ -65,15 +68,16 @@ class ScalingPropositionTest extends UnitTest {
       val f = new Fixture
 
       val proposition = ScalingProposition.propose(
-        runningTasks = f.noTasks,
-        toKill = Some(f.noTasks),
+        instances = f.noTasks,
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = -42,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "lead to ScalingProposition(_, None)" in {
-        proposition.tasksToStart shouldBe empty
+        proposition.toStart shouldBe 0
       }
     }
 
@@ -81,15 +85,16 @@ class ScalingPropositionTest extends UnitTest {
       val f = new Fixture
 
       val proposition = ScalingProposition.propose(
-        runningTasks = f.noTasks,
-        toKill = Some(f.noTasks),
+        instances = f.noTasks,
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 42,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
-      "lead to ScaleProposition(_ Some(_)" in {
-        proposition.tasksToStart shouldBe Some(42)
+      "lead to ScalePropositionof 42" in {
+        proposition.toStart shouldBe 42
       }
     }
 
@@ -97,17 +102,18 @@ class ScalingPropositionTest extends UnitTest {
       val f = new Fixture
 
       val proposition = ScalingProposition.propose(
-        runningTasks = Seq(f.createInstance(1), f.createInstance(2), f.createInstance(3)),
-        toKill = Some(f.noTasks),
+        instances = Seq(f.createInstance(1), f.createInstance(2), f.createInstance(3)),
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 5,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
       "determine tasks to kill" in {
-        proposition.tasksToKill shouldBe empty
+        proposition.toDecommission shouldBe empty
       }
       "determine tasks to start" in {
-        proposition.tasksToStart shouldBe Some(2)
+        proposition.toStart shouldBe 2
       }
     }
 
@@ -116,19 +122,20 @@ class ScalingPropositionTest extends UnitTest {
 
       val runningTasks: Seq[Instance] = Seq(f.createInstance(1), f.createInstance(2), f.createInstance(3))
       val proposition = ScalingProposition.propose(
-        runningTasks = runningTasks,
-        toKill = Some(f.noTasks),
+        instances = runningTasks,
+        toDecommission = f.noTasks,
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 0,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "determine tasks to kill" in {
-        proposition.tasksToKill shouldBe defined
-        proposition.tasksToKill.get shouldEqual runningTasks.reverse
+        proposition.toDecommission.nonEmpty shouldBe true
+        proposition.toDecommission shouldEqual runningTasks.reverse
       }
       "determine no tasks to start" in {
-        proposition.tasksToStart shouldBe empty
+        proposition.toStart shouldBe 0
       }
     }
 
@@ -141,19 +148,20 @@ class ScalingPropositionTest extends UnitTest {
       val alreadyKilled: Instance = f.createInstance(42)
 
       val proposition = ScalingProposition.propose(
-        runningTasks = Seq(task_1, task_2, task_3),
-        toKill = Some(Seq(task_2, task_3, alreadyKilled)),
+        instances = Seq(task_1, task_2, task_3),
+        toDecommission = Seq(task_2, task_3, alreadyKilled),
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 3,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "determine tasks to kill" in {
-        proposition.tasksToKill shouldBe defined
-        proposition.tasksToKill.get shouldEqual Seq(task_2, task_3)
+        proposition.toDecommission.nonEmpty shouldBe true
+        proposition.toDecommission shouldEqual Seq(task_2, task_3)
       }
       "determine tasks to start" in {
-        proposition.tasksToStart shouldBe Some(2)
+        proposition.toStart shouldBe 2
       }
     }
 
@@ -167,19 +175,20 @@ class ScalingPropositionTest extends UnitTest {
       val alreadyKilled = f.createInstance(42)
 
       val proposition = ScalingProposition.propose(
-        runningTasks = Seq(instance_1, instance_2, instance_3, instance_4),
-        toKill = Some(Seq(alreadyKilled)),
+        instances = Seq(instance_1, instance_2, instance_3, instance_4),
+        toDecommission = Seq(alreadyKilled),
         meetConstraints = f.noConstraintsToMeet,
         scaleTo = 3,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "determine tasks to kill" in {
-        proposition.tasksToKill shouldBe defined
-        proposition.tasksToKill.get shouldEqual Seq(instance_4)
+        proposition.toDecommission.nonEmpty shouldBe true
+        proposition.toDecommission shouldEqual Seq(instance_4)
       }
       "determine no tasks to start" in {
-        proposition.tasksToStart shouldBe empty
+        proposition.toStart shouldBe 0
       }
     }
 
@@ -192,19 +201,20 @@ class ScalingPropositionTest extends UnitTest {
       val instance_4 = f.createInstance(4)
 
       val proposition = ScalingProposition.propose(
-        runningTasks = Seq(instance_1, instance_2, instance_3, instance_4),
-        toKill = Some(Seq(instance_2)),
+        instances = Seq(instance_1, instance_2, instance_3, instance_4),
+        toDecommission = Seq(instance_2),
         meetConstraints = f.killToMeetConstraints(instance_3),
         scaleTo = 1,
-        killSelection = KillSelection.DefaultKillSelection
+        killSelection = KillSelection.DefaultKillSelection,
+        f.appId
       )
 
       "determine tasks to kill" in {
-        proposition.tasksToKill shouldBe defined
-        proposition.tasksToKill.get shouldEqual Seq(instance_2, instance_3, instance_4)
+        proposition.toDecommission.nonEmpty shouldBe true
+        proposition.toDecommission shouldEqual Seq(instance_2, instance_3, instance_4)
       }
       "determine no tasks to start" in {
-        proposition.tasksToStart shouldBe empty
+        proposition.toStart shouldBe 0
       }
     }
   }
@@ -250,7 +260,8 @@ class ScalingPropositionTest extends UnitTest {
         ScalingProposition.sortByConditionAndDate(KillSelection.DefaultKillSelection)(stagingInstance, stagingInstanceOlder) shouldBe true
       }
       "put younger starting before older starting" in {
-        ScalingProposition.sortByConditionAndDate(KillSelection.DefaultKillSelection)(startingInstanceOlder, startingInstance) shouldBe false
+        ScalingProposition
+          .sortByConditionAndDate(KillSelection.DefaultKillSelection)(startingInstanceOlder, startingInstance) shouldBe false
         ScalingProposition.sortByConditionAndDate(KillSelection.DefaultKillSelection)(startingInstance, startingInstanceOlder) shouldBe true
       }
       "put younger running before older running " in {
@@ -273,10 +284,13 @@ class ScalingPropositionTest extends UnitTest {
   }
 
   class Fixture {
-    val appId = PathId("/test")
+    val appId = AbsolutePathId("/test")
 
     def createInstance(index: Long) = {
-      val instance = TestInstanceBuilder.newBuilder(appId, version = Timestamp(index)).addTaskRunning(startedAt = Timestamp.now().+(index.hours)).getInstance()
+      val instance = TestInstanceBuilder
+        .newBuilder(appId, version = Timestamp(index))
+        .addTaskRunning(startedAt = Timestamp.now().+(index.hours))
+        .getInstance()
       val state = instance.state.copy(condition = Condition.Running)
       instance.copy(state = state)
     }
@@ -303,7 +317,7 @@ class ScalingPropositionTest extends UnitTest {
       Seq.empty[Instance]
 
     def killToMeetConstraints(tasks: Instance*): (Seq[Instance], Int) => Seq[Instance] =
-      (running: Seq[Instance], killCount: Int) => tasks.to[Seq]
+      (running: Seq[Instance], killCount: Int) => tasks.to(Seq)
 
     def noTasks = Seq.empty[Instance]
   }

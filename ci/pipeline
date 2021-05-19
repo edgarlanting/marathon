@@ -1,119 +1,414 @@
 #!/usr/bin/env amm
 
+// Get a logging backend into classpath.
+import $ivy.`org.slf4j:slf4j-simple:1.7.25`
+
 import ammonite.ops._
 import ammonite.ops.ImplicitWd._
 import java.util.concurrent.TimeUnit
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
 import scala.util.Try
+import java.time.format.DateTimeFormatter
+import java.time.LocalDateTime
 
 import $file.awsClient
+import $file.dataDogClient
+import $file.dcos
 import $file.fileUtil
-import $file.phabricatorClient
+import $file.githubClient
 import $file.provision
+import $file.releases
+import $file.upgrade
 import $file.utils
 
+import releases.ReleaseTarget
+import utils.{SemVer, SemVerRead}
+import utils.BranchType
+import utils.BranchType._
+
+
 val PACKAGE_DIR: Path = pwd / 'target / 'universal
+val PACKAGE_DOCS_DIR: Path = pwd / 'target / "universal-docs"
+
+final case class ScalafixException(message: String, cause: Throwable) extends Exception(message, cause)
+
 
 /**
- * Compile Marathon and run unit and integration tests followed by scapegoat.
+ * Compile Marathon and run unit, integration tests.
+ *
+ * @param logFileName Name of file which collects logs.
  */
 @main
-def compileAndTest(): Unit = utils.stage("Compile and Test") {
+def compileAndTest(logFileName: String): Unit = utils.stage("Compile and Test") {
 
-  def run(cmd: String *) = utils.runWithTimeout(1.hour)(cmd)
+  def run(cmd: String *) = utils.runWithTimeout(30.minutes, logFileName)(cmd)
+  def runIn(workDirectory: Path)(cmd: String *) = utils.runWithTimeout(5.minutes, logFileName, workDirectory)(cmd)
 
-  run("sbt", "clean", "test", "integration:test", "scapegoat")
+  run("sbt", "scalafmtCheck", "test:scalafmtCheck")
+
+  // Run type-generator compile before anything else.
+  runIn(pwd / "type-generator")("sbt", "compile")
+
+  run("sbt", "clean", "integration/clean", "compile", "test:compile", "integration/test:compile")
+
+  run("sbt", "test", "integration/test")
+
+  // Check leaked processes after integration tests
+  checkLeakedProcesses()
 
   // Compile other projects.
   run("sbt", "benchmark/compile")
   run("sbt", "mesos-simulation/compile")
   run("sbt", "plugin-interface/compile")
-}
 
-@main
-def zipSandboxLogs(): Unit = {
-  Try(%("tar", "-zcvf", "sandboxes.tar.gz", "sandboxes"))
-}
+  // Check system integration tests.
+  checkSystemIntegrationTests(logFileName)
 
-@main
-def uploadPackagesToS3(): Unit = utils.stage("Upload Packages") {
-  // || file.ext == "sha1" removed, separated out
-  (ls! PACKAGE_DIR |? (file => file.ext == "tgz" || file.ext == "txz" ))
-    .foreach(awsClient.archiveArtifact)
-}
-
-@main
-def createAndUploadPackages(): Unit = {
-  createPackages()
-  uploadPackagesToS3()
-  createLinuxPackages()
+  checkScalafix()
 }
 
 /**
- * Creates SHA-1 for all files in the package directory
+ * Checks for leaked processes and fails the build if any found.
  */
-def createPackageSha1s(): Unit = {
-  (ls! PACKAGE_DIR |? (file => file.ext == "tgz" || file.ext == "txz"))
-    .foreach(fileUtil.writeSha1ForFile)
+@main
+def checkLeakedProcesses(): Unit = {
+    val leaks = provision.leakedProcesses()
+    assert(leaks.isEmpty, s"Found leaked processes:\n${leaks.mkString("\n")}")
+}
+
+@main
+def checkScalafix(): Unit = {
+  try {
+    %('sbt, "compile:scalafix --check")
+  } catch {
+    case e: InteractiveShelloutException =>
+      throw ScalafixException("Scalafix failed. Run sbt compile:scalafix before checking in.", e)
+  }
+}
+
+@main
+def checkSystemIntegrationTests(logFileName: String): Unit = {
+  def run(cmd: String *) = utils.runWithTimeout(30.minutes, logFileName)(cmd)
+  run("flake8", "--count", "--max-line-length=120", "tests/system", "tests/integration/src/test/resources/python")
 }
 
 /**
- * Creates the zip and txz files of the Marathon runnable package with their
- * associated sha1
+ * Compresses sandboxes and logs.
+ *
+ * @param logFileName Name of log file.
+ * @param sandboxFileName The start of the file name for the sandboxes archive.
  */
 @main
-def createPackages(): Unit = utils.stage("Package") {
-  %('sbt, "universal:packageZipTarball", "universal:packageXzTarball")
-  createPackageSha1s()
+def zipLogs(logFileName: String = "ci.log", sandboxFileName: String = "sandboxes"): Unit = {
+  Try(%("tar", "--exclude=provisioner", "-zcf", s"$sandboxFileName.tar.gz", "sandboxes", "tests/integration/sandboxes"))
+  Try(%('sudo, "rm", "-rf", "sandboxes", "tests/integration/sandboxes"))
+  Try(%("tar", "-zcf", s"$logFileName.tar.gz", "--remove-files", logFileName))
 }
 
 /**
- * Create Docker, rpm and deb packages.
+ * Upload Marathon tgz tarballs, its sha1 checksum and docs to S3.
+ *
+ * @param version The version to upload.
+ * @param buildLocation subfolder location to upload tarball to. Example: "builds"
+ * @return Artifact description if it was uploaded.
  */
-@main
-def createLinuxPackages(): Unit = utils.stage("Package Docker Image, Debian and RedHat Packages") {
-  %('sbt, "docker:publishLocal", "packageDebian", "packageRpm")
+def uploadTarballPackagesToS3(version: SemVer, buildLocation: String): Option[awsClient.Artifact] = utils.stage("Upload Tarball Packages") {
+
+  // Upload docs
+  PACKAGE_DOCS_DIR.toIO.listFiles.filter(f => f.getName.endsWith(".tgz"))
+    .headOption.foreach(file => awsClient.upload(Path(file), awsClient.s3PathFor(buildLocation)))
+
+  // Upload Marathon
+  val maybeArtifact = PACKAGE_DIR.toIO.listFiles.filter(f => f.getName.endsWith(".tgz"))
+    .headOption.flatMap(file => awsClient.archiveArtifact(Path(file), awsClient.s3PathFor(buildLocation)))
+
+  // Upload dcos packages
+  PACKAGE_DIR.toIO.listFiles.filter(f => f.getName.endsWith(".dcos"))
+    .headOption.flatMap(file => awsClient.archiveArtifact(Path(file), awsClient.s3PathFor(buildLocation)))
+
+  maybeArtifact
 }
 
 /**
- * The pipeline target for Phabricator builds. It triggers the Jenkins target
- * and does some additional reporting to Phabricator.
+ * Creates the tarball files of the Marathon runnable package with their
+ * associated sha1 and the tarball of the documentation with the RAML definitions.
+ *
+ * @return version of build.
  */
-@main
-def phabricator(): Unit = {
-  val diffId: String = sys.env.getOrElse("DIFF_ID", throw new IllegalArgumentException("No DIFF_ID was defined."))
-  val phId: String = sys.env.getOrElse("PHID", throw new IllegalArgumentException("No PHID was defined."))
-  val revisionId: String = sys.env.getOrElse("REVISION_ID", throw new IllegalArgumentException("No REVISION_ID was defined."))
+def createTarballPackages(): SemVer = utils.stage("Package Tarballs") {
+  val result = %%('sbt, "universal:packageZipTarball", "universal-docs:packageZipTarball")
+
+  val version = %%("./version").out.string.trim
+  val gitSha = %%("./version", "commit").out.string.trim
+
+  println(s"Built tarballs for Marathon $version.")
+  SemVer(version, gitSha)
+}
+
+/**
+ * The pipeline target for GitHub pull request builds. It wraps other targets
+ * and does some additional reporting to GitHub.
+ */
+def asPullRequest(pullId: String)(run: => (SemVer, Option[awsClient.Artifact])): Unit = {
   val buildUrl: String = sys.env.getOrElse("BUILD_URL", throw new IllegalArgumentException("No BUILD_URL was defined."))
   val buildTag: String = sys.env.getOrElse("BUILD_TAG", "here")
 
   try {
-    phabricatorClient.reject(revisionId)
-    jenkins()
-    phabricatorClient.reportSuccess(diffId, phId, revisionId, buildUrl, buildTag)
+    githubClient.reject(pullId, buildUrl, buildTag)
+    val (_, maybeArtifact) = run
+    githubClient.reportSuccess(pullId, buildUrl, buildTag, maybeArtifact)
   } catch {
     case NonFatal(e) =>
-      phabricatorClient.reportFailure(diffId, phId, revisionId, buildUrl, buildTag, e.getMessage())
+      githubClient.reportFailure(pullId, buildUrl, buildTag, e.getMessage())
       throw e
   }
 }
 
 /**
- * The main pipeline target for builds on Jekins.
+ * Provision the build host.
+ */
+def provisionHost(): Unit = utils.stage("Provision") {
+  // Set port range for random port 0 allocation.
+  %('sudo, "ci/set_port_range.sh")
+
+  // First call to `docker --version` can take up to 30s. This sometimes leads to Mesos agent
+  // failing to start when checking for the docker version. So we do it here (successive calls will be faster).
+  %('sudo, "docker", "--version")
+
+  provision.killStaleTestProcesses()
+  provision.installMesos()
+  provision.installDcosCli()
+}
+
+//////////////////// MAIN TARGETS ////////////////////
+
+/**
+ * Run the main build pipeline.
+ *
+ * @return Version of Marathon build
+ */
+@main
+def build(runTests: Boolean = true, buildName: String = "run"): SemVer = {
+  if (runTests) {
+    val logFileName = s"$buildName.log"
+    val sandboxFile = s"$buildName.sandboxes"
+    try {
+      compileAndTest(logFileName)
+    } finally {
+      zipLogs(logFileName, sandboxFile)    // Try to archive ci and sandbox logs in any case
+    }
+  }
+
+  createTarballPackages()
+}
+
+/**
+  * Builds docker and linux native packages, then runs the tests in tests/package/test.sc
+  *
+  * @return Tag of Docker image
+  */
+@main
+def buildDockerAndLinuxPackages(): String = {
+  utils.stage("Package Docker Image, Debian and RedHat Packages") {
+    val toolPath = pwd/'tools/'packager
+    %('make, "clean")(toolPath)
+    %('make, "all", "-j")(toolPath)
+
+    %%("./version", "docker").out.string.trim
+  }
+}
+
+def testDockerAndLinuxPackages(): Unit = {
+  provision.maybeVersion match {
+    case Some(version) if version.contains(".pre.") =>
+      println("Skipping docker image testing as it does not work with pre-release Mesos versions")
+    case _ =>
+      utils.stage("Testing Docker Image, Debian and RedHat Packages") {
+        // create test-bed docker images and run the package tests
+        val testPath = pwd/'tests/'package
+        %('make, "clean")(testPath)
+        %('make, "test", "-j")(testPath)
+      }
+  }
+}
+
+/**
+  * Builds the Marathon storage tool, just to check that compatibility isn't broken
+  *
+  * @return Tag of Docker image
+  */
+@main
+def buildStorageTool(): String = {
+  utils.stage("Building the Marathon storage tool") {
+    val toolPath = pwd/'tools/'storage
+    %('make, "clean")(toolPath)
+    %('make, "compile")(toolPath)
+
+    %%("./version", "docker").out.string.trim
+  }
+}
+
+/**
+ * Update DC/OS repository and triggers build of update DC/OS image.
+ *
+ * @param version The newly built Marathon version.
+ * @param artifactUrl Url for the saved Marathon artifact.
+ * @param sha1 The sah1 checksum of the artifact.
+ */
+@main
+def updateDcosImage(version: SemVer, artifactUrl: String, sha1: String): Unit = utils.stage("Patch DC/OS Branch") {
+  upgrade.updateMarathon(artifactUrl, sha1, s"Update Marathon to $version")
+}
+
+/*******************************************************************************
+ *******************************  BUILD TARGETS  *******************************
+ ******************************************************************************/
+
+/**
+ * Build target for master and potential release branches.
+ */
+@main
+def buildMaster(): Unit = {
+  provisionHost()
+
+  val buildNumber = sys.env.get("BUILD_NUMBER").getOrElse("0")
+  val version = build(buildName = s"master-$buildNumber")
+  val dockerTag = buildDockerAndLinuxPackages()
+  testDockerAndLinuxPackages()
+  // dcos.buildRegistry(version) The packaging is broken on master https://jira.mesosphere.com/browse/MARATHON-8442.
+
+  // Verify that storage tool works
+  buildStorageTool()
+
+  // Uploads
+  val maybeArtifact = uploadTarballPackagesToS3(version, s"builds/$version")
+  maybeArtifact.foreach { artifact =>
+    updateDcosImage(version, artifact.downloadUrl, artifact.sha1)
+  }
+
+  // Publish Docker image
+  %('docker, "push", s"mesosphere/marathon:${dockerTag}")
+}
+
+/**
+ * Build target for release branches.
+ */
+@main
+def buildReleaseBranch(releaseVersion: String): Unit = {
+  provisionHost()
+
+  val buildNumber = sys.env.get("BUILD_NUMBER").getOrElse("0")
+  val version = build(buildName = s"releases-$releaseVersion-$buildNumber")
+  buildDockerAndLinuxPackages()
+  testDockerAndLinuxPackages()
+
+  // Uploads
+  val maybeArtifact = uploadTarballPackagesToS3(version, s"builds/$version")
+}
+
+/**
+ * Build target for pull request builds.
+ */
+@main
+def buildPr(pullId: String): Unit = asPullRequest(pullId) {
+  provisionHost()
+  val buildNumber = sys.env.get("BUILD_NUMBER").getOrElse("0")
+  val version = build(buildName = s"PR-$pullId-$buildNumber")
+
+  // Verify that storage tool works
+  buildStorageTool()
+
+  // Uploads
+  val artifact = uploadTarballPackagesToS3(version, s"builds/$version")
+  (version, artifact)
+}
+
+/**
+ * Build target for our build loop.
+ */
+@main
+def loop(): Unit = {
+  val start = System.currentTimeMillis
+  try {
+    provisionHost()
+    build(buildName = utils.loopBuildName())
+    dataDogClient.reportCount(s"marathon.build.${utils.loopName}.success", 1)
+  } catch {
+    case ex =>
+      dataDogClient.reportCount(s"marathon.build.${utils.loopName}.failure", 1)
+      throw ex
+  } finally {
+    dataDogClient.reportCount(s"marathon.build.${utils.loopName}.duration", ((System.currentTimeMillis - start) / 1000).toInt)
+  }
+}
+
+/**
+ * The main pipeline target for builds on Jenkins.
+ *
+ * @return Version and artifact description of Marathon build.
  */
 @main
 def jenkins(): Unit = {
-  utils.stage("Provision") {
-    provision.killStaleTestProcesses()
-    provision.installMesos()
+  val jobName = utils.getJobName()
+  BranchType(jobName) match {
+    case Some(Master) => buildMaster()
+    case Some(PR(pullId)) => buildPr(pullId)
+    case Some(Release(version)) => buildReleaseBranch(version)
+    case _ =>
+      println(s"Unknown job type $jobName - must be master build, release branch or PR build.")
+      sys.exit(1)
+  }
+}
+
+/**
+ * Executes the Community Release which includes:
+ *
+ *  1. tarball with version details
+ *  2. release of docker with that version
+ *  3. git tag of version (pushed to server)
+ *
+ * @param requestVersion The version attempting to be released v1.4.6
+ * @param gitSha The git commit sha.  This can be shorthand (ex. 0e1)
+ * @param latest Boolean to indicat if the Docker latest should be updated to this version.
+ * @return Version and artifact description of Marathon build.
+ */
+@main
+def release(args: String*): Unit = {
+
+  val config = releases.parser.parse(args, releases.Config()).getOrElse {
+    sys.exit(1)
+    ???
   }
 
-  try {
-    compileAndTest()
-  } finally {
-    zipSandboxLogs()    // Try to archive logs in any case
+  println(s"Releasing build ${config.version}...")
+  releases.verify(config.version)
+
+  %('git, "checkout", config.version.commit)
+
+  val targets = config.targets.toSet
+
+  build(config.runTests)
+  buildDockerAndLinuxPackages()
+  if (config.runTests)
+    testDockerAndLinuxPackages()
+
+  targets.foreach {
+    case ReleaseTarget.S3Package =>
+      releases.copyTarballBuildsToReleases(config.version)
+    case ReleaseTarget.LinuxPackages =>
+      releases.uploadLinuxPackagesToRepos(config.version.toTagString)
+    case ReleaseTarget.DockerTag =>
+      %('docker, "push", s"mesosphere/marathon:${config.version.toTagString}")
+    case ReleaseTarget.DockerLatest =>
+      %('docker, "tag", s"mesosphere/marathon:${config.version.toTagString}", "mesosphere/marathon:latest")
+      %('docker, "push", "mesosphere/marathon:latest")
+    case ReleaseTarget.JARArtifact =>
+      // publishing to the nexus repository.  This artifact is used by metronome.
+      %('sbt, "publish")
+    case ReleaseTarget.PluginInterface =>
+      %('sbt, "plugin-interface/publish")
   }
 
-  createAndUploadPackages()
+  // githubClient.tag(config.version.commit, config.version.toTagString)
 }

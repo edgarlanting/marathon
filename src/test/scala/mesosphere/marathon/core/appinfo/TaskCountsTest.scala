@@ -5,10 +5,10 @@ import mesosphere.UnitTest
 import mesosphere.marathon.core.condition.Condition
 import mesosphere.marathon.core.health.Health
 import mesosphere.marathon.core.instance.Instance.AgentInfo
-import mesosphere.marathon.core.instance.{ Instance, LegacyAppInstance, TestTaskBuilder }
+import mesosphere.marathon.core.instance.{Goal, Instance, TestTaskBuilder}
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.state.NetworkInfoPlaceholder
-import mesosphere.marathon.state.{ PathId, Timestamp, UnreachableStrategy }
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, Timestamp}
 
 import scala.collection.immutable.Seq
 
@@ -117,7 +117,10 @@ class TaskCountsTest extends UnitTest {
       val instance3 = TestTaskBuilder.Helper.runningTaskForApp(f.runSpecId).toInstance
       val instance4 = TestTaskBuilder.Helper.runningTaskForApp(f.runSpecId).toInstance
       val oneStagedTask = Seq(
-        instance1, instance2, instance3, instance4
+        instance1,
+        instance2,
+        instance3,
+        instance4
       )
       When("getting counts")
       val counts = TaskCounts(
@@ -128,12 +131,14 @@ class TaskCountsTest extends UnitTest {
         )
       )
       Then("all counts are 0 except staged")
-      counts should be(TaskCounts.zero.copy(
-        tasksStaged = 1,
-        tasksRunning = 3,
-        tasksHealthy = 1,
-        tasksUnhealthy = 1
-      ))
+      counts should be(
+        TaskCounts.zero.copy(
+          tasksStaged = 1,
+          tasksRunning = 3,
+          tasksHealthy = 1,
+          tasksUnhealthy = 1
+        )
+      )
     }
 
     "task count difference" in {
@@ -188,17 +193,29 @@ class TaskCountsTest extends UnitTest {
 
 object Fixture {
   implicit class TaskImplicits(val task: Task) extends AnyVal {
-    def toInstance: Instance = LegacyAppInstance(
-      task, AgentInfo(host = "host", agentId = Some("agent"), attributes = Nil),
-      unreachableStrategy = UnreachableStrategy.default(resident = task.reservationWithVolumes.nonEmpty)
-    )
+    def toInstance: Instance = {
+      val app = AppDefinition(task.taskId.runSpecId, role = "*")
+      val tasksMap = Map(task.taskId -> task)
+
+      new Instance(
+        instanceId = task.taskId.instanceId,
+        agentInfo = Some(AgentInfo(host = "host", agentId = Some("agent"), region = None, zone = None, attributes = Nil)),
+        state = Instance.InstanceState
+          .transitionTo(None, tasksMap, task.status.startedAt.getOrElse(task.status.stagedAt), app.unreachableStrategy, Goal.Running),
+        tasksMap = tasksMap,
+        app,
+        None,
+        "*"
+      )
+    }
   }
 }
 
 class Fixture {
-  val runSpecId = PathId("/test")
-  val taskId = Task.Id.forRunSpec(runSpecId)
-  val taskWithoutState = Task.LaunchedEphemeral(
+  val runSpecId = AbsolutePathId("/test")
+  val instanceId = Instance.Id.forRunSpec(runSpecId)
+  val taskId = Task.Id(instanceId)
+  val taskWithoutState = Task(
     taskId = taskId,
     runSpecVersion = Timestamp(0),
     status = Task.Status(

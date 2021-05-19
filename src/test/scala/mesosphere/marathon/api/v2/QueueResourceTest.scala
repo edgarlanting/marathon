@@ -3,33 +3,45 @@ package api.v2
 
 import mesosphere.UnitTest
 import mesosphere.marathon.api.TestAuthFixture
-import mesosphere.marathon.core.base.{ Clock, ConstantClock }
+import mesosphere.marathon.core.group.GroupManager
+import mesosphere.marathon.core.instance.Instance
 import mesosphere.marathon.core.launcher.OfferMatchResult
-import mesosphere.marathon.core.launchqueue.LaunchQueue
-import mesosphere.marathon.core.launchqueue.LaunchQueue.{ QueuedInstanceInfo, QueuedInstanceInfoWithStatistics }
-import mesosphere.marathon.raml.{ App, Raml }
+import mesosphere.marathon.core.launchqueue.{LaunchQueue, LaunchStats}
+import mesosphere.marathon.core.launchqueue.LaunchStats.QueuedInstanceInfoWithStatistics
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.raml.{App, Raml}
 import mesosphere.marathon.state.AppDefinition
 import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.stream.Implicits._
-import mesosphere.marathon.test.MarathonTestHelper
+import scala.jdk.CollectionConverters._
+import mesosphere.marathon.test.{JerseyTest, MarathonTestHelper, SettableClock}
 import mesosphere.mesos.NoOfferMatchReason
+import org.mockito.Matchers
 import play.api.libs.json._
 
 import scala.collection.immutable.Seq
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
-class QueueResourceTest extends UnitTest {
+class QueueResourceTest extends UnitTest with JerseyTest {
   case class Fixture(
-      clock: Clock = ConstantClock(),
+      clock: SettableClock = new SettableClock(),
       config: MarathonConf = mock[MarathonConf],
       auth: TestAuthFixture = new TestAuthFixture,
-      queue: LaunchQueue = mock[LaunchQueue]) {
+      queue: LaunchQueue = mock[LaunchQueue],
+      stats: LaunchStats = mock[LaunchStats],
+      instanceTracker: InstanceTracker = mock[InstanceTracker],
+      groupManager: GroupManager = mock[GroupManager]
+  ) {
     val queueResource: QueueResource = new QueueResource(
       clock,
       queue,
+      instanceTracker,
+      groupManager,
       auth.auth,
       auth.auth,
-      config
+      config,
+      stats
     )
   }
   implicit val appDefReader: Reads[AppDefinition] = Reads { js =>
@@ -42,24 +54,40 @@ class QueueResourceTest extends UnitTest {
   "QueueResource" should {
     "return well formatted JSON" in new Fixture {
       //given
-      val app = AppDefinition(id = "app".toRootPath, acceptedResourceRoles = Set("*"))
-      val noMatch = OfferMatchResult.NoMatch(app, MarathonTestHelper.makeBasicOffer().build(), Seq(NoOfferMatchReason.InsufficientCpus), clock.now())
-      queue.listWithStatistics returns Seq(
-        QueuedInstanceInfoWithStatistics(
-          app, inProgress = true, instancesLeftToLaunch = 23, finalInstanceCount = 23,
-          backOffUntil = clock.now() + 100.seconds, startedAt = clock.now(),
-          rejectSummaryLastOffers = Map(NoOfferMatchReason.InsufficientCpus -> 1),
-          rejectSummaryLaunchAttempt = Map(NoOfferMatchReason.InsufficientCpus -> 3), processedOffersCount = 3, unusedOffersCount = 1,
-          lastMatch = None, lastNoMatch = None, lastNoMatches = Seq(noMatch)
+      val app = AppDefinition(id = "app".toAbsolutePath, acceptedResourceRoles = Set("*"), role = "*")
+      val noMatch = OfferMatchResult.NoMatch(
+        app,
+        MarathonTestHelper.makeBasicOffer().build(),
+        Seq(NoOfferMatchReason.InsufficientCpus, NoOfferMatchReason.DeclinedScarceResources),
+        clock.now()
+      )
+      stats.getStatistics() returns Future.successful(
+        Seq(
+          QueuedInstanceInfoWithStatistics(
+            app,
+            "*",
+            inProgress = true,
+            instancesLeftToLaunch = 23,
+            finalInstanceCount = 23,
+            backOffUntil = Some(clock.now() + 100.seconds),
+            startedAt = clock.now(),
+            rejectSummaryLastOffers = Map(NoOfferMatchReason.InsufficientCpus -> 1, NoOfferMatchReason.DeclinedScarceResources -> 2),
+            rejectSummaryLaunchAttempt = Map(NoOfferMatchReason.InsufficientCpus -> 3, NoOfferMatchReason.DeclinedScarceResources -> 2),
+            processedOffersCount = 3,
+            unusedOffersCount = 1,
+            lastMatch = None,
+            lastNoMatch = None,
+            lastNoMatches = Seq(noMatch)
+          )
         )
       )
 
       //when
-      val response = queueResource.index(auth.request, Set("lastUnusedOffers").asJava)
+      val response = asyncRequest { r => queueResource.index(auth.request, Set("lastUnusedOffers").asJava, r) }
 
       //then
       response.getStatus should be(200)
-      val json = Json.parse(response.getEntity.asInstanceOf[String])
+      val json = Json.parse(response.getEntity.toString)
       val queuedApps = (json \ "queue").as[Seq[JsObject]]
       val jsonApp1 = queuedApps.find { apps => (apps \ "app" \ "id").as[String] == "/app" }.get
 
@@ -69,7 +97,8 @@ class QueueResourceTest extends UnitTest {
       (jsonApp1 \ "delay" \ "timeLeftSeconds").as[Int] should be(100) //the deadline holds the current time...
       (jsonApp1 \ "processedOffersSummary" \ "processedOffersCount").as[Int] should be(3)
       (jsonApp1 \ "processedOffersSummary" \ "unusedOffersCount").as[Int] should be(1)
-      (jsonApp1 \ "processedOffersSummary" \ "rejectSummaryLaunchAttempt" \ 3 \ "declined").as[Int] should be(3)
+      (jsonApp1 \ "processedOffersSummary" \ "rejectSummaryLaunchAttempt" \ 4 \ "declined").as[Int] should be(3)
+      (jsonApp1 \ "processedOffersSummary" \ "rejectSummaryLaunchAttempt" \ 9 \ "declined").as[Int] should be(2)
       val offer = (jsonApp1 \ "lastUnusedOffers").as[JsArray].value.head \ "offer"
       (offer \ "agentId").as[String] should be(noMatch.offer.getSlaveId.getValue)
       (offer \ "hostname").as[String] should be(noMatch.offer.getHostname)
@@ -82,21 +111,33 @@ class QueueResourceTest extends UnitTest {
 
     "the generated info from the queue contains 0 if there is no delay" in new Fixture {
       //given
-      val app = AppDefinition(id = "app".toRootPath)
-      queue.listWithStatistics returns Seq(
-        QueuedInstanceInfoWithStatistics(
-          app, inProgress = true, instancesLeftToLaunch = 23, finalInstanceCount = 23,
-          backOffUntil = clock.now() - 100.seconds, startedAt = clock.now(), rejectSummaryLastOffers = Map.empty,
-          rejectSummaryLaunchAttempt = Map.empty, processedOffersCount = 3, unusedOffersCount = 1, lastMatch = None,
-          lastNoMatch = None, lastNoMatches = Seq.empty
+      val app = AppDefinition(id = "app".toAbsolutePath, role = "*")
+      stats.getStatistics() returns Future.successful(
+        Seq(
+          QueuedInstanceInfoWithStatistics(
+            app,
+            "*",
+            inProgress = true,
+            instancesLeftToLaunch = 23,
+            finalInstanceCount = 23,
+            backOffUntil = Some(clock.now() - 100.seconds),
+            startedAt = clock.now(),
+            rejectSummaryLastOffers = Map.empty,
+            rejectSummaryLaunchAttempt = Map.empty,
+            processedOffersCount = 3,
+            unusedOffersCount = 1,
+            lastMatch = None,
+            lastNoMatch = None,
+            lastNoMatches = Seq.empty
+          )
         )
       )
       //when
-      val response = queueResource.index(auth.request, Set.empty[String].asJava)
+      val response = asyncRequest { r => queueResource.index(auth.request, Set.empty[String].asJava, r) }
 
       //then
       response.getStatus should be(200)
-      val json = Json.parse(response.getEntity.asInstanceOf[String])
+      val json = Json.parse(response.getEntity.toString)
       val queuedApps = (json \ "queue").as[Seq[JsObject]]
       val jsonApp1 = queuedApps.find { apps => (apps \ "app" \ "id").get == JsString("/app") }.get
 
@@ -108,10 +149,10 @@ class QueueResourceTest extends UnitTest {
 
     "unknown application backoff can not be removed from the launch queue" in new Fixture {
       //given
-      queue.list returns Seq.empty
+      instanceTracker.specInstances(any, Matchers.eq(false))(any) returns Future.successful(Seq.empty)
 
       //when
-      val response = queueResource.resetDelay("unknown", auth.request)
+      val response = asyncRequest { r => queueResource.resetDelay("unknown", auth.request, r) }
 
       //then
       response.getStatus should be(404)
@@ -119,16 +160,13 @@ class QueueResourceTest extends UnitTest {
 
     "application backoff can be removed from the launch queue" in new Fixture {
       //given
-      val app = AppDefinition(id = "app".toRootPath)
-      queue.list returns Seq(
-        QueuedInstanceInfo(
-          app, inProgress = true, instancesLeftToLaunch = 23, finalInstanceCount = 23,
-          backOffUntil = clock.now() + 100.seconds, startedAt = clock.now()
-        )
-      )
+      val app = AppDefinition(id = "app".toAbsolutePath, role = "*")
+      val instances = Seq.fill(23)(Instance.scheduled(app))
+      instanceTracker.specInstances(any, Matchers.eq(false))(any) returns Future.successful(instances)
+      groupManager.runSpec(app.id) returns Some(app)
 
       //when
-      val response = queueResource.resetDelay("app", auth.request)
+      val response = asyncRequest { r => queueResource.resetDelay("app", auth.request, r) }
 
       //then
       response.getStatus should be(204)
@@ -141,12 +179,12 @@ class QueueResourceTest extends UnitTest {
       val req = auth.request
 
       When("the index is fetched")
-      val index = queueResource.index(req, Set.empty[String].asJava)
+      val index = asyncRequest { r => queueResource.index(req, Set.empty[String].asJava, r) }
       Then("we receive a NotAuthenticated response")
       index.getStatus should be(auth.NotAuthenticatedStatus)
 
       When("one delay is reset")
-      val resetDelay = queueResource.resetDelay("appId", req)
+      val resetDelay = asyncRequest { r => queueResource.resetDelay("appId", req, r) }
       Then("we receive a NotAuthenticated response")
       resetDelay.getStatus should be(auth.NotAuthenticatedStatus)
     }
@@ -158,12 +196,12 @@ class QueueResourceTest extends UnitTest {
       val req = auth.request
 
       When("one delay is reset")
-      val appId = "appId".toRootPath
-      val taskCount = LaunchQueue.QueuedInstanceInfo(AppDefinition(appId), inProgress = false, 0, 0,
-        backOffUntil = clock.now() + 100.seconds, startedAt = clock.now())
-      queue.list returns Seq(taskCount)
+      val app = AppDefinition(id = "app".toAbsolutePath, role = "*")
+      val instances = Seq.fill(23)(Instance.scheduled(app))
+      instanceTracker.specInstances(any, Matchers.eq(false))(any) returns Future.successful(instances)
+      groupManager.runSpec(app.id) returns Some(app)
 
-      val resetDelay = queueResource.resetDelay("appId", req)
+      val resetDelay = asyncRequest { r => queueResource.resetDelay("app", req, r) }
       Then("we receive a not authorized response")
       resetDelay.getStatus should be(auth.UnauthorizedStatus)
     }
@@ -175,9 +213,9 @@ class QueueResourceTest extends UnitTest {
       val req = auth.request
 
       When("one delay is reset")
-      queue.list returns Seq.empty
+      instanceTracker.specInstances(any, Matchers.eq(false))(any) returns Future.successful(Seq.empty)
 
-      val resetDelay = queueResource.resetDelay("appId", req)
+      val resetDelay = asyncRequest { r => queueResource.resetDelay("appId", req, r) }
       Then("we receive a not authorized response")
       resetDelay.getStatus should be(404)
     }

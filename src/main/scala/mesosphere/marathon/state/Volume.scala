@@ -1,56 +1,93 @@
 package mesosphere.marathon
 package state
 
+import com.wix.accord.Descriptions.{Generic, Path => WixPath}
 import java.util.regex.Pattern
 
 import com.wix.accord._
 import com.wix.accord.dsl._
 import mesosphere.marathon.Protos.Constraint
+import mesosphere.marathon.api.serialization.{ContainerSerializer, ExternalVolumeInfoSerializer}
 import mesosphere.marathon.api.v2.Validation._
 import mesosphere.marathon.core.externalvolume.ExternalVolumes
-import mesosphere.marathon.plugin.AppSecretVolumeSpec
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.state.CSIExternalVolumeInfo.{AccessMode, AccessType}
+import mesosphere.marathon.state.DVDIExternalVolumeInfo.{csiValidExternalVolume, dvdiValidExternalVolumeInfo}
+
+import scala.jdk.CollectionConverters._
+import mesosphere.mesos.protos.Implicits._
 import org.apache.mesos.Protos.Resource.DiskInfo.Source
 import org.apache.mesos.Protos.Volume.Mode
-import org.apache.mesos.{ Protos => Mesos }
 
 import scala.util.Try
+import scala.util.matching.Regex
 
-sealed trait Volume extends plugin.AppVolumeSpec {
-  val containerPath: String
-  val mode: Mesos.Volume.Mode
-}
+trait Volume extends plugin.VolumeSpec
 
 object Volume {
-  def apply(proto: Protos.Volume): Volume = {
+  def apply(name: Option[String], proto: Protos.Volume): Volume = {
     if (proto.hasPersistent)
-      PersistentVolume(
-        containerPath = proto.getContainerPath,
-        persistent = PersistentVolumeInfo.fromProto(proto.getPersistent),
-        mode = proto.getMode
-      )
+      PersistentVolume(name = name, persistent = PersistentVolumeInfo.fromProto(proto.getPersistent))
     else if (proto.hasExternal)
-      ExternalVolume(
-        containerPath = proto.getContainerPath,
-        external = ExternalVolumeInfo.fromProto(proto.getExternal),
-        mode = proto.getMode
-      )
+      ExternalVolume(name = name, external = DVDIExternalVolumeInfo.fromProto(proto.getExternal))
+    else if (proto.hasCsiExternal)
+      ExternalVolume(name = name, external = CSIExternalVolumeInfo.fromProto(proto.getCsiExternal))
+    else if (proto.hasSecret)
+      SecretVolume(name = name, secret = proto.getSecret.getSecret)
     else
-      DockerVolume(
-        containerPath = proto.getContainerPath,
-        hostPath = proto.getHostPath,
-        mode = proto.getMode
-      )
+      HostVolume(name = name, hostPath = proto.getHostPath)
   }
 
-  def validVolume(enabledFeatures: Set[String]): Validator[Volume] = new Validator[Volume] {
-    override def apply(volume: Volume): Result = volume match {
-      case pv: PersistentVolume => validate(pv)(PersistentVolume.validPersistentVolume)
-      case dv: DockerVolume => validate(dv)(DockerVolume.validDockerVolume)
-      case ev: ExternalVolume => validate(ev)(ExternalVolume.validExternalVolume(enabledFeatures))
-      case _: SecretVolume => Success // validation is done in raml
+  def validVolume(volumeMount: VolumeMount, enabledFeatures: Set[String]): Validator[Volume] =
+    new Validator[Volume] {
+      override def apply(volume: Volume): Result =
+        volume match {
+          case pv: PersistentVolume => validate(pv)(PersistentVolume.validPersistentVolume)
+          case dv: HostVolume => validate(dv)(HostVolume.validHostVolume)
+          case ev: ExternalVolume => validate(ev)(ExternalVolume.validExternalVolume(volumeMount, enabledFeatures))
+          case _: SecretVolume => Success // validation is done in raml
+        }
     }
+}
+
+case class VolumeMount(volumeName: Option[String], mountPath: String, readOnly: Boolean = false) extends plugin.VolumeMountSpec
+
+object VolumeMount {
+  def apply(volumeName: Option[String], proto: Protos.Volume): VolumeMount = {
+    new VolumeMount(
+      volumeName = volumeName,
+      mountPath = proto.getContainerPath,
+      readOnly = proto.getMode == Mode.RO
+    )
   }
+
+  def apply(volumeName: Option[String], mountPath: String, readOnly: Boolean = false): VolumeMount = {
+    new VolumeMount(volumeName, mountPath, readOnly)
+  }
+
+  implicit val validVolumeMount: Validator[VolumeMount] = validator[VolumeMount] { mount =>
+    mount.volumeName is optional(notEmpty)
+    mount.mountPath is notEmpty
+  }
+
+  def readOnlyToProto(readOnly: Boolean): Mode = if (readOnly) Mode.RO else Mode.RW
+}
+
+case class VolumeWithMount[+A <: Volume](volume: A, mount: VolumeMount)
+
+object VolumeWithMount {
+  def apply(volumeName: Option[String], proto: Protos.Volume): VolumeWithMount[Volume] =
+    new VolumeWithMount(volume = Volume(volumeName, proto), mount = VolumeMount(volumeName, proto))
+
+  def validVolumeWithMount(enabledFeatures: Set[String]): Validator[VolumeWithMount[Volume]] =
+    validator[VolumeWithMount[Volume]] { vm =>
+      vm.volume is Volume.validVolume(vm.mount, enabledFeatures)
+      vm.mount is VolumeMount.validVolumeMount
+      vm.volume match {
+        case _: PersistentVolume =>
+          vm.mount is PersistentVolume.validPersistentVolumeMount
+        case _ =>
+      }
+    }
 }
 
 /**
@@ -58,61 +95,86 @@ object Volume {
   * Both paths can either refer to a directory or a file. Paths must be
   * absolute.
   */
-case class DockerVolume(
-  containerPath: String,
-  hostPath: String,
-  mode: Mesos.Volume.Mode)
-    extends Volume
+case class HostVolume(name: Option[String], hostPath: String) extends Volume
 
-object DockerVolume {
-  implicit val validDockerVolume = validator[DockerVolume] { vol =>
-    vol.containerPath is notEmpty
+object HostVolume {
+  implicit val validHostVolume: Validator[HostVolume] = validator[HostVolume] { vol =>
+    vol.name is optional(notEmpty)
     vol.hostPath is notEmpty
-    vol.mode is oneOf(Mode.RW, Mode.RO)
   }
 }
 
-case class DiskSource(diskType: DiskType, path: Option[String]) {
+case class DiskSource(diskType: DiskType, source: Option[Source]) {
+
+  lazy val id: Option[String] = source.filter(_.hasId).map(_.getId)
+  lazy val path: Option[String] =
+    if (diskType == DiskType.Mount)
+      source.filter(_.hasMount).map(_.getMount.getRoot)
+    else
+      source.filter(_.hasPath).map(_.getPath.getRoot)
+  lazy val metadata: Option[Map[String, String]] = source.map { s => s.getMetadata.fromProto }
+  lazy val profileName: Option[String] = source.filter(_.hasProfile).map(_.getProfile)
+
   if (diskType == DiskType.Root)
     require(path.isEmpty, "Path is not allowed for diskType")
   else
-    require(path.isDefined, "Path is required for non-root diskTypes")
+    require(path.nonEmpty, "Path is required for non-root diskTypes")
 
-  override def toString: String =
-    path match {
-      case Some(p) => s"$diskType:$p"
-      case None => diskType.toString
+  override def toString: String = {
+    val diskTypeStr = path match {
+      case Some(p) => Some(s"$diskType:$p")
+      case None => Some(diskType.toString)
     }
-
-  def asMesos: Option[Source] = (path, diskType) match {
-    case (None, DiskType.Root) =>
-      None
-    case (Some(p), DiskType.Path | DiskType.Mount) =>
-      val bld = Source.newBuilder
-      diskType.toMesos.foreach(bld.setType)
-      if (diskType == DiskType.Mount)
-        bld.setMount(Source.Mount.newBuilder().setRoot(p))
-      else
-        bld.setPath(Source.Path.newBuilder().setRoot(p))
-      Some(bld.build)
-    case (_, _) =>
-      throw new RuntimeException("invalid state")
+    val idStr = id.map(id => s"id:$id")
+    val profileNameStr = profileName.map(name => s"profile:$name")
+    val components = Seq(diskTypeStr, idStr, profileNameStr).flatten
+    components.mkString(";")
   }
+
+  def asMesos: Option[Source] = source
 }
 
 object DiskSource {
   val root = DiskSource(DiskType.Root, None)
-  @SuppressWarnings(Array("OptionGet"))
+
   def fromMesos(source: Option[Source]): DiskSource = {
     val diskType = DiskType.fromMesosType(source.map(_.getType))
-    diskType match {
+    DiskSource(diskType, source)
+  }
+
+  /**
+    * Create a Mesos protobuf for testing purposes; We should always prefer to send the same source protobuf that Mesos
+    * sends us in order to reply back with new fields Mesos introduces in the future
+    */
+  def fromParams(
+      diskType: DiskType,
+      path: Option[String],
+      id: Option[String],
+      metadata: Option[Map[String, String]],
+      profileName: Option[String],
+      vendor: Option[String]
+  ): DiskSource = {
+
+    val source = diskType match {
       case DiskType.Root =>
-        DiskSource(DiskType.Root, None)
-      case DiskType.Mount =>
-        DiskSource(DiskType.Mount, Some(source.get.getMount.getRoot))
-      case DiskType.Path =>
-        DiskSource(DiskType.Path, Some(source.get.getPath.getRoot))
+        None
+      case DiskType.Path | DiskType.Mount =>
+        val bld = Source.newBuilder
+        diskType.toMesos.foreach(bld.setType)
+        val p = path.getOrElse(throw new IllegalArgumentException("Path is required for Mount or Path volumes"))
+        if (diskType == DiskType.Mount)
+          bld.setMount(Source.Mount.newBuilder().setRoot(p))
+        else
+          bld.setPath(Source.Path.newBuilder().setRoot(p))
+        id.foreach(bld.setId)
+        metadata.foreach(metadata => bld.setMetadata(metadata.toMesosLabels))
+        profileName.foreach(bld.setProfile)
+        vendor.foreach(bld.setVendor)
+        Some(bld.build)
+      case _ =>
+        throw new RuntimeException("invalid state")
     }
+    DiskSource(diskType, source)
   }
 }
 
@@ -136,7 +198,7 @@ object DiskType {
     def toMesos: Option[Source.Type] = Some(Source.Type.MOUNT)
   }
 
-  val all = Root :: Path :: Mount :: Nil
+  val all: List[DiskType] = Root :: Path :: Mount :: Nil
 
   def fromMesosType(o: Option[Source.Type]): DiskType =
     o match {
@@ -148,10 +210,12 @@ object DiskType {
 }
 
 case class PersistentVolumeInfo(
-  size: Long,
-  maxSize: Option[Long] = None,
-  `type`: DiskType = DiskType.Root,
-  constraints: Set[Constraint] = Set.empty)
+    size: Long,
+    maxSize: Option[Long] = None,
+    `type`: DiskType = DiskType.Root,
+    profileName: Option[String] = None,
+    constraints: Set[Constraint] = Set.empty
+)
 
 object PersistentVolumeInfo {
   def fromProto(pvi: Protos.Volume.PersistentVolumeInfo): PersistentVolumeInfo =
@@ -159,16 +223,17 @@ object PersistentVolumeInfo {
       size = pvi.getSize,
       maxSize = if (pvi.hasMaxSize) Some(pvi.getMaxSize) else None,
       `type` = DiskType.fromMesosType(if (pvi.hasType) Some(pvi.getType) else None),
-      constraints = pvi.getConstraintsList.toSet
+      profileName = if (pvi.hasProfileName) Some(pvi.getProfileName) else None,
+      constraints = pvi.getConstraintsList.asScala.toSet
     )
 
   private val complyWithVolumeConstraintRules: Validator[Constraint] = new Validator[Constraint] {
     import Constraint.Operator._
     override def apply(c: Constraint): Result = {
       if (!c.hasField || !c.hasOperator) {
-        Failure(Set(RuleViolation(c, "Missing field and operator", None)))
+        Failure(Set(RuleViolation(c, "Missing field and operator")))
       } else if (c.getField != "path") {
-        Failure(Set(RuleViolation(c, "Unsupported field", Some(c.getField))))
+        Failure(Set(RuleViolation(c, "Unsupported field", WixPath(Generic(c.getField)))))
       } else {
         c.getOperator match {
           case LIKE | UNLIKE =>
@@ -177,30 +242,25 @@ object PersistentVolumeInfo {
                 case util.Success(_) =>
                   Success
                 case util.Failure(e) =>
-                  Failure(Set(RuleViolation(
-                    c,
-                    "Invalid regular expression",
-                    Some(s"${c.getValue}\n${e.getMessage}"))))
+                  Failure(Set(RuleViolation(c, "Invalid regular expression", WixPath(Generic("value")))))
               }
             } else {
-              Failure(Set(RuleViolation(c, "A regular expression value must be provided", None)))
+              Failure(Set(RuleViolation(c, "A regular expression value must be provided", WixPath(Generic("value")))))
             }
           case _ =>
-            Failure(Set(
-              RuleViolation(c, "Operator must be one of LIKE, UNLIKE", None)))
+            Failure(Set(RuleViolation(c, "Operator must be one of LIKE, UNLIKE", WixPath(Generic("operator")))))
         }
       }
     }
   }
 
   implicit val validPersistentVolumeInfo: Validator[PersistentVolumeInfo] = {
-    val notHaveConstraintsOnRoot = isTrue[PersistentVolumeInfo](
-      "Constraints on root volumes are not supported") { info =>
-        if (info.`type` == DiskType.Root)
-          info.constraints.isEmpty
-        else
-          true
-      }
+    val notHaveConstraintsOnRoot = isTrue[PersistentVolumeInfo]("Constraints on root volumes are not supported") { info =>
+      if (info.`type` == DiskType.Root)
+        info.constraints.isEmpty
+      else
+        true
+    }
 
     val meetMaxSizeConstraint = isTrue[PersistentVolumeInfo]("Only mount volumes can have maxSize") { info =>
       if (info.`type` == DiskType.Mount)
@@ -210,7 +270,11 @@ object PersistentVolumeInfo {
     }
 
     val haveProperlyOrderedMaxSize = isTrue[PersistentVolumeInfo]("Max size must be larger than size") { info =>
-      info.maxSize.map(_ > info.size).getOrElse(true)
+      info.maxSize.forall(_ > info.size)
+    }
+
+    val haveProperProfileName = validator[String] { profileName =>
+      profileName is notEmpty
     }
 
     validator[PersistentVolumeInfo] { info =>
@@ -219,36 +283,128 @@ object PersistentVolumeInfo {
       info should meetMaxSizeConstraint
       info should notHaveConstraintsOnRoot
       info should haveProperlyOrderedMaxSize
+      info.profileName should optional(haveProperProfileName)
     }
   }
 }
 
-case class PersistentVolume(
-  val containerPath: String,
-  val persistent: PersistentVolumeInfo,
-  val mode: Mesos.Volume.Mode) extends Volume
+case class PersistentVolume(name: Option[String], persistent: PersistentVolumeInfo) extends Volume
 
 object PersistentVolume {
   import PathPatterns._
-  import org.apache.mesos.Protos.Volume.Mode
 
-  implicit val validPersistentVolume = validator[PersistentVolume] { vol =>
-    vol.containerPath is notEmpty
-    vol.containerPath is notOneOf(DotPaths: _*)
-    vol.containerPath should matchRegexWithFailureMessage(NoSlashesPattern, "value must not contain \"/\"")
+  implicit val validPersistentVolume: Validator[PersistentVolume] = validator[PersistentVolume] { vol =>
+    vol.name is optional(notEmpty)
     vol.persistent is valid
-    vol.mode is equalTo(Mode.RW)
+  }
+
+  implicit val validPersistentVolumeMount: Validator[VolumeMount] = validator[VolumeMount] { mount =>
+    mount.mountPath is notOneOf(DotPaths: _*)
+    mount.mountPath should matchRegexWithFailureMessage(NoSlashesPattern, "value must not contain \"/\"")
+    mount.readOnly is false
   }
 }
 
 object PathPatterns {
-  lazy val NoSlashesPattern = """^[^/]*$""".r
-  lazy val AbsolutePathPattern = """^/[^/].*$""".r
-  lazy val DotPaths = Seq[String](".", "..")
+  lazy val NoSlashesPattern: Regex = """^[^/]*$""".r
+  lazy val AbsolutePathPattern: Regex = """^/[^/].*$""".r
+  lazy val DotPaths: Seq[String] = Seq(".", "..")
+}
+
+sealed trait ExternalVolumeInfo {
+  def name: String
+  def provider: String
+}
+
+object ExternalVolumeInfo {
+  implicit val validExternalVolumeInfo: Validator[ExternalVolumeInfo] = { volume =>
+    volume match {
+      case dvdi: DVDIExternalVolumeInfo =>
+        dvdiValidExternalVolumeInfo(dvdi)
+      case csi: CSIExternalVolumeInfo =>
+        csiValidExternalVolume(csi)
+    }
+  }
+}
+
+case class CSIExternalVolumeInfo(
+    name: String,
+    pluginName: String,
+    accessType: AccessType,
+    accessMode: AccessMode,
+    nodeStageSecret: Map[String, String],
+    nodePublishSecret: Map[String, String],
+    volumeContext: Map[String, String]
+) extends ExternalVolumeInfo {
+  val provider = "csi"
+}
+
+object CSIExternalVolumeInfo {
+  sealed trait AccessType
+
+  case object BlockAccessType extends AccessType
+  case class MountAccessType(fsType: String, mountFlags: Seq[String]) extends AccessType
+
+  sealed trait AccessMode {
+    val name: String
+    val shareable: Boolean
+    val readOnly: Boolean
+  }
+  object AccessMode {
+    case object UNKNOWN extends AccessMode {
+      override val name = "UNKNOWN"
+      override val shareable = false
+      override val readOnly = true
+    }
+    case object SINGLE_NODE_WRITER extends AccessMode {
+      override val name = "SINGLE_NODE_WRITER"
+      override val shareable = false
+      override val readOnly = false
+    }
+    case object SINGLE_NODE_READER_ONLY extends AccessMode {
+      override val name = "SINGLE_NODE_READER_ONLY"
+      override val shareable = false
+      override val readOnly = true
+    }
+
+    case object MULTI_NODE_READER_ONLY extends AccessMode {
+      override val name = "MULTI_NODE_READER_ONLY"
+      override val shareable = true
+      override val readOnly = true
+    }
+
+    case object MULTI_NODE_SINGLE_WRITER extends AccessMode {
+      override val name = "MULTI_NODE_SINGLE_WRITER"
+      override val shareable = true
+      override val readOnly = false
+    }
+
+    case object MULTI_NODE_MULTI_WRITER extends AccessMode {
+      override val name = "MULTI_NODE_MULTI_WRITER"
+      override val shareable = true
+      override val readOnly = false
+    }
+
+    val all =
+      Seq(UNKNOWN, SINGLE_NODE_WRITER, SINGLE_NODE_READER_ONLY, MULTI_NODE_READER_ONLY, MULTI_NODE_SINGLE_WRITER, MULTI_NODE_MULTI_WRITER)
+
+    def fromString(mode: String): Option[AccessMode] = all.find(_.name == mode)
+  }
+
+  def fromProto(evi: Protos.Volume.CSIVolumeInfo): ExternalVolumeInfo =
+    CSIExternalVolumeInfo(
+      name = evi.getName,
+      pluginName = evi.getPluginName,
+      accessType = ExternalVolumeInfoSerializer.fromProtoVolumeCapabilityToAccessType(evi.getVolumeCapability),
+      accessMode = ExternalVolumeInfoSerializer.csiProtoToAccessMode(evi.getVolumeCapability.getAccessMode),
+      nodeStageSecret = evi.getNodeStageSecretsMap.asScala.toMap,
+      nodePublishSecret = evi.getNodePublishSecretsMap.asScala.toMap,
+      volumeContext = evi.getVolumeContextMap.asScala.toMap
+    )
 }
 
 /**
-  * ExternalVolumeInfo captures the specification for a volume that survives task restarts.
+  * DVDIExternalVolumeInfo captures the specification for a volume that survives task restarts.
   *
   * `name` is the *unique name* of the storage volume. names should be treated as case insensitive labels
   * derived from an alpha-numeric character range [a-z0-9]. while there is no prescribed length limit for
@@ -259,6 +415,8 @@ object PathPatterns {
   *  <li> A volume name MUST be unique within the scope of a volume provider.
   *  <li> A fully-qualified volume name is expected to be unique across the cluster and may formed, for example,
   *       by concatenating the volume provider name with the volume name. E.g “dvdi.volume123”
+  *  <li> As there are multiple providers that allow shared access to the same volume, there is
+  *       a parameter `shared` that excludes that volume from the uniqueness check.
   *
   * `provider` is optional; if specified it indicates which storage provider will implement volume
   * lifecycle management operations for the external volume. if unspecified, “agent” is assumed.
@@ -276,12 +434,15 @@ object PathPatterns {
   * @param name identifies the volume within the context of the storage provider.
   * @param provider identifies the storage provider responsible for volume lifecycle operations.
   * @param options contains storage provider-specific configuration configuration
+  * @param shared if true, this volume is excluded from the uniqueness check
   */
-case class ExternalVolumeInfo(
-  size: Option[Long] = None,
-  name: String,
-  provider: String,
-  options: Map[String, String] = Map.empty[String, String])
+case class DVDIExternalVolumeInfo(
+    size: Option[Long] = None,
+    name: String,
+    provider: String,
+    options: Map[String, String] = Map.empty[String, String],
+    shared: Boolean = false
+) extends ExternalVolumeInfo
 
 object OptionLabelPatterns {
   val OptionNamespaceSeparator = "/"
@@ -291,44 +452,51 @@ object OptionLabelPatterns {
   val OptionKeyRegex = "^" + LabelPattern + OptionNamespaceSeparator + OptionNamePattern + "$"
 }
 
-object ExternalVolumeInfo {
+object DVDIExternalVolumeInfo {
   import OptionLabelPatterns._
 
-  implicit val validOptions = validator[Map[String, String]] {
-    option => option.keys.each should matchRegex(OptionKeyRegex)
+  implicit val validOptions = validator[Map[String, String]] { option =>
+    option.keys.each should matchRegex(OptionKeyRegex)
   }
 
-  implicit val validExternalVolumeInfo = validator[ExternalVolumeInfo] { info =>
+  val csiValidExternalVolume = validator[CSIExternalVolumeInfo] { info =>
+    ???
+  }
+
+  val dvdiValidExternalVolumeInfo = validator[DVDIExternalVolumeInfo] { info =>
     info.size.each should be > 0L
-    info.name should matchRegex(LabelRegex)
     info.provider should matchRegex(LabelRegex)
-    info.options is valid(validOptions)
+    info.options is validOptions
   }
 
   def fromProto(evi: Protos.Volume.ExternalVolumeInfo): ExternalVolumeInfo =
-    ExternalVolumeInfo(
-      if (evi.hasSize) Some(evi.getSize) else None,
-      evi.getName,
-      evi.getProvider,
-      evi.getOptionsList.map { p => p.getKey -> p.getValue }(collection.breakOut)
+    DVDIExternalVolumeInfo(
+      size = if (evi.hasSize) Some(evi.getSize) else None,
+      name = evi.getName,
+      provider = evi.getProvider,
+      shared = if (evi.hasShared) evi.getShared else false,
+      options = evi.getOptionsList.asScala.iterator.map { p => p.getKey -> p.getValue }.toMap
     )
 }
 
-case class ExternalVolume(
-  containerPath: String,
-  external: ExternalVolumeInfo,
-  mode: Mesos.Volume.Mode) extends Volume
+case class ExternalVolume(name: Option[String], external: ExternalVolumeInfo) extends Volume
 
 object ExternalVolume {
-  def validExternalVolume(enabledFeatures: Set[String]): Validator[ExternalVolume] = validator[ExternalVolume] { ev =>
-    ev is featureEnabled(enabledFeatures, Features.EXTERNAL_VOLUMES)
-    ev.containerPath is notEmpty
-    ev.external is valid(ExternalVolumeInfo.validExternalVolumeInfo)
-  } and ExternalVolumes.validExternalVolume
+  def validExternalVolume(volumeMount: VolumeMount, enabledFeatures: Set[String]): Validator[ExternalVolume] =
+    validator[ExternalVolume] { ev =>
+      ev is featureEnabled(enabledFeatures, Features.EXTERNAL_VOLUMES)
+      ev.name is optional(notEmpty)
+      ev.external is ExternalVolumeInfo.validExternalVolumeInfo
+    } and ExternalVolumes.validExternalVolume(volumeMount)
 }
 
-case class SecretVolume(
-    containerPath: String,
-    secret: String) extends Volume with AppSecretVolumeSpec {
-  override val mode: Mesos.Volume.Mode = Mesos.Volume.Mode.RO
-}
+/**
+  * A volume referring to an existing secret.
+  */
+case class SecretVolume(name: Option[String], secret: String) extends Volume with plugin.SecretVolumeSpec
+
+/**
+  * Ephemeral volumes share the lifetime of the pod instance they're used within and serve to
+  * provide temporary "scratch" space that sub-containers may use to share files, sockets, etc.
+  */
+case class EphemeralVolume(name: Option[String]) extends Volume

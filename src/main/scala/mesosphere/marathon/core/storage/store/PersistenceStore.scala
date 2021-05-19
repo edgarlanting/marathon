@@ -5,10 +5,11 @@ import java.time.OffsetDateTime
 
 import akka.http.scaladsl.marshalling.Marshaller
 import akka.http.scaladsl.unmarshalling.Unmarshaller
-import akka.stream.scaladsl.{ Sink, Source }
-import akka.{ Done, NotUsed }
+import akka.stream.scaladsl.{Sink, Source}
+import akka.{Done, NotUsed}
 import mesosphere.marathon.Protos.StorageVersion
 import mesosphere.marathon.core.storage.backup.BackupItem
+import mesosphere.marathon.util.OpenableOnce
 
 import scala.concurrent.Future
 
@@ -83,7 +84,8 @@ import scala.concurrent.Future
   * @tparam Category The persistence store's category type.
   * @tparam Serialized The serialized format for the persistence store.
   */
-trait PersistenceStore[K, Category, Serialized] {
+trait PersistenceStore[K, Category, Serialized] extends OpenableOnce {
+
   /**
     * Get a list of all of the Ids of the given Value Types
     */
@@ -107,9 +109,7 @@ trait PersistenceStore[K, Category, Serialized] {
     *         If there is an underlying storage problem, the future should fail with
     *         [[mesosphere.marathon.StoreCommandFailedException]]
     */
-  def get[Id, V](id: Id)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]]
+  def get[Id, V](id: Id)(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Future[Option[V]]
 
   /**
     * Get the version of the data at the given version, if any, for the given primary id and value type.
@@ -118,11 +118,10 @@ trait PersistenceStore[K, Category, Serialized] {
     *         If there is an underlying storage problem, the future should fail with
     *         [[mesosphere.marathon.StoreCommandFailedException]]
     */
-  def get[Id, V](
-    id: Id,
-    version: OffsetDateTime)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]]
+  def get[Id, V](id: Id, version: OffsetDateTime)(implicit
+      ir: IdResolver[Id, V, Category, K],
+      um: Unmarshaller[Serialized, V]
+  ): Future[Option[V]]
 
   /**
     * Get the version of the data at the given id and version, if any, for the value type.
@@ -131,9 +130,9 @@ trait PersistenceStore[K, Category, Serialized] {
     *         If there is an underlying storage problem, the future should fail with
     *         [[mesosphere.marathon.StoreCommandFailedException]]
     */
-  def getVersions[Id, V](list: Seq[(Id, OffsetDateTime)])(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Source[V, NotUsed]
+  def getVersions[Id, V](
+      list: Seq[(Id, OffsetDateTime)]
+  )(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Source[V, NotUsed]
 
   /**
     * Store the new value at the given Id. If the value already exists, the existing value will be versioned
@@ -142,9 +141,7 @@ trait PersistenceStore[K, Category, Serialized] {
     *         [[mesosphere.marathon.StoreCommandFailedException]] if either a value already exists at the given Id, or
     *         if there is an underlying storage problem
     */
-  def store[Id, V](id: Id, v: V)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done]
+  def store[Id, V](id: Id, v: V)(implicit ir: IdResolver[Id, V, Category, K], m: Marshaller[V, Serialized]): Future[Done]
 
   /**
     * Store a new value at the given version. If the maximum number of versions has been reached,
@@ -158,10 +155,10 @@ trait PersistenceStore[K, Category, Serialized] {
     *         [[mesosphere.marathon.StoreCommandFailedException]] if either a value already exists at the given Id, or
     *         if there is an underlying storage problem
     */
-  def store[Id, V](id: Id, v: V, version: OffsetDateTime)(
-    implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done]
+  def store[Id, V](id: Id, v: V, version: OffsetDateTime)(implicit
+      ir: IdResolver[Id, V, Category, K],
+      m: Marshaller[V, Serialized]
+  ): Future[Done]
 
   /**
     * Delete the value at the given id. Does not remove historical versions.
@@ -199,4 +196,20 @@ trait PersistenceStore[K, Category, Serialized] {
     * @return a sink that can be used to restore the complete state.
     */
   def restore(): Sink[BackupItem, Future[Done]]
+
+  /**
+    * Make sure that store read operations return up-to-date values.
+    */
+  def sync(): Future[Done]
+
+  /**
+    * Mark migration as started. It is supposed to be used to ensure that
+    * no other Marathon instance performs migration at the same time.
+    */
+  def startMigration(): Future[Done]
+
+  /**
+    * Mark migration as completed. It does the opposite of what [[startMigration]] does.
+    */
+  def endMigration(): Future[Done]
 }

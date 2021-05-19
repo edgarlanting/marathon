@@ -4,13 +4,15 @@ package core.storage.store.impl.zk
 import java.util.UUID
 
 import akka.util.ByteString
+import com.mesosphere.utils.zookeeper.ZookeeperServerTest
 import mesosphere.UnitTest
-import mesosphere.marathon.integration.setup.ZookeeperServerTest
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.core.base.JvmExitsCrashStrategy
+import scala.jdk.CollectionConverters._
+import org.apache.curator.framework.CuratorFramework
 import org.apache.zookeeper.ZooDefs.Perms
-import org.apache.zookeeper.data.{ ACL, Id }
+import org.apache.zookeeper.data.{ACL, Id}
 import org.apache.zookeeper.server.auth.DigestAuthenticationProvider
-import org.apache.zookeeper.{ KeeperException, ZooDefs }
+import org.apache.zookeeper.{KeeperException, ZooDefs}
 
 import scala.util.Random
 
@@ -18,14 +20,14 @@ class RichCuratorFrameworkTest extends UnitTest with ZookeeperServerTest {
   val root = Random.alphanumeric.take(10).mkString
   val user = new Id("digest", DigestAuthenticationProvider.generateDigest("super:secret"))
 
-  lazy val richClient = {
-    zkClient(namespace = Some(root))
+  lazy val richClient: RichCuratorFramework = {
+    RichCuratorFramework(zkClient(namespace = Some(root)), JvmExitsCrashStrategy)
   }
 
-  lazy val client = richClient.client
+  lazy val client: CuratorFramework = richClient.client
 
   after {
-    client.getChildren.forPath("/").map { child =>
+    client.getChildren.forPath("/").asScala.map { child =>
       client.delete().deletingChildrenIfNeeded().forPath(s"/$child")
     }
   }
@@ -33,7 +35,7 @@ class RichCuratorFrameworkTest extends UnitTest with ZookeeperServerTest {
   "RichCuratorFramework" should {
     "be able to create a simple node" in {
       richClient.create("/1").futureValue should equal("/1")
-      val childrenData = client.children("/").futureValue
+      val childrenData = richClient.children("/").futureValue
       childrenData.children should contain only "1"
       childrenData.path should equal("/")
       childrenData.stat.getVersion should equal(0)
@@ -42,8 +44,8 @@ class RichCuratorFrameworkTest extends UnitTest with ZookeeperServerTest {
     }
     "be able to create a simple node with data" in {
       richClient.create("/2", data = Some(ByteString("abc"))).futureValue should equal("/2")
-      client.data("/2").futureValue.data should equal(ByteString("abc"))
-      val childrenData = client.children("/").futureValue
+      richClient.data("/2").futureValue.data should equal(ByteString("abc"))
+      val childrenData = richClient.children("/").futureValue
       childrenData.children should contain only "2"
       childrenData.path should equal("/")
       childrenData.stat.getVersion should equal(0)
@@ -51,10 +53,9 @@ class RichCuratorFrameworkTest extends UnitTest with ZookeeperServerTest {
       childrenData.stat.getNumChildren should equal(1)
     }
     "be able to create a tree with data" in {
-      richClient.create(
-        "/3/4/5/6",
-        data = Some(ByteString("def")),
-        creatingParentContainersIfNeeded = true).futureValue should equal("/3/4/5/6")
+      richClient.create("/3/4/5/6", data = Some(ByteString("def")), creatingParentContainersIfNeeded = true).futureValue should equal(
+        "/3/4/5/6"
+      )
       richClient.data("/3/4/5/6").futureValue.data should equal(ByteString("def"))
     }
     "fail when creating a nested node when the parent doesn't exist and createParent isn't enabled" in {
@@ -101,13 +102,13 @@ class RichCuratorFrameworkTest extends UnitTest with ZookeeperServerTest {
     }
     "be able to get an ACL" in {
       val acl = new ACL(Perms.ALL, user)
-      val readAcl = ZooDefs.Ids.READ_ACL_UNSAFE.toIndexedSeq
+      val readAcl = ZooDefs.Ids.READ_ACL_UNSAFE.asScala.to(IndexedSeq)
       richClient.create("/acl", acls = acl +: readAcl).futureValue
       richClient.acl("/acl").futureValue should equal(acl +: readAcl)
     }
     "be able to set an ACL" in {
       val acls = Seq(new ACL(Perms.ALL, user))
-      richClient.create("/acl", acls = ZooDefs.Ids.OPEN_ACL_UNSAFE.toIndexedSeq).futureValue
+      richClient.create("/acl", acls = ZooDefs.Ids.OPEN_ACL_UNSAFE.asScala.to(IndexedSeq)).futureValue
       richClient.setAcl("/acl", acls).futureValue
       richClient.acl("/acl").futureValue should equal(acls)
     }

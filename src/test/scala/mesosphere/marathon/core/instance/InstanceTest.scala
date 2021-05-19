@@ -2,14 +2,16 @@ package mesosphere.marathon
 package core.instance
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.base.ConstantClock
 import mesosphere.marathon.core.condition.Condition
 import mesosphere.marathon.core.condition.Condition._
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.bus.MesosTaskStatusTestHelper
-import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.state.{ Timestamp, UnreachableStrategy }
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, UnreachableDisabled, UnreachableStrategy}
+import mesosphere.marathon.test.SettableClock
+import org.apache.mesos.Protos.Attribute
+import org.apache.mesos.Protos.Value.{Text, Type}
 import org.scalatest.prop.TableDrivenPropertyChecks
+import play.api.libs.json._
 
 class InstanceTest extends UnitTest with TableDrivenPropertyChecks {
 
@@ -17,8 +19,8 @@ class InstanceTest extends UnitTest with TableDrivenPropertyChecks {
 
     val stateChangeCases = Table(
       ("from", "to", "withTasks"),
-      (Created, Created, Seq(Created, Created, Created)),
-      (Created, Staging, Seq(Created, Created, Staging)),
+      (Provisioned, Provisioned, Seq(Provisioned, Provisioned, Provisioned)),
+      (Provisioned, Staging, Seq(Provisioned, Provisioned, Staging)),
       (Staging, Staging, Seq(Running, Staging, Running)),
       (Running, Running, Seq(Running, Finished, Running)),
       (Running, Failed, Seq(Staging, Starting, Running, Killing, Finished, Failed)),
@@ -32,14 +34,20 @@ class InstanceTest extends UnitTest with TableDrivenPropertyChecks {
       (Running, Dropped, Seq(Unreachable, Dropped))
     )
 
-    forAll (stateChangeCases) { (from, to, withTasks) =>
+    forAll(stateChangeCases) { (from, to, withTasks) =>
       val f = new Fixture
 
       val (instance, tasks) = f.instanceWith(from, withTasks)
 
       s"$from and tasks become ${withTasks.mkString(", ")}" should {
 
-        val status = Instance.InstanceState(Some(instance.state), tasks, f.clock.now(), UnreachableStrategy.default())
+        val status = Instance.InstanceState.transitionTo(
+          Some(instance.state),
+          tasks,
+          f.clock.now(),
+          UnreachableStrategy.default(),
+          instance.state.goal
+        )
 
         s"change to $to" in {
           status.condition should be(to)
@@ -48,76 +56,103 @@ class InstanceTest extends UnitTest with TableDrivenPropertyChecks {
     }
   }
 
-  "An instance" when {
+  "be killing" in {
+    val f = new Fixture
 
-    // format: OFF
-    val conditions = Table (
-      ("condition",         "isReserved", "isCreated", "isError", "isFailed", "isFinished", "isKilled", "isKilling", "isRunning", "isStaging", "isStarting", "isUnreachable", "isUnreachableInactive", "isGone", "isUnknown", "isDropped", "isActive", "isTerminated"),
-      (Reserved,            true,         false,       false,     false,      false,        false,      false,       false,       false,       false,        false,           false,                   false,    false,       false,       false,      false         ),
-      (Created,             false,        true,        false,     false,      false,        false,      false,       false,       false,       false,        false,           false,                   false,    false,       false,       true,       false         ),
-      (Error,               false,        false,       true,      false,      false,        false,      false,       false,       false,       false,        false,           false,                   false,    false,       false,       false,      true          ),
-      (Failed,              false,        false,       false,     true,       false,        false,      false,       false,       false,       false,        false,           false,                   false,    false,       false,       false,      true          ),
-      (Finished,            false,        false,       false,     false,      true,         false,      false,       false,       false,       false,        false,           false,                   false,    false,       false,       false,      true          ),
-      (Killed,              false,        false,       false,     false,      false,        true,       false,       false,       false,       false,        false,           false,                   false,    false,       false,       false,      true          ),
-      (Killing,             false,        false,       false,     false,      false,        false,      true,        false,       false,       false,        false,           false,                   false,    false,       false,       true,       false         ),
-      (Running,             false,        false,       false,     false,      false,        false,      false,       true,        false,       false,        false,           false,                   false,    false,       false,       true,       false         ),
-      (Staging,             false,        false,       false,     false,      false,        false,      false,       false,       true,        false,        false,           false,                   false,    false,       false,       true,       false         ),
-      (Starting,            false,        false,       false,     false,      false,        false,      false,       false,       false,       true,         false,           false,                   false,    false,       false,       true,       false         ),
-      (Unreachable,         false,        false,       false,     false,      false,        false,      false,       false,       false,       false,        true,            false,                   false,    false,       false,       true,       false         ),
-      (UnreachableInactive, false,        false,       false,     false,      false,        false,      false,       false,       false,       false,        false,           true,                    false,    false,       false,       false,      false         ),
-      (Gone,                false,        false,       false,     false,      false,        false,      false,       false,       false,       false,        false,           false,                   true,     false,       false,       false,      true          ),
-      (Unknown,             false,        false,       false,     false,      false,        false,      false,       false,       false,       false,        false,           false,                   false,    true,        false,       false,      true          ),
-      (Dropped,             false,        false,       false,     false,      false,        false,      false,       false,       false,       false,        false,           false,                   false,    false,       true,        false,      true          )
-    )
-    // format: ON
+    val (instance, _) = f.instanceWith(Condition.Killing, Seq(Condition.Killing))
+    instance.isKilling should be(true)
+  }
 
-    forAll (conditions) { (condition: Condition, isReserved, isCreated, isError, isFailed, isFinished, isKilled, isKilling, isRunning, isStaging, isStarting, isUnreachable, isUnreachableInactive, isGone, isUnknown, isDropped, isActive, isTerminated) =>
-      s"it's condition is $condition" should {
-        val f = new Fixture
+  "be running" in {
+    val f = new Fixture
 
-        val (instance, _) = f.instanceWith(condition, Seq(condition))
+    val (instance, _) = f.instanceWith(Condition.Running, Seq(Condition.Running))
+    instance.isRunning should be(true)
+  }
 
-        s"${if (!isReserved) "not" else ""} be reserved" in { instance.isReserved should be(isReserved) }
-        s"${if (!isCreated) "not" else ""} be created" in { instance.isCreated should be(isCreated) }
-        s"${if (!isError) "not" else ""} be error" in { instance.isError should be(isError) }
-        s"${if (!isFailed) "not" else ""} be failed" in { instance.isFailed should be(isFailed) }
-        s"${if (!isFinished) "not" else ""} be finished" in { instance.isFinished should be(isFinished) }
-        s"${if (!isKilled) "not" else ""} be killed" in { instance.isKilled should be(isKilled) }
-        s"${if (!isKilling) "not" else ""} be killing" in { instance.isKilling should be(isKilling) }
-        s"${if (!isRunning) "not" else ""} be running" in { instance.isRunning should be(isRunning) }
-        s"${if (!isStaging) "not" else ""} be staging" in { instance.isStaging should be(isStaging) }
-        s"${if (!isStarting) "not" else ""} be starting" in { instance.isStarting should be(isStarting) }
-        s"${if (!isUnreachable) "not" else ""} be unreachable" in { instance.isUnreachable should be(isUnreachable) }
-        s"${if (!isUnreachableInactive) "not" else ""} be unreachable inactive" in { instance.isUnreachableInactive should be(isUnreachableInactive) }
-        s"${if (!isGone) "not" else ""} be gone" in { instance.isGone should be(isGone) }
-        s"${if (!isUnknown) "not" else ""} be unknown" in { instance.isUnknown should be(isUnknown) }
-        s"${if (!isDropped) "not" else ""} be dropped" in { instance.isDropped should be(isDropped) }
-        s"${if (!isActive) "not" else ""} be active" in { instance.isActive should be(isActive) }
-        s"${if (!isTerminated) "not" else ""} be terminated" in { instance.isTerminated should be(isTerminated) }
-      }
+  "be unreachable" in {
+    val f = new Fixture(unreachableStrategy = UnreachableDisabled)
+
+    val (instance, _) = f.instanceWith(Condition.Unreachable, Seq(Condition.Unreachable))
+    instance.isUnreachable should be(true)
+  }
+
+  "be unreachable inactive" in {
+    val f = new Fixture
+
+    val (instance, _) = f.instanceWith(Condition.UnreachableInactive, Seq(Condition.UnreachableInactive))
+    instance.isUnreachableInactive should be(true)
+  }
+
+  "be active only for active conditions" in {
+    val f = new Fixture(unreachableStrategy = UnreachableDisabled)
+
+    val activeConditions: Seq[Condition] = Seq(Provisioned, Killing, Running, Staging, Starting, Unreachable)
+    activeConditions.foreach { condition =>
+      val (instance, _) = f.instanceWith(condition, Seq(condition))
+      instance.isActive should be(true)
+    }
+
+    Condition.all.filterNot(activeConditions.contains(_)).foreach { condition =>
+      val (instance, _) = f.instanceWith(condition, Seq(condition))
+      instance.isActive should be(false) withClue (s"'$condition' was supposed to not be active but isActive returned true")
     }
   }
 
-  class Fixture {
-    val id = "/test".toPath
-    val clock = ConstantClock()
+  "say it's reserved when reservation is set" in {
+    val f = new Fixture
+    val (instance, _) = f.instanceWith(Condition.Scheduled, Seq.empty)
+    val instanceWithReservation =
+      instance.copy(reservation = Some(Reservation(Seq.empty, Reservation.State.New(None), Reservation.SimplifiedId(instance.instanceId))))
+    instanceWithReservation.hasReservation should be(true)
+  }
 
-    val agentInfo = Instance.AgentInfo("", None, Nil)
-    def tasks(statuses: Condition*): Map[Task.Id, Task] = tasks(statuses.to[Seq])
+  "agentInfo serialization" should {
+    "round trip serialize" in {
+      val agentInfo = Instance.AgentInfo(
+        host = "host",
+        agentId = Some("agentId"),
+        region = Some("region"),
+        zone = Some("zone"),
+        attributes = Seq(
+          Attribute.newBuilder
+            .setName("name")
+            .setText(Text.newBuilder.setValue("value"))
+            .setType(Type.TEXT)
+            .build
+        )
+      )
+      println(Json.toJson(agentInfo))
+      Json.toJson(agentInfo).as[Instance.AgentInfo] shouldBe agentInfo
+    }
+
+    "it should default region and zone fields to empty string when missing" in {
+      val agentInfo = Json.parse("""{"host": "host", "agentId": "agentId", "attributes": []}""").as[Instance.AgentInfo]
+      agentInfo.region shouldBe None
+      agentInfo.zone shouldBe None
+    }
+  }
+
+  class Fixture(unreachableStrategy: UnreachableStrategy = UnreachableStrategy.default(false)) {
+    val id = AbsolutePathId("/test")
+    val app = AppDefinition(id, role = "*", unreachableStrategy = unreachableStrategy)
+    val clock = new SettableClock()
+
+    val agentInfo = Instance.AgentInfo("", None, None, None, Nil)
     def tasks(statuses: Seq[Condition]): Map[Task.Id, Task] =
-      statuses.map { status =>
-        val taskId = Task.Id.forRunSpec(id)
-        val mesosStatus = MesosTaskStatusTestHelper.mesosStatus(status, taskId, Timestamp.now())
-        val task = TestTaskBuilder.Helper.minimalTask(taskId, Timestamp.now(), mesosStatus, status)
+      statuses.iterator.map { status =>
+        val instanceId = Instance.Id.forRunSpec(id)
+        val taskId = Task.Id(instanceId)
+        val mesosStatus = MesosTaskStatusTestHelper.mesosStatus(status, taskId, clock.now())
+        val task = TestTaskBuilder.Helper.minimalTask(taskId, clock.now(), mesosStatus, status)
         task.taskId -> task
-      }(collection.breakOut)
+      }.toMap
 
     def instanceWith(condition: Condition, conditions: Seq[Condition]): (Instance, Map[Task.Id, Task]) = {
       val currentTasks = tasks(conditions.map(_ => condition))
       val newTasks = tasks(conditions)
-      val state = Instance.InstanceState(None, currentTasks, Timestamp.now(), UnreachableStrategy.default())
-      val instance = Instance(Instance.Id.forRunSpec(id), agentInfo, state, currentTasks,
-        runSpecVersion = Timestamp.now(), UnreachableStrategy.default())
+      val state = Instance.InstanceState.transitionTo(None, currentTasks, clock.now(), unreachableStrategy, Goal.Running)
+      val instance = Instance(Instance.Id.forRunSpec(id), Some(agentInfo), state, currentTasks, app, None, "*")
       (instance, newTasks)
     }
   }

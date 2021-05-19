@@ -12,7 +12,9 @@ object NoOfferMatchReason {
   case object InsufficientPorts extends NoOfferMatchReason
   case object UnfulfilledRole extends NoOfferMatchReason
   case object UnfulfilledConstraint extends NoOfferMatchReason
+  case object AgentMaintenance extends NoOfferMatchReason
   case object NoCorrespondingReservationFound extends NoOfferMatchReason
+  case object DeclinedScarceResources extends NoOfferMatchReason
 
   /**
     * This sequence is used to funnel reasons for not matching an offer.
@@ -23,19 +25,22 @@ object NoOfferMatchReason {
     UnfulfilledRole,
     UnfulfilledConstraint,
     NoCorrespondingReservationFound,
+    AgentMaintenance,
     InsufficientCpus,
     InsufficientMemory,
     InsufficientDisk,
     InsufficientGpus,
-    InsufficientPorts
+    InsufficientPorts,
+    DeclinedScarceResources
   )
 
-  def fromResourceType(name: String): NoOfferMatchReason = name match {
-    case Resource.CPUS => InsufficientCpus
-    case Resource.DISK => InsufficientDisk
-    case Resource.GPUS => InsufficientGpus
-    case Resource.MEM => InsufficientMemory
-    case Resource.PORTS => InsufficientPorts
-    case _ => throw new IllegalArgumentException(s"Not able to match $name to NoOfferMatchReason")
-  }
+  def fromResourceType(name: String): NoOfferMatchReason =
+    name match {
+      case Resource.CPUS => InsufficientCpus
+      case Resource.DISK => InsufficientDisk
+      case Resource.GPUS => InsufficientGpus
+      case Resource.MEM => InsufficientMemory
+      case Resource.PORTS => InsufficientPorts
+      case _ => throw new IllegalArgumentException(s"Not able to match $name to NoOfferMatchReason")
+    }
 }

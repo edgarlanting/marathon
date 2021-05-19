@@ -6,10 +6,10 @@ import mesosphere.UnitTest
 import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon.api.v2.ValidationHelper
 import mesosphere.marathon.core.instance.Instance.AgentInfo
-import mesosphere.marathon.core.instance.{ LegacyAppInstance, TestInstanceBuilder, TestTaskBuilder }
+import mesosphere.marathon.core.instance.{TestInstanceBuilder, TestTaskBuilder}
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.state.NetworkInfo
-import mesosphere.marathon.raml.{ AppHealthCheck, Raml }
+import mesosphere.marathon.raml.{AppHealthCheck, Raml}
 import mesosphere.marathon.state._
 import mesosphere.marathon.test.MarathonTestHelper
 import play.api.libs.json.Json
@@ -17,6 +17,7 @@ import play.api.libs.json.Json
 import scala.concurrent.duration._
 
 class HealthCheckTest extends UnitTest {
+
   "HealthCheck" should {
     "ToProto Marathon HTTP HealthCheck with portIndex" in {
       val healthCheck = MarathonHttpHealthCheck(
@@ -245,25 +246,31 @@ class HealthCheckTest extends UnitTest {
     }
 
     "both port and portIndex are not accepted at the same time for a HTTP HealthCheck" in {
-      shouldBeInvalid(MarathonHttpHealthCheck(
-        protocol = Protocol.HTTP,
-        port = Some(1),
-        portIndex = Some(PortReference(0))
-      ))
+      shouldBeInvalid(
+        MarathonHttpHealthCheck(
+          protocol = Protocol.HTTP,
+          port = Some(1),
+          portIndex = Some(PortReference(0))
+        )
+      )
     }
 
     "both port and portIndex are not accepted at the same time for a TCP HealthCheck" in {
-      shouldBeInvalid(MarathonTcpHealthCheck(
-        port = Some(1),
-        portIndex = Some(PortReference(0))
-      ))
+      shouldBeInvalid(
+        MarathonTcpHealthCheck(
+          port = Some(1),
+          portIndex = Some(PortReference(0))
+        )
+      )
     }
 
     "port is accepted for a HTTP HealthCheck" in {
-      shouldBeValid(MarathonHttpHealthCheck(
-        protocol = Protocol.HTTP,
-        port = Some(1)
-      ))
+      shouldBeValid(
+        MarathonHttpHealthCheck(
+          protocol = Protocol.HTTP,
+          port = Some(1)
+        )
+      )
     }
 
     "port is accepted for a TCP HealthCheck" in {
@@ -282,9 +289,13 @@ class HealthCheckTest extends UnitTest {
       import mesosphere.marathon.test.MarathonTestHelper.Implicits._
       val check = new MarathonTcpHealthCheck(port = Some(1234))
       val app = MarathonTestHelper.makeBasicApp().withPortDefinitions(Seq(PortDefinition(0)))
-      val instance = TestInstanceBuilder.newBuilder(app.id).addTaskWithBuilder().taskRunning()
+      val instance = TestInstanceBuilder
+        .newBuilder(app.id)
+        .addTaskWithBuilder()
+        .taskRunning()
         .withNetworkInfo(hostPorts = Seq(4321))
-        .build().getInstance()
+        .build()
+        .getInstance()
 
       assert(check.effectivePort(app, instance) == Option(1234))
     }
@@ -294,13 +305,13 @@ class HealthCheckTest extends UnitTest {
       val check = new MarathonTcpHealthCheck(portIndex = Some(PortReference(0)))
       val app = MarathonTestHelper.makeBasicApp().withPortDefinitions(Seq(PortDefinition(0)))
       val hostName = "hostName"
-      val agentInfo = AgentInfo(host = hostName, agentId = Some("agent"), attributes = Nil)
+      val agentInfo = AgentInfo(host = hostName, agentId = Some("agent"), region = None, zone = None, attributes = Nil)
       val task = {
-        val t: Task.LaunchedEphemeral = TestTaskBuilder.Helper.runningTaskForApp(app.id)
+        val t: Task = TestTaskBuilder.Helper.runningTaskForApp(app.id)
         val hostPorts = Seq(4321)
         t.copy(status = t.status.copy(networkInfo = NetworkInfo(hostName, hostPorts, ipAddresses = Nil)))
       }
-      val instance = LegacyAppInstance(task, agentInfo, unreachableStrategy = UnreachableStrategy.default())
+      val instance = TestInstanceBuilder.fromTask(task, agentInfo, unreachableStrategy = UnreachableStrategy.default())
 
       assert(check.effectivePort(app, instance) == Option(4321))
     }
@@ -311,6 +322,6 @@ class HealthCheckTest extends UnitTest {
 
   private[this] def shouldBeValid(hc: HealthCheck): Unit = {
     val result = validate(hc)
-    assert(result.isSuccess, s"violations: ${ValidationHelper.getAllRuleConstrains(result)}")
+    assert(result.isSuccess, s"violations: ${ValidationHelper.getAllRuleConstraints(result)}")
   }
 }

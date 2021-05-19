@@ -5,15 +5,18 @@ import mesosphere.UnitTest
 import mesosphere.marathon.api.TestAuthFixture
 import mesosphere.marathon.core.group.GroupManager
 import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.state.{ AppDefinition, Timestamp }
+import mesosphere.marathon.state.{AppDefinition, Timestamp}
+import mesosphere.marathon.test.JerseyTest
+import scala.concurrent.ExecutionContext.Implicits.global
 
-class AppVersionsResourceTest extends UnitTest {
+class AppVersionsResourceTest extends UnitTest with JerseyTest {
 
   case class Fixture(
       auth: TestAuthFixture = new TestAuthFixture,
       config: MarathonConf = mock[MarathonConf],
       service: MarathonSchedulerService = mock[MarathonSchedulerService],
-      groupManager: GroupManager = mock[GroupManager]) {
+      groupManager: GroupManager = mock[GroupManager]
+  ) {
     val appsVersionsResource = new AppVersionsResource(service, groupManager, auth.auth, auth.auth, config)
   }
 
@@ -24,12 +27,12 @@ class AppVersionsResourceTest extends UnitTest {
       val req = auth.request
 
       When("the index is fetched")
-      val index = appsVersionsResource.index("appId", req)
+      val index = asyncRequest { r => appsVersionsResource.index("appId", req, r) }
       Then("we receive a NotAuthenticated response")
       index.getStatus should be(auth.NotAuthenticatedStatus)
 
       When("one app version is fetched")
-      val show = appsVersionsResource.show("appId", "version", req)
+      val show = asyncRequest { r => appsVersionsResource.show("appId", "version", req, r) }
       Then("we receive a NotAuthenticated response")
       show.getStatus should be(auth.NotAuthenticatedStatus)
     }
@@ -40,9 +43,9 @@ class AppVersionsResourceTest extends UnitTest {
       auth.authorized = false
       val req = auth.request
 
-      groupManager.app("appId".toRootPath) returns Some(AppDefinition("appId".toRootPath))
+      groupManager.app("appId".toAbsolutePath) returns Some(AppDefinition("appId".toAbsolutePath, role = "*"))
       When("the index is fetched")
-      val index = appsVersionsResource.index("appId", req)
+      val index = asyncRequest { r => appsVersionsResource.index("appId", req, r) }
       Then("we receive a not authorized response")
       index.getStatus should be(auth.UnauthorizedStatus)
     }
@@ -53,9 +56,9 @@ class AppVersionsResourceTest extends UnitTest {
       auth.authorized = false
       val req = auth.request
 
-      groupManager.app("appId".toRootPath) returns None
+      groupManager.app("appId".toAbsolutePath) returns None
       When("the index is fetched")
-      val index = appsVersionsResource.index("appId", req)
+      val index = asyncRequest { r => appsVersionsResource.index("appId", req, r) }
       Then("we receive a 404")
       index.getStatus should be(404)
     }
@@ -67,9 +70,9 @@ class AppVersionsResourceTest extends UnitTest {
       val req = auth.request
 
       val version = Timestamp.now()
-      service.getApp("appId".toRootPath, version) returns Some(AppDefinition("appId".toRootPath))
+      service.getApp("appId".toAbsolutePath, version) returns Some(AppDefinition("appId".toAbsolutePath, role = "*"))
       When("one app version is fetched")
-      val show = appsVersionsResource.show("appId", version.toString, req)
+      val show = asyncRequest { r => appsVersionsResource.show("appId", version.toString, req, r) }
       Then("we receive a not authorized response")
       show.getStatus should be(auth.UnauthorizedStatus)
     }
@@ -81,9 +84,9 @@ class AppVersionsResourceTest extends UnitTest {
       val req = auth.request
 
       val version = Timestamp.now()
-      service.getApp("appId".toRootPath, version) returns None
+      service.getApp("appId".toAbsolutePath, version) returns None
       When("one app version is fetched")
-      val show = appsVersionsResource.show("appId", version.toString, req)
+      val show = asyncRequest { r => appsVersionsResource.show("appId", version.toString, req, r) }
       Then("we receive a not authorized response")
       show.getStatus should be(404)
     }

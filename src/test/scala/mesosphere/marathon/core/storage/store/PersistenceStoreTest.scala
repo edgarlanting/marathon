@@ -2,16 +2,17 @@ package mesosphere.marathon
 package core.storage.store
 
 import java.io.File
-import java.time.{ Clock, OffsetDateTime }
+import java.time.{Clock, OffsetDateTime}
 
 import akka.Done
 import akka.http.scaladsl.marshalling.Marshaller
 import akka.http.scaladsl.unmarshalling.Unmarshaller
-import akka.stream.scaladsl.{ FileIO, Keep, Sink }
+import akka.stream.scaladsl.{FileIO, Keep, Sink}
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.storage.backup.impl.TarBackupFlow
+import mesosphere.marathon.core.storage.repository.RepositoryConstants
 import mesosphere.marathon.core.storage.store.impl.BasePersistenceStore
-import mesosphere.marathon.storage.migration.{ Migration, StorageVersions }
+import mesosphere.marathon.storage.migration.{Migration, StorageVersions}
 import mesosphere.marathon.test.SettableClock
 
 import scala.concurrent.Future
@@ -26,13 +27,34 @@ object TestClass1 {
 }
 
 private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
-  def basicPersistenceStore[K, C, Serialized](name: String, newStore: => PersistenceStore[K, C, Serialized])(
-    implicit
-    ir: IdResolver[String, TestClass1, C, K],
-    m: Marshaller[TestClass1, Serialized],
-    um: Unmarshaller[Serialized, TestClass1]): Unit = {
+  def basicPersistenceStore[K, C, Serialized](name: String, newStore: => PersistenceStore[K, C, Serialized])(implicit
+      ir: IdResolver[String, TestClass1, C, K],
+      m: Marshaller[TestClass1, Serialized],
+      um: Unmarshaller[Serialized, TestClass1]
+  ): Unit = {
 
     name should {
+      "is open" in {
+        val store = newStore
+        store.isOpen shouldBe true
+      }
+      "cannot be opened twice" in {
+        val store = newStore
+        val thrown = the[IllegalStateException] thrownBy store.markOpen()
+        thrown.getMessage shouldBe "it was opened before"
+      }
+      "cannot be reopened" in {
+        val store = newStore
+        store.markClosed()
+        val thrown = the[IllegalStateException] thrownBy store.markOpen()
+        thrown.getMessage shouldBe "it was opened before"
+      }
+      "cannot be closed twice" in {
+        val store = newStore
+        store.markClosed()
+        val thrown = the[IllegalStateException] thrownBy store.markClosed()
+        thrown.getMessage shouldBe "attempt to close while not being opened"
+      }
       "have no ids" in {
         val store = newStore
         store.ids().runWith(Sink.seq).futureValue should equal(Nil)
@@ -62,7 +84,7 @@ private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
         implicit val clock = new SettableClock()
         val store = newStore
         val original = TestClass1("abc", 1)
-        clock.plus(1.minute)
+        clock.advanceBy(1.minute)
         val updated = TestClass1("def", 2)
         store.store("task-1", original).futureValue should be(Done)
         store.store("task-1", updated).futureValue should be(Done)
@@ -82,14 +104,14 @@ private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
       "store the multiple versions of the old values" in {
         val clock = new SettableClock()
         val versions = 0.until(10).map { i =>
-          clock.plus(1.minute)
+          clock.advanceBy(1.minute)
           TestClass1("abc", i, OffsetDateTime.now(clock))
         }
         val store = newStore
         versions.foreach { v =>
           store.store("task", v).futureValue should be(Done)
         }
-        clock.plus(1.hour)
+        clock.advanceBy(1.hour)
         val newestVersion = TestClass1("def", 3, OffsetDateTime.now(clock))
         store.store("task", newestVersion).futureValue should be(Done)
         // it should have dropped one element.
@@ -130,11 +152,11 @@ private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
     }
   }
 
-  def backupRestoreStore[K, C, Serialized](name: String, newStore: => PersistenceStore[K, C, Serialized])(
-    implicit
-    ir: IdResolver[String, TestClass1, C, K],
-    m: Marshaller[TestClass1, Serialized],
-    um: Unmarshaller[Serialized, TestClass1]): Unit = {
+  def backupRestoreStore[K, C, Serialized](name: String, newStore: => PersistenceStore[K, C, Serialized])(implicit
+      ir: IdResolver[String, TestClass1, C, K],
+      m: Marshaller[TestClass1, Serialized],
+      um: Unmarshaller[Serialized, TestClass1]
+  ): Unit = {
 
     name should {
       "be able to backup and restore the state" in {
@@ -153,7 +175,7 @@ private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
         store.backup().runWith(tarSink).futureValue
 
         Then("the content of the store can be removed completely")
-        store.ids().map(store.deleteAll(_)).mapAsync(Int.MaxValue)(identity).runWith(Sink.ignore).futureValue
+        store.ids().map(store.deleteAll(_)).mapAsync(RepositoryConstants.maxConcurrency)(identity).runWith(Sink.ignore).futureValue
         store.setStorageVersion(StorageVersions(0, 0, 0)).futureValue
 
         When("the state is read from the backup")
@@ -161,7 +183,7 @@ private[storage] trait PersistenceStoreTest { this: AkkaUnitTest =>
         tarSource.runWith(store.restore()).futureValue
 
         Then("the state is restored completely")
-        val children = store.backup().runWith(stream.Sink.seq).futureValue
+        val children = store.backup().runWith(Sink.seq).futureValue
         children.size should be >= numEntries
         children.exists(_.key == Migration.StorageVersionName) should be(true)
         content.foreach { item =>

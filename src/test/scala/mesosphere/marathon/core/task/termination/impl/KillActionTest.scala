@@ -2,27 +2,22 @@ package mesosphere.marathon
 package core.task.termination.impl
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.base.ConstantClock
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
-import mesosphere.marathon.core.task.Task.LocalVolumeId
-import mesosphere.marathon.state.PathId
+import mesosphere.marathon.core.instance.{Instance, LocalVolumeId, TestInstanceBuilder}
+import mesosphere.marathon.state.AbsolutePathId
+import mesosphere.marathon.test.SettableClock
 import org.scalatest.prop.TableDrivenPropertyChecks
 
 class KillActionTest extends UnitTest with TableDrivenPropertyChecks {
 
-  val clock = ConstantClock()
-  val appId = PathId("/test")
+  val clock = new SettableClock()
+  val appId = AbsolutePathId("/test")
 
   lazy val localVolumeId = LocalVolumeId(appId, "unwanted-persistent-volume", "uuid1")
-  lazy val residentLaunchedInstance: Instance = TestInstanceBuilder.newBuilder(appId).
-    addTaskResidentLaunched(localVolumeId).
-    getInstance()
+  lazy val residentLaunchedInstance: Instance =
+    TestInstanceBuilder.newBuilder(appId).addTaskResidentLaunched(Seq(localVolumeId)).getInstance()
 
-  lazy val residentUnreachableInstance: Instance = TestInstanceBuilder.newBuilder(appId).
-    addTaskWithBuilder().
-    taskResidentUnreachable(localVolumeId).
-    build().
-    getInstance()
+  lazy val residentUnreachableInstance: Instance =
+    TestInstanceBuilder.newBuilder(appId).addTaskUnreachable(Seq(localVolumeId)).getInstance()
 
   lazy val unreachableInstance: Instance = TestInstanceBuilder.newBuilder(appId).addTaskUnreachable().getInstance()
   lazy val runningInstance: Instance = TestInstanceBuilder.newBuilder(appId).addTaskLaunched().getInstance()
@@ -32,18 +27,15 @@ class KillActionTest extends UnitTest with TableDrivenPropertyChecks {
       ("name", "instance", "expected"),
       ("an unreachable reserved instance", residentUnreachableInstance, KillAction.Noop),
       ("a running reserved instance", residentLaunchedInstance, KillAction.IssueKillRequest),
-      ("an unreachable ephemeral instance", unreachableInstance, KillAction.ExpungeFromState),
+      ("an unreachable ephemeral instance", unreachableInstance, KillAction.Decommission),
       ("a running ephemeral instance", runningInstance, KillAction.IssueKillRequest)
-    ).
-      foreach {
-        case (name, instance, expected) =>
-          s"killing ${name}" should {
-            s"result in ${expected}" in {
-              KillAction(
-                instance.instanceId, instance.tasksMap.keys, Some(instance)).
-                shouldBe(expected)
-            }
+    ).foreach {
+      case (name, instance, expected) =>
+        s"killing ${name}" should {
+          s"result in ${expected}" in {
+            KillAction(instance.instanceId, instance.tasksMap.keys, Some(instance)).shouldBe(expected)
           }
-      }
+        }
+    }
   }
 }

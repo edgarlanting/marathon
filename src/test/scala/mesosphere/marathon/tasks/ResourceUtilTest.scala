@@ -2,11 +2,11 @@ package mesosphere.marathon
 package tasks
 
 import mesosphere.UnitTest
-import mesosphere.marathon.stream.Implicits._
-import mesosphere.marathon.test.{ MarathonTestHelper => MTH }
+import scala.jdk.CollectionConverters._
+import mesosphere.marathon.test.{MarathonTestHelper => MTH}
 import org.apache.mesos.Protos
 import org.apache.mesos.Protos.Resource.DiskInfo.Persistence
-import org.apache.mesos.Protos.Resource.{ DiskInfo, ReservationInfo }
+import org.apache.mesos.Protos.Resource.{DiskInfo, ReservationInfo}
 import org.apache.mesos.Protos._
 
 class ResourceUtilTest extends UnitTest {
@@ -38,7 +38,11 @@ class ResourceUtilTest extends UnitTest {
     "resource consumption considers roles" in {
       val leftOvers = ResourceUtil.consumeResources(
         Seq(MTH.scalarResource("cpus", 2), MTH.scalarResource("cpus", 2, role = "marathon")),
-        Seq(MTH.scalarResource("cpus", 0.5), MTH.scalarResource("cpus", 1, role = "marathon"), MTH.scalarResource("cpus", 0.5, role = "marathon"))
+        Seq(
+          MTH.scalarResource("cpus", 0.5),
+          MTH.scalarResource("cpus", 1, role = "marathon"),
+          MTH.scalarResource("cpus", 0.5, role = "marathon")
+        )
       )
       assert(leftOvers == Seq(MTH.scalarResource("cpus", 1.5), MTH.scalarResource("cpus", 0.5, role = "marathon")))
     }
@@ -47,8 +51,8 @@ class ResourceUtilTest extends UnitTest {
       val reservationInfo = ReservationInfo.newBuilder().setPrincipal("principal").build()
 
       val disk = DiskInfo.newBuilder().setPersistence(Persistence.newBuilder().setId("persistenceId")).build()
-      val resourceWithReservation = MTH.scalarResource("disk", 1024, "role", Some(reservationInfo), Some(disk))
-      val resourceWithoutReservation = MTH.scalarResource("disk", 1024, "role", None, None)
+      val resourceWithReservation = MTH.scalarResource("disk", 1024, "role", None, Some(reservationInfo), Some(disk))
+      val resourceWithoutReservation = MTH.scalarResource("disk", 1024, "role", None, None, None)
 
       // simple case: Only exact match contained
 
@@ -98,10 +102,7 @@ class ResourceUtilTest extends UnitTest {
     }
 
     "resource consumption fully consumes mount disks" in {
-      ResourceUtil.consumeScalarResource(
-        MTH.scalarResource("disk", 1024.0,
-          disk = Some(MTH.mountDisk("/mnt/disk1"))),
-        32.0) shouldBe (None)
+      ResourceUtil.consumeScalarResource(MTH.scalarResource("disk", 1024.0, disk = Some(MTH.mountDisk("/mnt/disk1"))), 32.0) shouldBe (None)
     }
 
     "resource consumption considers reservation labels" in {
@@ -109,8 +110,8 @@ class ResourceUtilTest extends UnitTest {
       val labels = Protos.Labels.newBuilder().addLabels(Protos.Label.newBuilder().setKey("key").setValue("value"))
       val reservationInfo2 = ReservationInfo.newBuilder().setPrincipal("principal").setLabels(labels).build()
 
-      val resourceWithReservation1 = MTH.scalarResource("disk", 1024, "role", Some(reservationInfo1), None)
-      val resourceWithReservation2 = MTH.scalarResource("disk", 1024, "role", Some(reservationInfo2), None)
+      val resourceWithReservation1 = MTH.scalarResource("disk", 1024, "role", None, Some(reservationInfo1), None)
+      val resourceWithReservation2 = MTH.scalarResource("disk", 1024, "role", None, Some(reservationInfo2), None)
 
       // simple case: Only exact match contained
 
@@ -161,7 +162,7 @@ class ResourceUtilTest extends UnitTest {
 
     "display resources indicates reservation" in {
       val reservationInfo = ReservationInfo.newBuilder().setPrincipal("principal").build()
-      val resource = MTH.scalarResource("disk", 1024, "role", Some(reservationInfo), None)
+      val resource = MTH.scalarResource("disk", 1024, "role", None, Some(reservationInfo), None)
       val resourceString = ResourceUtil.displayResources(Seq(resource), maxRanges = 10)
       resourceString should equal("disk(role, RESERVED for principal) 1024.0")
     }
@@ -169,7 +170,7 @@ class ResourceUtilTest extends UnitTest {
     "display resources displays disk and reservation info" in {
       val reservationInfo = ReservationInfo.newBuilder().setPrincipal("principal").build()
       val disk = DiskInfo.newBuilder().setPersistence(Persistence.newBuilder().setId("persistenceId")).build()
-      val resource = MTH.scalarResource("disk", 1024, "role", Some(reservationInfo), Some(disk))
+      val resource = MTH.scalarResource("disk", 1024, "role", None, Some(reservationInfo), Some(disk))
       val resourceString = ResourceUtil.displayResources(Seq(resource), maxRanges = 10)
       resourceString should equal("disk(role, RESERVED for principal, diskId persistenceId) 1024.0")
     }
@@ -177,14 +178,19 @@ class ResourceUtilTest extends UnitTest {
     // in the middle
     portsTest(consumedResource = Seq(10 to 10), baseResource = Seq(5 to 15), expectedResult = Some(Seq(5 to 9, 11 to 15)))
     portsTest(consumedResource = Seq(10 to 11), baseResource = Seq(5 to 15), expectedResult = Some(Seq(5 to 9, 12 to 15)))
-    portsTest(consumedResource = Seq(10 to 11), baseResource = Seq(5 to 15, 30 to 31),
-      expectedResult = Some(Seq(5 to 9, 12 to 15, 30 to 31)))
+    portsTest(
+      consumedResource = Seq(10 to 11),
+      baseResource = Seq(5 to 15, 30 to 31),
+      expectedResult = Some(Seq(5 to 9, 12 to 15, 30 to 31))
+    )
 
     portsTest(consumedResource = Seq(), baseResource = Seq(5 to 15), expectedResult = Some(Seq(5 to 15)))
 
     portsTest(
       consumedResource = Seq(31084 to 31084),
-      baseResource = Seq(31000 to 31096, 31098 to 32000), expectedResult = Some(Seq(31000 to 31083, 31085 to 31096, 31098 to 32000)))
+      baseResource = Seq(31000 to 31096, 31098 to 32000),
+      expectedResult = Some(Seq(31000 to 31083, 31085 to 31096, 31098 to 32000))
+    )
 
     // overlapping smaller
     portsTest(consumedResource = Seq(2 to 5), baseResource = Seq(5 to 15), expectedResult = Some(Seq(6 to 15)))
@@ -206,10 +212,7 @@ class ResourceUtilTest extends UnitTest {
     setResourceTest(consumedResource = Set("a", "b", "c"), baseResource = Set("a", "b", "c"), expectedResult = None)
   }
 
-  private[this] def setResourceTest(
-    consumedResource: Set[String],
-    baseResource: Set[String],
-    expectedResult: Option[Set[String]]): Unit = {
+  private[this] def setResourceTest(consumedResource: Set[String], baseResource: Set[String], expectedResult: Option[Set[String]]): Unit = {
 
     s"consuming sets resource $consumedResource from $baseResource results in $expectedResult" in {
       val r1 = set("cpus", consumedResource)
@@ -230,9 +233,10 @@ class ResourceUtilTest extends UnitTest {
   }
 
   private[this] def portsTest(
-    consumedResource: Seq[Range.Inclusive],
-    baseResource: Seq[Range.Inclusive],
-    expectedResult: Option[Seq[Range.Inclusive]]): Unit = {
+      consumedResource: Seq[Range.Inclusive],
+      baseResource: Seq[Range.Inclusive],
+      expectedResult: Option[Seq[Range.Inclusive]]
+  ): Unit = {
 
     s"consuming ports resource $consumedResource from $baseResource results in $expectedResult" in {
       val r1 = ports("cpus", consumedResource: _*)
@@ -247,7 +251,9 @@ class ResourceUtilTest extends UnitTest {
     def toRange(range: Range.Inclusive): Value.Range =
       Value.Range
         .newBuilder()
-        .setBegin(range.start.toLong).setEnd(range.end.toLong).build()
+        .setBegin(range.start.toLong)
+        .setEnd(range.end.toLong)
+        .build()
 
     Resource
       .newBuilder()

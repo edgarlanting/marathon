@@ -4,163 +4,208 @@ import mesosphere.marathon.Protos.Constraint
 import mesosphere.marathon.Protos.Constraint.Operator
 import mesosphere.marathon.core.instance.Instance
 import mesosphere.marathon.state.RunSpec
-import mesosphere.marathon.stream.Implicits._
-import org.apache.mesos.Protos.{ Attribute, Offer, Value }
-import org.slf4j.LoggerFactory
+import mesosphere.marathon.tasks.OfferUtil
+import org.apache.mesos.Protos.{Attribute, Offer, Value}
+import org.apache.mesos.scheduler.Protos.{AttributeConstraint => MesosAttributeConstraint}
+import org.apache.mesos.scheduler.Protos.AttributeConstraint.Selector.PseudoattributeType
 
 import scala.collection.immutable.Seq
 import scala.util.Try
+import java.text.DecimalFormat
+
+import com.typesafe.scalalogging.StrictLogging
+import scala.jdk.CollectionConverters._
 
 object Int {
   def unapply(s: String): Option[Int] = Try(s.toInt).toOption
 }
 
-trait Placed {
-  def attributes: Seq[Attribute]
-  def hostname: String
-}
+object Constraints extends StrictLogging {
 
-object Constraints {
-
-  private[this] val log = LoggerFactory.getLogger(getClass.getName)
   private val GroupByDefault = 0
 
-  private def getIntValue(s: String, default: Int): Int = s match {
-    case "inf" => Integer.MAX_VALUE
-    case Int(x) => x
-    case _ => default
-  }
+  private def getIntValue(s: String, default: Int): Int =
+    s match {
+      case "inf" => Integer.MAX_VALUE
+      case Int(x) => x
+      case _ => default
+    }
 
-  private def getValueString(attribute: Attribute): String = attribute.getType match {
-    case Value.Type.SCALAR =>
-      java.text.NumberFormat.getInstance.format(attribute.getScalar.getValue)
-    case Value.Type.TEXT =>
-      attribute.getText.getValue
-    case Value.Type.RANGES =>
-      val s = attribute.getRanges.getRangeList.to[Seq]
-        .sortWith(_.getBegin < _.getBegin)
-        .map(r => s"${r.getBegin.toString}-${r.getEnd.toString}")
-        .mkString(",")
-      s"[$s]"
-    case Value.Type.SET =>
-      val s = attribute.getSet.getItemList.to[Seq].sorted.mkString(",")
-      s"{$s}"
-  }
+  /**
+    * Decimal formatter to the 1000th precision. Does not include zeros after the decimal. Rounding mode
+    * ROUND_HALF_EVEN (1.0005 becomes "1", but 1.00051 becomes "1.001" and 1.1005 becomes "1.101").
+    *
+    * ROUND_HALF_EVEN is used for legacy purposes.
+    *
+    * Previously, we used NumberFormat.getInstance, which defaults to the DecimalFormat seen below, but could have
+    * differing behavior depending on the environmental locale configured.
+    */
+  private val decimalFormatter =
+    new DecimalFormat("0.###")
 
-  private final class ConstraintsChecker(allPlaced: Seq[Placed], offer: Offer, constraint: Constraint) {
-    val field = constraint.getField
-    val value = constraint.getValue
-    lazy val attr = offer.getAttributesList.find(_.getName == field)
+  private def getValueString(attribute: Attribute): String =
+    attribute.getType match {
+      case Value.Type.SCALAR =>
+        decimalFormatter.format(attribute.getScalar.getValue)
+      case Value.Type.TEXT =>
+        attribute.getText.getValue
+      case Value.Type.RANGES =>
+        val s = attribute.getRanges.getRangeList.asScala
+          .to(Seq)
+          .sortWith(_.getBegin < _.getBegin)
+          .map(r => s"${r.getBegin.toString}-${r.getEnd.toString}")
+          .mkString(",")
+        s"[$s]"
+      case Value.Type.SET =>
+        val s = attribute.getSet.getItemList.asScala.to(Seq).sorted.mkString(",")
+        s"{$s}"
+    }
 
-    def isMatch: Boolean =
-      if (field == "hostname") {
-        checkHostName
-      } else if (attr.nonEmpty) {
-        checkAttribute
-      } else {
-        // This will be reached in case we want to schedule for an attribute
-        // that's not supplied.
-        checkMissingAttribute
+  type FieldReader = (Offer => Option[String], Instance => Option[String])
+  private val hostnameReader: FieldReader = (offer => Some(offer.getHostname), placed => placed.hostname)
+  private val regionReader: FieldReader = (OfferUtil.region(_), _.region)
+  private val zoneReader: FieldReader = (OfferUtil.zone(_), _.zone)
+  private def attributeReader(field: String): FieldReader =
+    (
+      { offer => offer.getAttributesList.asScala.find(_.getName == field).map(getValueString) },
+      { p => p.attributes.find(_.getName == field).map(getValueString) }
+    )
+
+  val hostnameField = "@hostname"
+  val regionField = "@region"
+  val zoneField = "@zone"
+  def readerForField(field: String): FieldReader =
+    field match {
+      case "hostname" | `hostnameField` => hostnameReader
+      case `regionField` => regionReader
+      case `zoneField` => zoneReader
+      case _ => attributeReader(field)
+    }
+
+  // Converts a field string into a Mesos offer constraint attribute selector.
+  def buildSelectorProto(field: String, builder: MesosAttributeConstraint.Selector.Builder): Unit =
+    field match {
+      case "hostname" | `hostnameField` => builder.setPseudoattributeType(PseudoattributeType.HOSTNAME)
+      case `regionField` => builder.setPseudoattributeType(PseudoattributeType.REGION)
+      case `zoneField` => builder.setPseudoattributeType(PseudoattributeType.ZONE)
+      case _ => builder.setAttributeName(field)
+    }
+
+  // Regular expressions to determine type based on http://mesos.apache.org/documentation/latest/attributes-resources/
+  private[mesos] val MesosSetValue = "\\{(.+)\\}".r
+  private[mesos] val MesosRangeValue = "\\[(.+)\\]".r
+  private[mesos] val MesosScalarValue = "([0-9]+(?:\\.[0-9]+)?)".r
+
+  private final class ConstraintsChecker(allInstances: Seq[Instance], offer: Offer, constraint: Constraint) {
+    val constraintValue = constraint.getValue
+    def constraintValueAsScalar: Option[Double] =
+      constraintValue match {
+        case MesosScalarValue(v) => Some(v.toDouble)
+        case _ => None
+      }
+    def constraintValueAsSet: Option[Iterable[String]] = {
+      constraintValue match {
+        case MesosSetValue(inner) =>
+          Some(inner.split(',').view.map {
+            case MesosScalarValue(v) => decimalFormatter.format(v.toDouble)
+            case text => text
+          })
+
+        case _ => None
+      }
+    }
+
+    def isMatch: Boolean = {
+      val (offerReader, placedReader) = readerForField(constraint.getField)
+      checkConstraint(offerReader(offer), placedReader)
+    }
+
+    private def checkGroupBy(offerValue: String, groupFunc: (Instance) => Option[String]): Boolean = {
+      val desiredInstanceCount: Int = allInstances.headOption.map(_.runSpec.instances).getOrElse(1)
+      val desiredGroupCount: Int = List(GroupByDefault, getIntValue(constraintValue, GroupByDefault)).max
+
+      val currentCountPerGroup = allInstances.groupBy(groupFunc).map { case (k, v) => k -> v.size }
+      val desiredCountPerGroup: Int = (desiredInstanceCount / desiredGroupCount)
+      val remainder = desiredInstanceCount % desiredGroupCount
+      val remainderConsumed = currentCountPerGroup.map {
+        case (_, count) =>
+          Math.max(0, count - desiredCountPerGroup)
+      }.sum
+      def remainderUnused: Boolean = (remainder - remainderConsumed) > 0
+
+      val countInOfferGroup = currentCountPerGroup.collectFirst {
+        case (Some(v), groupCount) if v == offerValue =>
+          groupCount
       }
 
-    private def checkGroupBy(constraintValue: String, groupFunc: (Placed) => Option[String]) = {
-      // Minimum group count
-      val minimum = List(GroupByDefault, getIntValue(value, GroupByDefault)).max
+      countInOfferGroup match {
+        case Some(count) => // we've already placed at least one instance in this group
+          (count < desiredCountPerGroup) || // we haven't yet reached the desired count
+            (count == desiredCountPerGroup && remainderUnused) // we've reached exactly the desired count, but there's still a remainder
+        case None =>
+          // allow selection of a new group if we still haven't chosen all of our group values
+          currentCountPerGroup.size < desiredGroupCount
+      }
+    }
+
+    private def checkMaxPer(offerValue: String, maxCount: Int, groupFunc: (Instance) => Option[String]): Boolean = {
       // Group tasks by the constraint value, and calculate the task count of each group
-      val groupedTasks = allPlaced.groupBy(groupFunc).map { case (k, v) => k -> v.size }
-      // Task count of the smallest group
-      val minCount = groupedTasks.values.reduceOption(_ min _).getOrElse(0)
+      val groupedTasks = allInstances.groupBy(groupFunc).map { case (k, v) => k -> v.size }
 
-      // Return true if any of these are also true:
-      // a) this offer matches the smallest grouping when there
-      // are >= minimum groupings
-      // b) the constraint value from the offer is not yet in the grouping
-      groupedTasks.find(_._1.contains(constraintValue))
-        .forall(pair => groupedTasks.size >= minimum && pair._2 == minCount)
+      groupedTasks.find(_._1.contains(offerValue)).forall(_._2 < maxCount)
     }
 
-    private def checkMaxPer(constraintValue: String, maxCount: Int, groupFunc: (Placed) => Option[String]): Boolean = {
-      // Group tasks by the constraint value, and calculate the task count of each group
-      val groupedTasks = allPlaced.groupBy(groupFunc).map { case (k, v) => k -> v.size }
+    private def checkCluster(offerValue: String, placedValue: Instance => Option[String]) =
+      if (constraintValue.isEmpty)
+        // If no placements are made, then accept (and make this offerValue) the value on which all future tasks are
+        // placed
+        allInstances.headOption.fold(true) { p => placedValue(p) contains offerValue }
+      else
+        // Is constraint
+        (offerValue == constraintValue)
 
-      groupedTasks.find(_._1.contains(constraintValue)).forall(_._2 < maxCount)
+    // All running tasks must have a value that is different from the one in the offer
+    private def checkUnique(offerValue: Option[String], placedValue: Instance => Option[String]) = {
+      allInstances.forall { p => placedValue(p) != offerValue }
     }
 
-    private def checkHostName =
-      constraint.getOperator match {
-        case Operator.LIKE => offer.getHostname.matches(value)
-        case Operator.UNLIKE => !offer.getHostname.matches(value)
-        // All running tasks must have a hostname that is different from the one in the offer
-        case Operator.UNIQUE => allPlaced.forall(_.hostname != offer.getHostname)
-        case Operator.GROUP_BY => checkGroupBy(offer.getHostname, (p: Placed) => Some(p.hostname))
-        case Operator.MAX_PER => checkMaxPer(offer.getHostname, value.toInt, (p: Placed) => Some(p.hostname))
-        case Operator.CLUSTER =>
-          // Hostname must match or be empty
-          (value.isEmpty || value == offer.getHostname) &&
-            // All running tasks must have the same hostname as the one in the offer
-            allPlaced.forall(_.hostname == offer.getHostname)
-        case _ => false
-      }
-
-    @SuppressWarnings(Array("OptionGet"))
-    private def checkAttribute: Boolean = {
-      def matches: Seq[Placed] = matchTaskAttributes(allPlaced, field, getValueString(attr.get))
-      def groupFunc = (p: Placed) => p.attributes
-        .find(_.getName == field)
-        .map(getValueString)
-      constraint.getOperator match {
-        case Operator.UNIQUE => matches.isEmpty
-        case Operator.CLUSTER =>
-          // If no value is set, accept the first one. Otherwise check for it.
-          (value.isEmpty || getValueString(attr.get) == value) &&
-            // All running tasks should have the matching attribute
-            matches.size == allPlaced.size
-        case Operator.GROUP_BY =>
-          checkGroupBy(getValueString(attr.get), groupFunc)
-        case Operator.MAX_PER =>
-          checkMaxPer(getValueString(attr.get), value.toInt, groupFunc)
-        case Operator.LIKE => checkLike
-        case Operator.UNLIKE => checkUnlike
-      }
-    }
-
-    @SuppressWarnings(Array("OptionGet"))
-    private def checkLike: Boolean = {
-      if (value.nonEmpty) {
-        getValueString(attr.get).matches(value)
-      } else {
-        log.warn("Error, value is required for LIKE operation")
-        false
-      }
-    }
-
-    @SuppressWarnings(Array("OptionGet"))
-    private def checkUnlike: Boolean = {
-      if (value.nonEmpty) {
-        !getValueString(attr.get).matches(value)
-      } else {
-        log.warn("Error, value is required for UNLIKE operation")
-        false
-      }
-    }
-
-    private def checkMissingAttribute = constraint.getOperator == Operator.UNLIKE
-
-    /**
-      * Filters running tasks by matching their attributes to this field & value.
-      */
-    private def matchTaskAttributes(allPlaced: Seq[Placed], field: String, value: String) =
-      allPlaced.filter {
-        _.attributes
-          .exists { y =>
-            y.getName == field &&
-              getValueString(y) == value
+    def checkConstraint(maybeOfferValue: Option[String], placedValue: Instance => Option[String]): Boolean = {
+      maybeOfferValue match {
+        case Some(offerValue) =>
+          constraint.getOperator match {
+            case Operator.LIKE => checkLike(offerValue)
+            case Operator.UNLIKE => checkUnlike(offerValue)
+            case Operator.UNIQUE => checkUnique(maybeOfferValue, placedValue)
+            case Operator.GROUP_BY => checkGroupBy(offerValue, placedValue)
+            case Operator.MAX_PER => checkMaxPer(offerValue, constraintValue.toInt, placedValue)
+            case Operator.CLUSTER => checkCluster(offerValue, placedValue)
+            case Operator.IS => offerValue == constraintValueAsScalar.fold(constraintValue)(decimalFormatter.format(_))
           }
+        case None =>
+          // Only unlike can be matched if this offer does not have the specified value
+          constraint.getOperator == Operator.UNLIKE
+      }
+    }
+
+    private def checkLike(offerValue: String): Boolean =
+      if (constraintValue.nonEmpty) {
+        offerValue.matches(constraintValue)
+      } else {
+        logger.warn("Error, value is required for LIKE operation")
+        false
+      }
+
+    private def checkUnlike(offerValue: String): Boolean =
+      if (constraintValue.nonEmpty) {
+        !offerValue.matches(constraintValue)
+      } else {
+        logger.warn("Error, value is required for UNLIKE operation")
+        false
       }
   }
 
-  def meetsConstraint(allPlaced: Seq[Placed], offer: Offer, constraint: Constraint): Boolean =
-    new ConstraintsChecker(allPlaced, offer, constraint).isMatch
+  def meetsConstraint(allInstance: Seq[Instance], offer: Offer, constraint: Constraint): Boolean =
+    new ConstraintsChecker(allInstance, offer, constraint).isMatch
 
   /**
     * Select instances to kill while maintaining the constraints of the application definition.
@@ -171,8 +216,7 @@ object Constraints {
     * @param toKillCount the expected number of instances to select for kill
     * @return the selected instances to kill. The number of instances will not exceed toKill but can be less.
     */
-  def selectInstancesToKill(
-    runSpec: RunSpec, runningInstances: Seq[Instance], toKillCount: Int): Seq[Instance] = {
+  def selectInstancesToKill(runSpec: RunSpec, runningInstances: Seq[Instance], toKillCount: Int): Seq[Instance] = {
 
     require(toKillCount <= runningInstances.size, "Can not kill more instances than running")
 
@@ -181,12 +225,9 @@ object Constraints {
 
     //currently, only the GROUP_BY operator is able to select instances to kill
     val distributions = runSpec.constraints.withFilter(_.getOperator == Operator.GROUP_BY).map { constraint =>
-      def groupFn(instance: Instance): Option[String] = constraint.getField match {
-        case "hostname" => Some(instance.agentInfo.host)
-        case field: String => instance.agentInfo.attributes.find(_.getName == field).map(getValueString)
-      }
+      val (_, placed) = readerForField(constraint.getField)
       val instanceGroups: Seq[Map[Instance.Id, Instance]] =
-        runningInstances.groupBy(groupFn).values.map(Instance.instancesById)(collection.breakOut)
+        runningInstances.groupBy(placed).values.iterator.map(Instance.instancesById).toSeq
       GroupByDistribution(constraint, instanceGroups)
     }
 
@@ -197,8 +238,9 @@ object Constraints {
     var flag = true
     while (flag && toKillInstances.size != toKillCount) {
       val tried = distributions
-        //sort all distributions in descending order based on distribution difference
-        .toSeq.sortBy(_.distributionDifference(toKillInstances))(Ordering.Int.reverse)
+      //sort all distributions in descending order based on distribution difference
+      .toSeq
+        .sortBy(_.distributionDifference(toKillInstances))(Ordering.Int.reverse)
         //select instances to kill (without already selected ones)
         .flatMap(_.findInstancesToKill(toKillInstances)) ++
         //fallback: if the distributions did not select a instance, choose one of the not chosen ones
@@ -215,19 +257,17 @@ object Constraints {
     }
 
     //log the selected instances and why they were selected
-    if (log.isInfoEnabled) {
-      val instanceDesc = toKillInstances.values.map { instance =>
-        val attrs = instance.agentInfo.attributes.map(a => s"${a.getName}=${getValueString(a)}").mkString(", ")
-        s"${instance.instanceId} host:${instance.agentInfo.host} attrs:$attrs"
-      }.mkString("Selected Tasks to kill:\n", "\n", "\n")
-      val distDesc = distributions.map { d =>
-        val (before, after) = (d.distributionDifference(), d.distributionDifference(toKillInstances))
-        s"${d.constraint.getField} changed from: $before to $after"
-      }.mkString("Selected Constraint diff changed:\n", "\n", "\n")
-      log.info(s"$instanceDesc$distDesc")
-    }
+    val instanceDesc = toKillInstances.values.map { instance =>
+      val attrs = instance.attributes.map(a => s"${a.getName}=${getValueString(a)}").mkString(", ")
+      s"${instance.instanceId} host:${instance.agentInfo.map(_.host).getOrElse("unknown")} attrs:$attrs"
+    }.mkString("Selected Tasks to kill:\n", "\n", "\n")
+    val distDesc = distributions.map { d =>
+      val (before, after) = (d.distributionDifference(), d.distributionDifference(toKillInstances))
+      s"${d.constraint.getField} changed from: $before to $after"
+    }.mkString("Selected Constraint diff changed:\n", "\n", "\n")
+    logger.info(s"$instanceDesc$distDesc")
 
-    toKillInstances.values.to[Seq]
+    toKillInstances.values.to(Seq)
   }
 
   /**
@@ -246,7 +286,7 @@ object Constraints {
         /* even distributed */
         Seq.empty
       } else {
-        updated.maxBy(_._1)._2.flatMap(_.map { case (_, instance) => instance })(collection.breakOut)
+        updated.maxBy(_._1)._2.iterator.flatMap(_.map { case (_, instance) => instance }).toSeq
       }
     }
 

@@ -1,18 +1,27 @@
 package mesosphere.marathon
 package core.appinfo
 
+import java.time.{OffsetDateTime, ZoneOffset}
+
 import mesosphere.UnitTest
-import mesosphere.marathon.core.base.ConstantClock
+import mesosphere.marathon.core.appinfo.impl.TaskForStatistics
 import mesosphere.marathon.core.health.Health
 import mesosphere.marathon.core.instance.Instance.AgentInfo
-import mesosphere.marathon.core.instance.{ Instance, LegacyAppInstance, TestTaskBuilder }
-import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.state.{ PathId, Timestamp, UnreachableStrategy, VersionInfo }
+import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder, TestTaskBuilder}
+import mesosphere.marathon.state.{AbsolutePathId, Timestamp, UnreachableStrategy, VersionInfo}
 import play.api.libs.json.Json
 
 import scala.concurrent.duration._
 
 class TaskStatsByVersionTest extends UnitTest {
+
+  private[this] def taskStatsForSomeTasks(
+      now: Timestamp,
+      instances: Seq[Instance],
+      statuses: Map[Instance.Id, Seq[Health]]
+  ): Option[raml.TaskStats] = {
+    TaskStats.forSomeTasks(TaskForStatistics.forInstances(now, instances, statuses))
+  }
 
   "TaskStatsByVersion" should {
     "no tasks" in {
@@ -26,11 +35,11 @@ class TaskStatsByVersionTest extends UnitTest {
       )
       Then("we get none")
       stats should be(
-        TaskStatsByVersion(
-          maybeStartedAfterLastScaling = None,
-          maybeWithLatestConfig = None,
-          maybeWithOutdatedConfig = None,
-          maybeTotalSummary = None
+        raml.TaskStatsByVersion(
+          startedAfterLastScaling = None,
+          withLatestConfig = None,
+          withOutdatedConfig = None,
+          totalSummary = None
         )
       )
     }
@@ -50,42 +59,36 @@ class TaskStatsByVersionTest extends UnitTest {
         runningInstanceStartedAt(intermediaryScalingAt, 2.seconds)
       ) ++ afterLastScalingTasks
 
-      val tasks: Seq[Instance] = outdatedInstances ++ afterLastConfigChangeTasks
+      val instances: Seq[Instance] = outdatedInstances ++ afterLastConfigChangeTasks
       val statuses = Map.empty[Instance.Id, Seq[Health]]
 
       When("calculating stats")
       val stats = TaskStatsByVersion(
         now = now,
         versionInfo = versionInfo,
-        instances = tasks,
+        instances = instances,
         statuses = statuses
       )
       Then("we get the correct stats")
-      import mesosphere.marathon.api.v2.json.Formats._
-      withClue(Json.prettyPrint(Json.obj("stats" -> stats, "tasks" -> tasks))) {
-        stats.maybeWithOutdatedConfig should not be empty
-        stats.maybeWithLatestConfig should not be empty
-        stats.maybeStartedAfterLastScaling should not be empty
-        stats.maybeTotalSummary should not be empty
-
-        stats.maybeWithOutdatedConfig should be(TaskStats.forSomeTasks(now, outdatedInstances, statuses))
-        stats.maybeWithLatestConfig should be(TaskStats.forSomeTasks(now, afterLastConfigChangeTasks, statuses))
-        stats.maybeStartedAfterLastScaling should be(TaskStats.forSomeTasks(now, afterLastScalingTasks, statuses))
-        stats.maybeTotalSummary should be(TaskStats.forSomeTasks(now, tasks, statuses))
+      withClue(Json.prettyPrint(Json.obj("stats" -> stats.toString, "tasks" -> instances.map(state.Instance.fromCoreInstance)))) {
+        stats.withOutdatedConfig.value.stats should be(taskStatsForSomeTasks(now, outdatedInstances, statuses).value)
+        stats.withLatestConfig.value.stats should be(taskStatsForSomeTasks(now, afterLastConfigChangeTasks, statuses).value)
+        stats.startedAfterLastScaling.value.stats should be(taskStatsForSomeTasks(now, afterLastScalingTasks, statuses).value)
+        stats.totalSummary.value.stats should be(taskStatsForSomeTasks(now, instances, statuses).value)
 
         stats should be(
-          TaskStatsByVersion(
-            maybeStartedAfterLastScaling = TaskStats.forSomeTasks(now, afterLastScalingTasks, statuses),
-            maybeWithLatestConfig = TaskStats.forSomeTasks(now, afterLastConfigChangeTasks, statuses),
-            maybeWithOutdatedConfig = TaskStats.forSomeTasks(now, outdatedInstances, statuses),
-            maybeTotalSummary = TaskStats.forSomeTasks(now, tasks, statuses)
+          raml.TaskStatsByVersion(
+            startedAfterLastScaling = taskStatsForSomeTasks(now, afterLastScalingTasks, statuses).map(raml.Stats(_)),
+            withLatestConfig = taskStatsForSomeTasks(now, afterLastConfigChangeTasks, statuses).map(raml.Stats(_)),
+            withOutdatedConfig = taskStatsForSomeTasks(now, outdatedInstances, statuses).map(raml.Stats(_)),
+            totalSummary = taskStatsForSomeTasks(now, instances, statuses).map(raml.Stats(_))
           )
         )
       }
 
     }
   }
-  private[this] val now: Timestamp = ConstantClock().now()
+  private[this] val now: Timestamp = Timestamp(OffsetDateTime.of(2015, 4, 9, 12, 30, 0, 0, ZoneOffset.UTC))
   private val lastScalingAt: Timestamp = now - 10.seconds
   private val intermediaryScalingAt: Timestamp = now - 20.seconds
   private val lastConfigChangeAt: Timestamp = now - 100.seconds
@@ -95,16 +98,14 @@ class TaskStatsByVersionTest extends UnitTest {
     lastScalingAt = lastScalingAt,
     lastConfigChangeAt = lastConfigChangeAt
   )
-  val appId = PathId("/test")
-  private[this] def newTaskId(): Task.Id = {
-    // TODO(PODS): this relied on incremental taskIds before and might be broken
-    Task.Id.forRunSpec(appId)
-  }
+  val appId = AbsolutePathId("/test")
+  private[this] def newInstanceId(): Instance.Id = Instance.Id.forRunSpec(appId)
+
   private[this] def runningInstanceStartedAt(version: Timestamp, startingDelay: FiniteDuration): Instance = {
     val startedAt = (version + startingDelay).millis
-    val agentInfo = AgentInfo(host = "host", agentId = Some("agent"), attributes = Nil)
-    LegacyAppInstance(
-      TestTaskBuilder.Helper.runningTask(newTaskId(), appVersion = version, startedAt = startedAt),
+    val agentInfo = AgentInfo(host = "host", agentId = Some("agent"), region = None, zone = None, attributes = Nil)
+    TestInstanceBuilder.fromTask(
+      TestTaskBuilder.Helper.runningTask(newInstanceId(), appVersion = version, startedAt = startedAt),
       agentInfo,
       unreachableStrategy = UnreachableStrategy.default()
     )

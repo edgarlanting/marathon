@@ -3,22 +3,22 @@ package io
 
 import java.io.FileInputStream
 import java.security.KeyStore
-import java.security.cert.{ CertificateException, X509Certificate }
-import javax.net.ssl.{ SSLContext, TrustManager, TrustManagerFactory, X509TrustManager }
+import java.security.cert.{CertificateException, X509Certificate}
+import javax.net.ssl.{SSLContext, TrustManager, TrustManagerFactory, X509TrustManager}
 
 /**
   * Util for create SSLContext objects.
   */
-@SuppressWarnings(Array("NullParameter", "IsInstanceOf", "AsInstanceOf"))
 object SSLContextUtil {
 
   /**
     * Create an SSLContext which accepts the certificates in the given key store (if any).
     */
-  def createSSLContext(keyStoreOpt: Option[String], passwordOpt: Option[String]): SSLContext = keyStoreOpt match {
-    case Some(keystorePath) => createSSLContext(keystorePath, passwordOpt)
-    case None => SSLContext.getDefault
-  }
+  def createSSLContext(keyStoreOpt: Option[String], passwordOpt: Option[String]): SSLContext =
+    keyStoreOpt match {
+      case Some(keystorePath) => createSSLContext(keystorePath, passwordOpt)
+      case None => SSLContext.getDefault
+    }
 
   private[this] def createSSLContext(keyStorePath: String, passwordOpt: Option[String]): SSLContext = {
     def getX509TrustManager(tmf: TrustManagerFactory): X509TrustManager = {

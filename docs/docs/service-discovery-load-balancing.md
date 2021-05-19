@@ -10,9 +10,12 @@ There are several ways to do this:
 
 * [Mesos-DNS](https://github.com/mesosphere/mesos-dns) provides service discovery through the domain name system ([DNS](http://en.wikipedia.org/wiki/Domain_Name_System)).
 * [Marathon-lb](https://github.com/mesosphere/marathon-lb) provides port-based service discovery using HAProxy, a lightweight TCP/HTTP proxy.
-* [haproxy-marathon-bridge](https://github.com/mesosphere/marathon/blob/master/examples/haproxy-marathon-bridge) *(DEPRECATED)* is an example script that configures a local HAProxy installation.
 
 For a detailed description of how ports work in Marathon, see [Networking](networking.html).
+
+**Note:** While Marathon accepts dots in application names, names with dots can prevent proper service discovery
+behavior.
+If you intend to use a service discovery mechanism, you should not put dots in your application name.
 
 ## Mesos-DNS
 
@@ -21,10 +24,36 @@ Mesos-DNS generates an SRV record for each Mesos task (including Marathon applic
 Mesos-DNS is particularly useful when:
 
 * apps are launched through multiple frameworks (not just Marathon).
-* you are using an IP per container solution like [Project Calico](http://www.projectcalico.org/).
+* you are using an IP per container solution like [Project Calico](https://www.projectcalico.org/).
 * you use random host port assignments in Marathon.
 
 See the Mesos-DNS [documentation and tutorials page](http://mesosphere.github.io/mesos-dns/) for further information.
+
+### Service name length limitations
+According to RFC 1035 DNS labels are limited to 63 characters. 
+Mesos-DNS will append a random 9-character long string to your service name. This means that your service name length 
+must be less than or equal to 54 characters in order to have SRV records generated correctly.
+
+To check that your SRV records were successfully generated, you can use `dig` command, for example:
+```text
+dig _nginx-12345._tcp.marathon.mesos SRV
+```
+Correct output will look like this:
+```text
+;; QUESTION SECTION:
+;_nginx-12345._tcp.marathon.mesos. IN SRV
+
+;; ANSWER SECTION:
+_nginx-12345._tcp.marathon.mesos. 60 IN SRV 0 0 80 nginx-12345-eq1m3-s1.marathon.mesos.
+_nginx-12345._tcp.marathon.mesos. 60 IN SRV 0 0 80 nginx-12345-9umtc-s1.marathon.mesos.
+_nginx-12345._tcp.marathon.mesos. 60 IN SRV 0 0 80 nginx-12345-4c3em-s1.marathon.mesos.
+
+;; ADDITIONAL SECTION:
+nginx-12345-9umtc-s1.marathon.mesos. 60 IN A 10.0.6.43
+nginx-12345-4c3em-s1.marathon.mesos. 60 IN A 10.0.6.43
+nginx-12345-eq1m3-s1.marathon.mesos. 60 IN A 10.0.6.43
+```
+
 
 ## Marathon-lb
 
@@ -34,10 +63,4 @@ Marathon-lb is a Dockerized application that includes both HAProxy an applicatio
 
 When using marathon-lb, note that it is not necessary to set `requirePorts` to `true`, as described in the [networking documentation](networking.html).
 
-For more information, see the [Marathon-lb repository](https://github.com/mesosphere/marathon-lb) or refer to the [marathon-lb documentation on the Mesosphere site](https://dcos.io/docs/latest/usage/service-discovery/marathon-lb/).
-
-## haproxy-marathon-bridge (DEPRECATED)
-
-Marathon ships with a simple shell script called `haproxy-marathon-bridge`, which uses Marathon's REST API to create a config file for HAProxy. The `haproxy-marathon-bridge` provides minimal functionality and is easier to understand for beginners or can serve as a starting point for a custom implementation. Note that this script is now deprecated and should not be used as-is in production. For production use, consider using Marathon-lb, above.
-
-For a full list of HAProxy configurations, consult [the HAProxy configuration docs](http://cbonte.github.io/haproxy-dconv/configuration-1.5.html).
+For more information, see the [Marathon-lb repository](https://github.com/mesosphere/marathon-lb) or refer to the [marathon-lb documentation on the Mesosphere site](https://docs.mesosphere.com/services/marathon-lb/).

@@ -1,6 +1,6 @@
 package mesosphere.util.state
 
-import mesosphere.marathon.state.{ MarathonState, Timestamp }
+import mesosphere.marathon.state.{MarathonState, Timestamp}
 import org.apache.mesos.Protos
 import org.apache.mesos.Protos.FrameworkID
 
@@ -22,4 +22,3 @@ object FrameworkId {
   def fromProto(message: FrameworkID): FrameworkId = new FrameworkId(message.getValue)
   def fromProtoBytes(bytes: Array[Byte]): FrameworkId = fromProto(Protos.FrameworkID.parseFrom(bytes))
 }
-

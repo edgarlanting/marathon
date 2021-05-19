@@ -3,37 +3,37 @@ package mesosphere.marathon
 import akka.Done
 import akka.actor.Props
 import akka.event.EventStream
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Keep, Source}
+import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.testkit._
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.MarathonSchedulerActor._
 import mesosphere.marathon.core.deployment._
-import mesosphere.marathon.core.deployment.impl.{ DeploymentManagerActor, DeploymentManagerDelegate }
-import mesosphere.marathon.core.election.{ ElectionService, LocalLeadershipEvent }
+import mesosphere.marathon.core.deployment.impl.{DeploymentManagerActor, DeploymentManagerDelegate}
+import mesosphere.marathon.core.election.{ElectionService, LeadershipTransition}
 import mesosphere.marathon.core.event._
 import mesosphere.marathon.core.health.HealthCheckManager
 import mesosphere.marathon.core.history.impl.HistoryActor
-import mesosphere.marathon.core.instance.update.InstanceChangedEventsGenerator
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
-import mesosphere.marathon.core.launcher.impl.LaunchQueueTestHelper
+import mesosphere.marathon.core.instance.{Goal, GoalChangeReason, Instance, TestInstanceBuilder}
 import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.core.readiness.ReadinessCheckExecutor
 import mesosphere.marathon.core.task.KillServiceMock
-import mesosphere.marathon.core.task.bus.TaskStatusUpdateTestHelper
 import mesosphere.marathon.core.task.tracker.InstanceTracker
-import mesosphere.marathon.state.PathId._
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.metrics.dummy.DummyMetrics
 import mesosphere.marathon.state._
-import mesosphere.marathon.storage.repository.{ DeploymentRepository, FrameworkIdRepository, GroupRepository, TaskFailureRepository }
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.storage.repository.{DeploymentRepository, FrameworkIdRepository, GroupRepository, TaskFailureRepository}
+import mesosphere.marathon.stream.Subject
 import mesosphere.marathon.test.GroupCreation
-import org.apache.mesos.Protos.{ Status, TaskStatus }
+import org.apache.mesos.Protos.{Status, TaskStatus}
 import org.apache.mesos.SchedulerDriver
-import org.mockito
+import org.mockito.{Matchers => M}
 import org.scalatest.concurrent.Eventually
 
 import scala.collection.immutable.Set
 import scala.concurrent.duration._
-import scala.concurrent.{ ExecutionContext, Future, Promise }
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.jdk.CollectionConverters._
 
 class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with GroupCreation with Eventually {
 
@@ -49,43 +49,54 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
   "MarathonSchedulerActor" should {
     "RecoversDeploymentsAndReconcilesHealthChecksOnStart" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "test-app".toPath, instances = 1)
+      val app = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       eventually {
         verify(hcManager).reconcile(Seq(app))
+        ()
       }
       verify(deploymentRepo, times(1)).all()
     }
 
     "Reconcile orphan instance of unknown app - instance should be killed" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "/deleted-app".toPath, instances = 1)
+      val app = AppDefinition(id = AbsolutePathId("/deleted-app"), instances = 1, role = "*")
       val orphanedInstance = TestInstanceBuilder.newBuilder(app.id).addTaskRunning().getInstance()
 
       groupRepo.root() returns Future.successful(createRootGroup())
-      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(InstanceTracker.InstancesBySpec.of(InstanceTracker.SpecInstances.forInstances(app.id, Seq(orphanedInstance))))
+      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(
+        InstanceTracker.InstancesBySpec.forInstances(Seq(orphanedInstance))
+      )
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! ReconcileTasks
 
       expectMsg(TasksReconciled)
 
       eventually {
-        killService.killed should contain(orphanedInstance.instanceId)
+        verify(instanceTracker).setGoal(orphanedInstance.instanceId, Goal.Decommissioned, GoalChangeReason.Orphaned)
+        ()
       }
     }
 
     "Terminal tasks should not be submitted in reconciliation" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "/test-app".toPath, instances = 1)
-      val instance = TestInstanceBuilder.newBuilder(app.id).addTaskUnreachable(containerName = Some("unreachable")).addTaskRunning().addTaskGone(containerName = Some("gone")).getInstance()
+      val app = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
+      val instance = TestInstanceBuilder
+        .newBuilder(app.id)
+        .addTaskUnreachable(containerName = Some("unreachable"))
+        .addTaskRunning()
+        .addTaskGone(containerName = Some("gone"))
+        .getInstance()
 
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
-      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(InstanceTracker.InstancesBySpec.of(InstanceTracker.SpecInstances.forInstances(app.id, Seq(instance))))
+      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(
+        InstanceTracker.InstancesBySpec.forInstances(Seq(instance))
+      )
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! ReconcileTasks
 
       expectMsg(TasksReconciled)
@@ -102,8 +113,9 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
 
     "Terminal tasks should not be submitted in reconciliation - Instance with only terminal tasks" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "/test-app".toPath, instances = 1)
-      val instance = TestInstanceBuilder.newBuilder(app.id)
+      val app = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
+      val instance = TestInstanceBuilder
+        .newBuilder(app.id)
         .addTaskError(containerName = Some("error"))
         .addTaskFailed(containerName = Some("failed"))
         .addTaskFinished(containerName = Some("finished"))
@@ -114,9 +126,11 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         .getInstance()
 
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
-      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(InstanceTracker.InstancesBySpec.of(InstanceTracker.SpecInstances.forInstances("nope".toPath, Seq(instance))))
+      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(
+        InstanceTracker.InstancesBySpec.forInstances(Seq(instance))
+      )
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! ReconcileTasks
 
       expectMsg(TasksReconciled)
@@ -127,8 +141,9 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
 
     "Terminal tasks should not be submitted in reconciliation - Instance with all kind of tasks status" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "/test-app".toPath, instances = 1)
-      val instance = TestInstanceBuilder.newBuilder(app.id)
+      val app = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
+      val instance = TestInstanceBuilder
+        .newBuilder(app.id)
         .addTaskError(containerName = Some("error"))
         .addTaskFailed(containerName = Some("failed"))
         .addTaskFinished(containerName = Some("finished"))
@@ -136,8 +151,6 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         .addTaskGone(containerName = Some("gone"))
         .addTaskDropped(containerName = Some("dropped"))
         .addTaskUnknown(containerName = Some("unknown"))
-        .addTaskReserved(containerName = Some("reserved"))
-        .addTaskCreated(containerName = Some("created"))
         .addTaskKilling(containerName = Some("killing"))
         .addTaskRunning(containerName = Some("running"))
         .addTaskStaging(containerName = Some("staging"))
@@ -146,18 +159,21 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         .getInstance()
 
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
-      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(InstanceTracker.InstancesBySpec.of(InstanceTracker.SpecInstances.forInstances("nope".toPath, Seq(instance))))
+      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(
+        InstanceTracker.InstancesBySpec.forInstances(Seq(instance))
+      )
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! ReconcileTasks
 
       expectMsg(TasksReconciled)
 
       val nonTerminalTasks = instance.tasksMap.values.filter(!_.task.isTerminal)
-      assert(nonTerminalTasks.size == 7, "We should have 7 non-terminal tasks")
+      assert(nonTerminalTasks.size == 5, "We should have 5 non-terminal tasks")
 
       val expectedStatus: java.util.Collection[TaskStatus] = TaskStatusCollector.collectTaskStatusFor(Seq(instance)).asJava
-      assert(expectedStatus.size() == 6, "We should have 6 task status, because Reserved do not have a mesosStatus")
+
+      assert(expectedStatus.size() == 5, "We should have 5 task statuses")
 
       eventually {
         driver.reconcileTasks(expectedStatus)
@@ -167,115 +183,90 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
       }
     }
 
+    "Created tasks should not be submitted in reconciliation" in withFixture() { f =>
+      import f._
+      val app = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
+      val instance = TestInstanceBuilder
+        .newBuilder(app.id)
+        .addTaskProvisioned(containerName = Some("created"))
+        .getInstance()
+
+      groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
+      instanceTracker.instancesBySpec()(any[ExecutionContext]) returns Future.successful(
+        InstanceTracker.InstancesBySpec.forInstances(Seq(instance))
+      )
+
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
+      schedulerActor ! ReconcileTasks
+
+      expectMsg(TasksReconciled)
+
+      val tasksToReconcile: java.util.Collection[TaskStatus] = TaskStatusCollector.collectTaskStatusFor(Seq(instance)).asJava
+      assert(tasksToReconcile.isEmpty, "Created task should not be submited for reconciliation")
+    }
+
     "ScaleApps" in withFixture() { f =>
       import f._
-      val app: AppDefinition = AppDefinition(id = "/test-app".toPath, instances = 1)
+      val app: AppDefinition = AppDefinition(id = AbsolutePathId("/test-app"), instances = 1, cmd = Some("sleep"), role = "*")
 
       val instances = Seq(TestInstanceBuilder.newBuilder(app.id).addTaskRunning().getInstance())
 
-      queue.get(app.id) returns Some(LaunchQueueTestHelper.zeroCounts)
-      instanceTracker.specInstances(mockito.Matchers.eq("nope".toPath))(mockito.Matchers.any[ExecutionContext]) returns Future.successful(instances)
+      instanceTracker.specInstances(M.eq(AbsolutePathId("/nope")), M.eq(false))(M.any[ExecutionContext]) returns Future.successful(
+        instances
+      )
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! ScaleRunSpecs
 
       eventually {
         verify(queue).add(app, 1)
+        ()
       }
     }
 
     "ScaleApp" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = "test-app".toPath, instances = 1)
+      val app = AppDefinition(id = AbsolutePathId("/test-app-scale"), instances = 1, cmd = Some("sleep"), role = "*")
 
-      queue.get(app.id) returns Some(LaunchQueueTestHelper.zeroCounts)
       groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
-      schedulerActor ! ScaleRunSpec("test-app".toPath)
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
+      schedulerActor ! ScaleRunSpec(AbsolutePathId("/test-app-scale"))
 
       eventually {
         verify(queue).add(app, 1)
+        ()
       }
 
       expectMsg(RunSpecScaled(app.id))
     }
 
-    "Kill tasks with scaling" in withFixture() { f =>
-      import f._
-      val app = AppDefinition(id = "/test-app".toPath, instances = 1)
-      val instance = TestInstanceBuilder.newBuilder(app.id).addTaskStaged().getInstance()
-      val failedInstance = TaskStatusUpdateTestHelper.failed(instance).updatedInstance
-      val events = InstanceChangedEventsGenerator.events(
-        failedInstance, task = Some(failedInstance.appTask), now = Timestamp.now(), previousCondition = Some(instance.state.condition))
-
-      killService.customStatusUpdates.put(instance.instanceId, events)
-
-      queue.get(app.id) returns Some(LaunchQueueTestHelper.zeroCounts)
-      groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
-
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
-      schedulerActor ! KillTasks(app.id, Seq(instance))
-
-      expectMsg(TasksKilled(app.id, Seq(instance.instanceId)))
-
-      val mesosStatusUpdateEvent: MesosStatusUpdateEvent = events.collectFirst {
-        case event: MesosStatusUpdateEvent => event
-      }.getOrElse {
-        fail(s"$events did not contain a MesosStatusUpdateEvent")
-      }
-      val Some(taskFailureEvent) = TaskFailure.FromMesosStatusUpdateEvent(mesosStatusUpdateEvent)
-
-      eventually {
-        verify(taskFailureEventRepository, times(1)).store(taskFailureEvent)
-      }
-      // KillTasks does no longer scale
-      killService.numKilled shouldBe 1 // 1 kill was scheduled a few lines above
-    }
-
-    "Kill tasks" in withFixture() { f =>
-      import f._
-      val app = AppDefinition(id = "/test-app".toPath, instances = 1)
-      val instanceA = TestInstanceBuilder.newBuilderWithLaunchedTask(app.id).getInstance()
-
-      queue.get(app.id) returns Some(LaunchQueueTestHelper.zeroCounts)
-      groupRepo.root() returns Future.successful(createRootGroup(apps = Map(app.id -> app)))
-
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
-      schedulerActor ! KillTasks(app.id, Seq(instanceA))
-
-      expectMsg(TasksKilled(app.id, List(instanceA.instanceId)))
-
-      eventually {
-        verify(queue).add(app, 1)
-      }
-    }
-
     "Deployment" in withFixture() { f =>
       import f._
       val app = AppDefinition(
-        id = PathId("app1"),
+        id = AbsolutePathId("/foo/app1"),
         cmd = Some("cmd"),
         instances = 2,
         upgradeStrategy = UpgradeStrategy(0.5),
-        versionInfo = VersionInfo.forNewConfig(Timestamp(0))
+        versionInfo = VersionInfo.forNewConfig(Timestamp(0)),
+        role = "*"
       )
       val probe = TestProbe()
-      val origGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(app.id -> app))))
+      val origGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(app.id -> app))))
 
       val appNew = app.copy(
         cmd = Some("cmd new"),
         versionInfo = VersionInfo.forNewConfig(Timestamp(1000))
       )
 
-      val targetGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(appNew.id -> appNew))))
+      val targetGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(appNew.id -> appNew))))
 
       val plan = DeploymentPlan("foo", origGroup, targetGroup, Nil, Timestamp.now())
 
       system.eventStream.subscribe(probe.ref, classOf[UpgradeEvent])
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! Deploy(plan)
 
       expectMsg(DeploymentStarted(plan))
@@ -289,30 +280,28 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
     "Deployment resets rate limiter for affected apps" in withFixture() { f =>
       import f._
       val app = AppDefinition(
-        id = PathId("/app1"),
+        id = AbsolutePathId("/foo/app1"),
         cmd = Some("cmd"),
         instances = 2,
         upgradeStrategy = UpgradeStrategy(0.5),
-        versionInfo = VersionInfo.forNewConfig(Timestamp(0))
+        versionInfo = VersionInfo.forNewConfig(Timestamp(0)),
+        role = "*"
       )
       val probe = TestProbe()
       val instance = TestInstanceBuilder.newBuilder(app.id).addTaskRunning().getInstance()
-      val origGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(app.id -> app))))
-      val targetGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"))))
+      val origGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(app.id -> app))))
+      val targetGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"))))
 
       val plan = DeploymentPlan("d2", origGroup, targetGroup, List(DeploymentStep(List(StopApplication(app)))), Timestamp.now())
 
-      f.queue.asyncPurge(app.id) returns Future.successful(Done)
-
-      instanceTracker.specInstances(mockito.Matchers.eq(app.id))(any[ExecutionContext]) returns Future.successful(Seq(instance))
+      instanceTracker.specInstances(M.eq(app.id), M.eq(false))(any[ExecutionContext]) returns Future.successful(Seq(instance))
       system.eventStream.subscribe(probe.ref, classOf[UpgradeEvent])
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! Deploy(plan)
 
       expectMsg(DeploymentStarted(plan))
 
-      verify(f.queue, timeout(1000)).asyncPurge(app.id)
       verify(f.queue, timeout(1000)).resetDelay(app.copy(instances = 0))
 
       system.eventStream.unsubscribe(probe.ref)
@@ -321,19 +310,20 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
     "Deployment fail to acquire lock" in withFixture() { f =>
       import f._
       val app = AppDefinition(
-        id = PathId("app1"),
+        id = AbsolutePathId("/foo/app1"),
         cmd = Some("cmd"),
         instances = 2,
         upgradeStrategy = UpgradeStrategy(0.5),
-        versionInfo = VersionInfo.forNewConfig(Timestamp(0))
+        versionInfo = VersionInfo.forNewConfig(Timestamp(0)),
+        role = "*"
       )
-      val rootGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(app.id -> app))))
+      val rootGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(app.id -> app))))
 
       val plan = DeploymentPlan(createRootGroup(), rootGroup, id = Some("d3"))
 
       groupRepo.root() returns Future.successful(rootGroup)
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! Deploy(plan)
 
       expectMsgType[DeploymentStarted]
@@ -349,13 +339,14 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
     "Restart deployments after failover" in withFixture() { f =>
       import f._
       val app = AppDefinition(
-        id = PathId("app1"),
+        id = AbsolutePathId("/foo/app1"),
         cmd = Some("cmd"),
         instances = 2,
         upgradeStrategy = UpgradeStrategy(0.5),
-        versionInfo = VersionInfo.forNewConfig(Timestamp(0))
+        versionInfo = VersionInfo.forNewConfig(Timestamp(0)),
+        role = "*"
       )
-      val rootGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(app.id -> app))))
+      val rootGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(app.id -> app))))
 
       val plan = DeploymentPlan(createRootGroup(), rootGroup, id = Some("d4"))
 
@@ -363,7 +354,7 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
       deploymentRepo.all() returns Source.single(plan)
       deploymentRepo.store(plan) returns Future.successful(Done)
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! Deploy(plan)
 
       // This indicates that the deployment is already running,
@@ -375,14 +366,20 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
 
     "Forced deployment" in withFixture() { f =>
       import f._
-      val app = AppDefinition(id = PathId("app1"), cmd = Some("cmd"), instances = 2, upgradeStrategy = UpgradeStrategy(0.5))
-      val rootGroup = createRootGroup(groups = Set(createGroup(PathId("/foo/bar"), Map(app.id -> app))))
+      val app = AppDefinition(
+        id = AbsolutePathId("/foo/app1"),
+        cmd = Some("cmd"),
+        instances = 2,
+        upgradeStrategy = UpgradeStrategy(0.5),
+        role = "*"
+      )
+      val rootGroup = createRootGroup(groups = Set(createGroup(AbsolutePathId("/foo"), Map(app.id -> app))))
 
       val plan = DeploymentPlan(createRootGroup(), rootGroup, id = Some("d1"))
 
       groupRepo.root() returns Future.successful(rootGroup)
 
-      schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+      leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
       schedulerActor ! Deploy(plan)
 
       expectMsgType[DeploymentStarted](10.seconds)
@@ -401,7 +398,7 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         actions.reconcileTasks(any) returns reconciliationPromise.future
         groupRepo.root() returns Future.successful(createRootGroup())
 
-        schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+        leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
 
         schedulerActor ! MarathonSchedulerActor.ReconcileTasks // linter:ignore
         schedulerActor ! MarathonSchedulerActor.ReconcileTasks // linter:ignore
@@ -426,7 +423,7 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         actions.reconcileTasks(any) returns Future.successful(Status.DRIVER_RUNNING)
         groupRepo.root() returns Future.successful(createRootGroup())
 
-        schedulerActor ! LocalLeadershipEvent.ElectedAsLeader
+        leadershipTransitionInput.offer(LeadershipTransition.ElectedAsLeaderAndReady)
 
         schedulerActor ! MarathonSchedulerActor.ReconcileTasks
         expectMsg(MarathonSchedulerActor.TasksReconciled)
@@ -454,23 +451,29 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
     val hcManager: HealthCheckManager = mock[HealthCheckManager]
 
     val instanceTracker: InstanceTracker = mock[InstanceTracker]
-    instanceTracker.countLaunchedSpecInstancesSync(any[PathId]) returns 0
-    instanceTracker.specInstances(any)(any) returns Future.successful(Seq.empty[Instance])
-    instanceTracker.specInstancesSync(any) returns Seq.empty[Instance]
-
+    instanceTracker.specInstances(any, M.eq(false))(any) returns Future.successful(Seq.empty[Instance])
+    instanceTracker.setGoal(any, any, any) returns Future.successful(Done)
+    instanceTracker.instanceUpdates returns Source.empty
     val killService = new KillServiceMock(system)
 
     val queue: LaunchQueue = mock[LaunchQueue]
-    queue.get(any[PathId]) returns None
+    queue.add(any, any) returns Future.successful(Done)
 
     val frameworkIdRepo: FrameworkIdRepository = mock[FrameworkIdRepository]
     val driver: SchedulerDriver = mock[SchedulerDriver]
     val holder: MarathonSchedulerDriverHolder = new MarathonSchedulerDriverHolder
     holder.driver = Some(driver)
     val taskFailureEventRepository: TaskFailureRepository = mock[TaskFailureRepository]
+    val (leadershipTransitionInput, leadershipTransitionEvents) = Source
+      .queue[LeadershipTransition](16, OverflowStrategy.fail)
+      .toMat(Subject(16, OverflowStrategy.fail))(Keep.both)
+      .run
     val electionService: ElectionService = mock[ElectionService]
-    val schedulerActions: SchedulerActions = new SchedulerActions(
-      groupRepo, hcManager, instanceTracker, queue, new EventStream(system), killService)(system.dispatcher)
+    val schedulerActions: SchedulerActions =
+      new SchedulerActions(groupRepo, hcManager, instanceTracker, queue, new EventStream(system), killService)(
+        system.dispatcher,
+        ActorMaterializer()(system)
+      )
     val readinessCheckExecutor: ReadinessCheckExecutor = mock[ReadinessCheckExecutor]
     val historyActorProps: Props = Props(new HistoryActor(system.eventStream, taskFailureEventRepository))
 
@@ -479,16 +482,20 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
     conf.killBatchSize returns 100
     conf.deploymentManagerRequestDuration returns 1.seconds
 
-    val deploymentManagerActor = system.actorOf(DeploymentManagerActor.props(
-      instanceTracker,
-      killService,
-      queue,
-      schedulerActions,
-      hcManager,
-      system.eventStream,
-      readinessCheckExecutor,
-      deploymentRepo
-    ))
+    val metrics: Metrics = DummyMetrics
+
+    val deploymentManagerActor = system.actorOf(
+      DeploymentManagerActor.props(
+        metrics,
+        instanceTracker,
+        killService,
+        queue,
+        hcManager,
+        system.eventStream,
+        readinessCheckExecutor,
+        deploymentRepo
+      )
+    )
 
     val deploymentManager = new DeploymentManagerDelegate(conf, deploymentManagerActor)
 
@@ -503,7 +510,7 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
         killService,
         queue,
         holder,
-        electionService,
+        leadershipTransitionEvents,
         system.eventStream
       )
     )
@@ -518,4 +525,5 @@ class MarathonSchedulerActorTest extends AkkaUnitTest with ImplicitSender with G
       expectTerminated(deploymentManagerActor)
     }
   }
+
 }

@@ -1,0 +1,19 @@
+[[source]]
+name = "pypi"
+url = "https://pypi.python.org/simple"
+verify_ssl = true
+
+[requires]
+python_version = "3.6"
+
+[packages]
+aiohttp = "*"
+pytest-asyncio = "*"
+dcos-launch = {ref = "0aa9eaa1200b8a87a7d07fe4e13d552ef7410a04",git = "https://github.com/dcos/dcos-launch.git"}
+python-dateutil = "<2.7.0,>=2.1"
+dcos-test-utils = {ref = "d2903a23e8dbf009d0bba02f2a479e1e048416b5",git = "https://github.com/dcos/dcos-test-utils"}
+214ae30 = {editable = true,path = "../shakedown"}
+pytest = '==3.6.4'
+
+[dev-packages]
+"flake8" = "*"

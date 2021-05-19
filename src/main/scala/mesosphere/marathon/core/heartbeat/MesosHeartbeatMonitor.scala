@@ -1,13 +1,12 @@
 package mesosphere.marathon
 package core.heartbeat
 
-import java.util.{ Collections, UUID }
-import javax.inject.{ Inject, Named }
-
+import java.util.{Collections, UUID}
+import javax.inject.Named
 import akka.actor.ActorRef
+import com.typesafe.scalalogging.StrictLogging
 import org.apache.mesos.Protos._
-import org.apache.mesos.{ Scheduler, SchedulerDriver }
-import org.slf4j.LoggerFactory
+import org.apache.mesos.{Scheduler, SchedulerDriver}
 
 /**
   * @constructor create a mesos Scheduler decorator that intercepts callbacks from a mesos SchedulerDriver,
@@ -16,61 +15,55 @@ import org.slf4j.LoggerFactory
   * implementation.
   *
   * @param scheduler is the delegate scheduler implementation
-  * @param heartbeatActor is the receipient of generated Heartbeat.Message's
+  * @param heartbeatActor is the recipient of generated Heartbeat.Message's
   *
   * @see mesosphere.util.monitor.HeartbeatMonitor
   * @see org.apache.mesos.Scheduler
   * @see org.apache.mesos.SchedulerDriver
   */
-class MesosHeartbeatMonitor @Inject() (
-    @Named(MesosHeartbeatMonitor.BASE) scheduler: Scheduler,
-    @Named(ModuleNames.MESOS_HEARTBEAT_ACTOR) heartbeatActor: ActorRef
-) extends Scheduler {
+class MesosHeartbeatMonitor(scheduler: Scheduler, @Named(ModuleNames.MESOS_HEARTBEAT_ACTOR) heartbeatActor: ActorRef)
+    extends Scheduler
+    with StrictLogging {
 
   import MesosHeartbeatMonitor._
 
-  private[this] val log = LoggerFactory.getLogger(getClass.getName)
+  logger.info(s"Created Mesos heartbeat monitor for scheduler $scheduler")
 
-  log.debug(s"created mesos heartbeat monitor for scheduler $scheduler")
+  protected[marathon] def heartbeatReactor(driver: SchedulerDriver): Heartbeat.Reactor =
+    new Heartbeat.Reactor {
+      // virtualHeartbeatTasks is sent in a reconciliation message to mesos in order to force a
+      // predictable response: the master (if we're connected) will send back a TASK_LOST because
+      // the fake task ID and agent ID that we use will never actually exist in the cluster.
+      // this is part of a short-term workaround: will no longer be needed once marathon is ported
+      // to use the new mesos v1 http API.
+      private[this] val virtualHeartbeatTasks = Collections.singletonList(fakeHeartbeatStatus)
 
-  protected[marathon] def heartbeatReactor(driver: SchedulerDriver): Heartbeat.Reactor = new Heartbeat.Reactor {
-    // virtualHeartbeatTasks is sent in a reconciliation message to mesos in order to force a
-    // predictable response: the master (if we're connected) will send back a TASK_LOST because
-    // the fake task ID and agent ID that we use will never actually exist in the cluster.
-    // this is part of a short-term workaround: will no longer be needed once marathon is ported
-    // to use the new mesos v1 http API.
-    private[this] val virtualHeartbeatTasks = Collections.singletonList(fakeHeartbeatStatus)
-
-    override def onSkip(skipped: Int): Unit = {
-      // the first skip (skipped == 1) may be because there simply haven't been any offers or task status updates
-      // sent by the master within the heartbeat interval. that's completely normal, so we only log if skipped > 1
-      // because that means that we've prompted mesos via task reconciliation and it still hasn't responded in a
-      // timely manner.
-      if (skipped > 1) {
-        log.info(s"missed ${skipped - 1} expected heartbeat(s) from mesos master; possibly disconnected")
+      override def onSkip(skipped: Int): Unit = {
+        // the first skip (skipped == 1) may be because there simply haven't been any offers or task status updates
+        // sent by the master within the heartbeat interval. that's completely normal, so we only log if skipped > 1
+        // because that means that we've prompted mesos via task reconciliation and it still hasn't responded in a
+        // timely manner.
+        if (skipped > 1) {
+          logger.warn(s"Missed ${skipped - 1} expected heartbeat(s) from Mesos master; possibly disconnected")
+        }
+        logger.info("Prompting Mesos for a heartbeat via explicit task reconciliation")
+        driver.reconcileTasks(virtualHeartbeatTasks)
       }
-      log.debug("Prompting mesos for a heartbeat via explicit task reconciliation")
-      driver.reconcileTasks(virtualHeartbeatTasks)
+
+      override def onFailure(): Unit = {
+        logger.warn("Too many subsequent heartbeats missed; inferring disconnected from mesos master")
+        disconnected(driver)
+      }
     }
 
-    override def onFailure(): Unit = {
-      log.warn("Too many subsequent heartbeats missed; inferring disconnected from mesos master")
-      disconnected(driver)
-    }
-  }
-
-  override def registered(
-    driver: SchedulerDriver,
-    frameworkId: FrameworkID,
-    master: MasterInfo): Unit = {
-    log.debug("registered heartbeat monitor")
-    heartbeatActor ! Heartbeat.MessageActivate(heartbeatReactor(driver), sessionOf(driver))
+  override def registered(driver: SchedulerDriver, frameworkId: FrameworkID, master: MasterInfo): Unit = {
+    logger.info("Registered heartbeat monitor")
     scheduler.registered(driver, frameworkId, master)
   }
 
   override def reregistered(driver: SchedulerDriver, master: MasterInfo): Unit = {
-    log.debug("reregistered heartbeat monitor")
-    heartbeatActor ! Heartbeat.MessageActivate(heartbeatReactor(driver), sessionOf(driver))
+    logger.info("Re-registered heartbeat monitor")
+    activate(driver)
     scheduler.reregistered(driver, master)
   }
 
@@ -91,7 +84,7 @@ class MesosHeartbeatMonitor @Inject() (
     if (!isFakeHeartbeatUpdate(status)) {
       scheduler.statusUpdate(driver, status)
     } else {
-      log.debug("received fake heartbeat task-status update")
+      logger.info("Received fake heartbeat task-status update")
     }
   }
 
@@ -102,11 +95,7 @@ class MesosHeartbeatMonitor @Inject() (
       status.hasSlaveId && status.getSlaveId.getValue.startsWith(FAKE_AGENT_PREFIX) &&
       status.hasTaskId && status.getTaskId.getValue.startsWith(FAKE_TASK_PREFIX)
 
-  override def frameworkMessage(
-    driver: SchedulerDriver,
-    executor: ExecutorID,
-    slave: SlaveID,
-    message: Array[Byte]): Unit = {
+  override def frameworkMessage(driver: SchedulerDriver, executor: ExecutorID, slave: SlaveID, message: Array[Byte]): Unit = {
     heartbeatActor ! Heartbeat.MessagePulse
     scheduler.frameworkMessage(driver, executor, slave, message)
   }
@@ -114,8 +103,8 @@ class MesosHeartbeatMonitor @Inject() (
   override def disconnected(driver: SchedulerDriver): Unit = {
     // heartbeatReactor may have triggered this, but that's ok because if it did then
     // it's already "inactive", so this becomes a no-op
-    log.debug("disconnected heartbeat monitor")
-    heartbeatActor ! Heartbeat.MessageDeactivate(sessionOf(driver))
+    logger.info("Disconnected heartbeat monitor")
+    deactivate(driver)
     scheduler.disconnected(driver)
   }
 
@@ -124,27 +113,29 @@ class MesosHeartbeatMonitor @Inject() (
     scheduler.slaveLost(driver, slave)
   }
 
-  override def executorLost(
-    driver: SchedulerDriver,
-    executor: ExecutorID,
-    slave: SlaveID,
-    code: Int): Unit = {
+  override def executorLost(driver: SchedulerDriver, executor: ExecutorID, slave: SlaveID, code: Int): Unit = {
     heartbeatActor ! Heartbeat.MessagePulse
     scheduler.executorLost(driver, executor, slave, code)
   }
 
   override def error(driver: SchedulerDriver, message: String): Unit = {
     // errors from the driver are fatal (to the driver) so it should be safe to deactivate here because
-    // the marathon scheduler **should** either exit or else create a new driver instance and reregister.
-    log.debug("errored heartbeat monitor")
-    heartbeatActor ! Heartbeat.MessageDeactivate(sessionOf(driver))
+    // the marathon scheduler **should** either exit or else create a new driver instance and re-register.
+    logger.info("Errored heartbeat monitor")
+    deactivate(driver)
     scheduler.error(driver, message)
+  }
+
+  def activate(driver: SchedulerDriver): Unit = {
+    heartbeatActor ! Heartbeat.MessageActivate(heartbeatReactor(driver), sessionOf(driver))
+  }
+
+  def deactivate(driver: SchedulerDriver): Unit = {
+    heartbeatActor ! Heartbeat.MessageDeactivate(sessionOf(driver))
   }
 }
 
 object MesosHeartbeatMonitor {
-  final val BASE = "mesosHeartbeatMonitor.base"
-
   final val DEFAULT_HEARTBEAT_INTERVAL_MS = 15000L
   final val DEFAULT_HEARTBEAT_FAILURE_THRESHOLD = 5
 

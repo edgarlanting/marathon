@@ -1,8 +1,8 @@
 package mesosphere.marathon
 package core.leadership
 
-import akka.actor.{ ActorRef, ActorRefFactory, Props }
-import mesosphere.marathon.core.base.{ ActorsModule }
+import akka.actor.{ActorRef, ActorRefFactory, Props}
+import mesosphere.marathon.core.base.{ActorsModule}
 import mesosphere.marathon.test.Mockito
 
 /**
@@ -11,6 +11,7 @@ import mesosphere.marathon.test.Mockito
   * This simplifies tests.
   */
 object AlwaysElectedLeadershipModule extends Mockito {
+
   /**
     * Create a leadership module using the given actorSystem. The caller must shutdown the given actor system
     * itself after usage.
@@ -19,10 +20,9 @@ object AlwaysElectedLeadershipModule extends Mockito {
     forActorsModule(new ActorsModule(actorRefFactory))
   }
 
-  private[this] def forActorsModule(actorsModule: ActorsModule): LeadershipModule =
-    {
-      new AlwaysElectedLeadershipModule(actorsModule)
-    }
+  private[this] def forActorsModule(actorsModule: ActorsModule): LeadershipModule = {
+    new AlwaysElectedLeadershipModule(actorsModule)
+  }
 }
 
 private class AlwaysElectedLeadershipModule(actorsModule: ActorsModule) extends LeadershipModule {

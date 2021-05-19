@@ -1,11 +1,14 @@
 package mesosphere.marathon
 package state
 
+import com.typesafe.scalalogging.StrictLogging
 import com.wix.accord._
 import com.wix.accord.dsl._
 import mesosphere.marathon.api.v2.Validation._
+import mesosphere.marathon.api.v2.validation.PodsValidation
 import mesosphere.marathon.core.externalvolume.ExternalVolumes
 import mesosphere.marathon.core.pod.PodDefinition
+import mesosphere.marathon.util.RoleSettings
 import org.jgrapht.DirectedGraph
 import org.jgrapht.alg.CycleDetector
 import org.jgrapht.graph._
@@ -17,28 +20,24 @@ import scala.collection.JavaConverters._
   * Represents the root group for Marathon. It is a persistent data structure,
   * and all of the modifying operations are defined at this level.
   */
-class RootGroup(
-  apps: Map[AppDefinition.AppKey, AppDefinition] = Group.defaultApps,
-  pods: Map[PathId, PodDefinition] = Group.defaultPods,
-  groupsById: Map[Group.GroupKey, Group] = Group.defaultGroups,
-  dependencies: Set[PathId] = Group.defaultDependencies,
-  version: Timestamp = Group.defaultVersion) extends Group(
-  PathId.empty,
-  apps,
-  pods,
-  groupsById,
-  dependencies,
-  version,
-  apps ++ groupsById.values.flatMap(_.transitiveAppsById),
-  pods ++ groupsById.values.flatMap(_.transitivePodsById)) {
+class RootGroup protected (
+    apps: Map[AbsolutePathId, AppDefinition],
+    pods: Map[AbsolutePathId, PodDefinition],
+    groupsById: Map[AbsolutePathId, Group],
+    dependencies: Set[AbsolutePathId],
+    val newGroupStrategy: RootGroup.NewGroupStrategy,
+    version: Timestamp
+) extends Group(PathId.root, apps, pods, groupsById, dependencies, version, None)
+    with StrictLogging {
   require(
     groupsById.forall {
       case (_, _: RootGroup) => false
       case (_, _: Group) => true
     },
-    "`RootGroup` cannot be a child of `RootGroup`.")
+    "`RootGroup` cannot be a child of `RootGroup`."
+  )
 
-  private lazy val applicationDependencies: List[(AppDefinition, AppDefinition)] = {
+  lazy val applicationDependencies: List[(AppDefinition, AppDefinition)] = {
     var result = List.empty[(AppDefinition, AppDefinition)]
 
     //group->group dependencies
@@ -55,7 +54,7 @@ class RootGroup(
       group <- transitiveGroupsById.values.filter(_.apps.nonEmpty)
       app <- group.apps.values
       dependencyId <- app.dependencies
-      dependentApp = transitiveAppsById.get(dependencyId).map(Set(_))
+      dependentApp = this.app(dependencyId).map(Set(_))
       dependentGroup = transitiveGroupsById.get(dependencyId).map(_.transitiveApps)
       dependent <- dependentApp orElse dependentGroup getOrElse Set.empty
     } result ::= app -> dependent
@@ -64,11 +63,12 @@ class RootGroup(
 
   /**
     * This is used to compute the "layered" topological sort during deployment.
+    *
     * @return The dependency graph of all the run specs in the root group.
     */
   lazy val dependencyGraph: DirectedGraph[RunSpec, DefaultEdge] = {
     val graph = new DefaultDirectedGraph[RunSpec, DefaultEdge](classOf[DefaultEdge])
-    for (runnableSpec <- transitiveRunSpecsById.values) graph.addVertex(runnableSpec)
+    for (runnableSpec <- transitiveRunSpecs) graph.addVertex(runnableSpec)
     for ((app, dependent) <- applicationDependencies) graph.addEdge(app, dependent)
     new UnmodifiableDirectedGraph(graph)
   }
@@ -96,16 +96,16 @@ class RootGroup(
     * Every transitive group gets the new version.
     *
     * @param newGroup the new group to be added
-    * @param version the new version of the root group
+    * @param version  the new version of the root group
     * @return the new root group with `newGroup` added.
     */
-  def putGroup(newGroup: Group, version: Timestamp): RootGroup = {
-    val oldGroup = group(newGroup.id).getOrElse(Group.empty(newGroup.id))
-    @tailrec def rebuildTree(allParents: List[PathId], result: Group): Group = {
+  def putGroup(newGroup: Group, version: Timestamp = Group.defaultVersion): RootGroup = {
+    @tailrec def rebuildTree(allParents: List[AbsolutePathId], result: Group): Group = {
       allParents match {
-        case Nil => result
+        case Nil =>
+          result
         case head :: tail =>
-          val oldParent = group(head).getOrElse(Group.empty(head))
+          val oldParent = group(head).getOrElse(newGroupStrategy.newGroup(head))
           val newParent = Group(
             id = oldParent.id,
             apps = oldParent.apps,
@@ -113,12 +113,13 @@ class RootGroup(
             groupsById = oldParent.groupsById + (result.id -> result),
             dependencies = oldParent.dependencies,
             version = version,
-            transitiveAppsById = oldParent.transitiveAppsById -- oldGroup.transitiveAppsById.keys ++ newGroup.transitiveAppsById,
-            transitivePodsById = oldParent.transitivePodsById -- oldGroup.transitivePodsById.keys ++ newGroup.transitivePodsById)
+            enforceRole = oldParent.enforceRole
+          )
           rebuildTree(tail, newParent)
       }
     }
-    RootGroup.fromGroup(updateVersion(rebuildTree(newGroup.id.allParents, newGroup), version))
+
+    updatedWith(updateVersion(rebuildTree(newGroup.id.allParents, newGroup), version))
   }
 
   /**
@@ -133,8 +134,10 @@ class RootGroup(
     * @param groupId the id of the group to make exist
     * @return the new root group with group with id `groupId`.
     */
-  def makeGroup(groupId: PathId): RootGroup =
-    group(groupId).fold(putGroup(Group.empty(groupId), version))(_ => this)
+  def makeGroup(groupId: AbsolutePathId): RootGroup = {
+    val newGroup = newGroupStrategy.newGroup(groupId)
+    group(groupId).fold(putGroup(newGroup, version))(_ => this)
+  }
 
   /**
     * Apply an update function to every transitive app rooted at a specified group id.
@@ -145,11 +148,15 @@ class RootGroup(
     * Every transitive group gets the new version.
     *
     * @param groupId the root of the group subtree to update
-    * @param app the update function, which is applied to every transitive app under `groupId`.
+    * @param app     the update function, which is applied to every transitive app under `groupId`.
     * @param version the new version of the root group
     * @return the new root group with group with id `groupId`.
     */
-  def updateTransitiveApps(groupId: PathId, app: AppDefinition => AppDefinition, version: Timestamp): RootGroup = {
+  def updateTransitiveApps(
+      groupId: AbsolutePathId,
+      app: AppDefinition => AppDefinition,
+      version: Timestamp = Group.defaultVersion
+  ): RootGroup = {
     def updateApps(group: Group): Group = {
       Group(
         id = group.id,
@@ -158,10 +165,11 @@ class RootGroup(
         groupsById = group.groupsById.map { case (subGroupId, subGroup) => subGroupId -> updateApps(subGroup) },
         dependencies = group.dependencies,
         version = version,
-        transitiveAppsById = group.transitiveAppsById.map { case (appId, appDef) => appId -> app(appDef) },
-        transitivePodsById = group.transitivePodsById)
+        enforceRole = group.enforceRole
+      )
     }
-    val oldGroup = group(groupId).getOrElse(Group.empty(groupId))
+
+    val oldGroup = group(groupId).getOrElse(newGroupStrategy.newGroup(groupId))
     val newGroup = updateApps(oldGroup)
     putGroup(newGroup, version)
   }
@@ -175,15 +183,16 @@ class RootGroup(
     * Every transitive group gets the new version.
     *
     * @param groupId the id of the group to be updated
-    * @param apps the update function, which is applied to the specified group's apps.
+    * @param apps    the update function, which is applied to the specified group's apps.
     * @param version the new version of the root group
     * @return the new root group with the specified group updated.
     */
   def updateApps(
-    groupId: PathId,
-    apps: Map[AppDefinition.AppKey, AppDefinition] => Map[AppDefinition.AppKey, AppDefinition],
-    version: Timestamp): RootGroup = {
-    val oldGroup = group(groupId).getOrElse(Group.empty(groupId))
+      groupId: AbsolutePathId,
+      apps: Map[AbsolutePathId, AppDefinition] => Map[AbsolutePathId, AppDefinition],
+      version: Timestamp = Group.defaultVersion
+  ): RootGroup = {
+    val oldGroup = group(groupId).getOrElse(newGroupStrategy.newGroup(groupId))
     val oldApps = oldGroup.apps
     val newApps = apps(oldApps)
     val newGroup = Group(
@@ -193,8 +202,8 @@ class RootGroup(
       groupsById = oldGroup.groupsById,
       dependencies = oldGroup.dependencies,
       version = version,
-      transitiveAppsById = oldGroup.transitiveAppsById -- oldApps.keys ++ newApps,
-      transitivePodsById = oldGroup.transitivePodsById)
+      enforceRole = oldGroup.enforceRole
+    )
     putGroup(newGroup, version)
   }
 
@@ -206,26 +215,20 @@ class RootGroup(
     *
     * Every transitive group gets the new version.
     *
-    * @param groupId the id of the group to be updated
+    * @param groupId      the id of the group to be updated
     * @param dependencies the update function, which is applied to the specified group's dependencies.
-    * @param version the new version of the root group
+    * @param version      the new version of the root group
     * @return the new root group with the specified group updated.
     */
-  def updateDependencies(groupId: PathId, dependencies: Set[PathId] => Set[PathId], version: Timestamp): RootGroup = {
-    val oldGroup = group(groupId).getOrElse(Group.empty(groupId))
+  def updateDependencies(
+      groupId: AbsolutePathId,
+      dependencies: Set[AbsolutePathId] => Set[AbsolutePathId],
+      version: Timestamp = Group.defaultVersion
+  ): RootGroup = {
+    val oldGroup = group(groupId).getOrElse(newGroupStrategy.newGroup(groupId))
     val oldDependencies = oldGroup.dependencies
     val newDependencies = dependencies(oldDependencies)
-    val newGroup = Group(
-      id = oldGroup.id,
-      apps = oldGroup.apps,
-      pods = oldGroup.pods,
-      groupsById = oldGroup.groupsById,
-      dependencies = newDependencies,
-      version = version,
-      transitiveAppsById = oldGroup.transitiveAppsById,
-      transitivePodsById = oldGroup.transitivePodsById
-    )
-    putGroup(newGroup, version)
+    putGroup(oldGroup.withDependencies(newDependencies), version)
   }
 
   /**
@@ -238,13 +241,13 @@ class RootGroup(
     *
     * Every transitive group gets the new version.
     *
-    * @param appId the id of the app to be updated
-    * @param fn the update function, which is applied to the specified app
+    * @param appId   the id of the app to be updated
+    * @param fn      the update function, which is applied to the specified app
     * @param version the new version of the root group
     * @return the new root group with the specified app updated.
     */
-  def updateApp(appId: PathId, fn: Option[AppDefinition] => AppDefinition, version: Timestamp): RootGroup = {
-    val oldGroup = group(appId.parent).getOrElse(Group.empty(appId.parent))
+  def updateApp(appId: AbsolutePathId, fn: Option[AppDefinition] => AppDefinition, version: Timestamp = Group.defaultVersion): RootGroup = {
+    val oldGroup = group(appId.parent).getOrElse(newGroupStrategy.newGroup(appId.parent))
     val newApp = fn(app(appId))
     require(newApp.id == appId, "app id must not be changed by `fn`.")
     val newGroup = Group(
@@ -259,8 +262,8 @@ class RootGroup(
       },
       dependencies = oldGroup.dependencies,
       version = version,
-      transitiveAppsById = oldGroup.transitiveAppsById + (newApp.id -> newApp),
-      transitivePodsById = oldGroup.transitivePodsById)
+      enforceRole = oldGroup.enforceRole
+    )
     putGroup(newGroup, version)
   }
 
@@ -274,13 +277,13 @@ class RootGroup(
     *
     * Every transitive group gets the new version.
     *
-    * @param podId the id of the pod to be updated
-    * @param fn the update function, which is applied to the specified pod
+    * @param podId   the id of the pod to be updated
+    * @param fn      the update function, which is applied to the specified pod
     * @param version the new version of the root group
     * @return the new root group with the specified pod updated.
     */
-  def updatePod(podId: PathId, fn: Option[PodDefinition] => PodDefinition, version: Timestamp): RootGroup = {
-    val oldGroup = group(podId.parent).getOrElse(Group.empty(podId.parent))
+  def updatePod(podId: AbsolutePathId, fn: Option[PodDefinition] => PodDefinition, version: Timestamp = Group.defaultVersion): RootGroup = {
+    val oldGroup = group(podId.parent).getOrElse(newGroupStrategy.newGroup(podId.parent))
     val newPod = fn(pod(podId))
     require(newPod.id == podId, "pod id must not be changed by `fn`.")
     val newGroup = Group(
@@ -295,9 +298,24 @@ class RootGroup(
       },
       dependencies = oldGroup.dependencies,
       version = version,
-      transitiveAppsById = oldGroup.transitiveAppsById,
-      transitivePodsById = oldGroup.transitivePodsById + (newPod.id -> newPod))
+      enforceRole = oldGroup.enforceRole
+    )
     putGroup(newGroup, version)
+  }
+
+  /**
+    * Update a group with the specified group id by applying the update function.
+    *
+    * It has the same semantics as [[updateApp()]] and [[updatePod()]]. If the group does not exist
+    * it will be created. The update does *not* change the group version.
+    *
+    * @param groupId the if od the group to be updated.
+    * @param fn      the update function.
+    * @return the new root group with the update group.
+    */
+  def updateGroup(groupId: AbsolutePathId, fn: Option[Group] => Group): RootGroup = {
+    val updatedGroup = fn(group(groupId))
+    putGroup(updatedGroup, updatedGroup.version)
   }
 
   private def updateVersion(group: Group, version: Timestamp): Group = {
@@ -308,8 +326,8 @@ class RootGroup(
       groupsById = group.groupsById.map { case (subGroupId, subGroup) => subGroupId -> updateVersion(subGroup, version) },
       dependencies = group.dependencies,
       version = version,
-      transitiveAppsById = group.transitiveAppsById,
-      transitivePodsById = group.transitivePodsById)
+      enforceRole = group.enforceRole
+    )
   }
 
   /**
@@ -317,7 +335,9 @@ class RootGroup(
     *
     * @param version the new version of the root group.
     */
-  def updateVersion(version: Timestamp): RootGroup = RootGroup.fromGroup(updateVersion(this, version))
+  def updateVersion(version: Timestamp = Group.defaultVersion): RootGroup = {
+    updatedWith(updateVersion(this, version))
+  }
 
   /**
     * Remove the group with the specified group id.
@@ -328,7 +348,7 @@ class RootGroup(
     * @param version the new version of the root group
     * @return the new root group with the specified group removed.
     */
-  def removeGroup(groupId: PathId, version: Timestamp = Timestamp.now()): RootGroup = {
+  def removeGroup(groupId: AbsolutePathId, version: Timestamp = Group.defaultVersion): RootGroup = {
     require(!groupId.isRoot, "The root group cannot be removed.")
     group(groupId).fold(updateVersion(version)) { oldGroup =>
       val oldParent = transitiveGroupsById(oldGroup.id.parent)
@@ -340,8 +360,10 @@ class RootGroup(
           groupsById = oldParent.groupsById - oldGroup.id,
           dependencies = oldParent.dependencies,
           version = version,
-          transitiveAppsById = oldParent.transitiveAppsById -- oldGroup.transitiveAppsById.keys,
-          transitivePodsById = oldParent.transitivePodsById -- oldGroup.transitivePodsById.keys), version)
+          enforceRole = oldParent.enforceRole
+        ),
+        version
+      )
     }
   }
 
@@ -350,22 +372,25 @@ class RootGroup(
     *
     * Every transitive group gets the new version.
     *
-    * @param appId the id of the app to be removed
+    * @param appId   the id of the app to be removed
     * @param version the new version of the root group
     * @return the new root group with the specified app removed.
     */
-  def removeApp(appId: PathId, version: Timestamp = Timestamp.now()): RootGroup = {
+  def removeApp(appId: AbsolutePathId, version: Timestamp = Group.defaultVersion): RootGroup = {
     app(appId).fold(updateVersion(version)) { oldApp =>
       val oldGroup = transitiveGroupsById(oldApp.id.parent)
-      putGroup(Group(
-        id = oldGroup.id,
-        apps = oldGroup.apps - oldApp.id,
-        pods = oldGroup.pods,
-        groupsById = oldGroup.groupsById,
-        dependencies = oldGroup.dependencies,
-        version = version,
-        transitiveAppsById = oldGroup.transitiveAppsById - oldApp.id,
-        transitivePodsById = oldGroup.transitivePodsById), version)
+      putGroup(
+        Group(
+          id = oldGroup.id,
+          apps = oldGroup.apps - oldApp.id,
+          pods = oldGroup.pods,
+          groupsById = oldGroup.groupsById,
+          dependencies = oldGroup.dependencies,
+          version = version,
+          enforceRole = oldGroup.enforceRole
+        ),
+        version
+      )
     }
   }
 
@@ -374,66 +399,111 @@ class RootGroup(
     *
     * Every transitive group gets the new version.
     *
-    * @param podId the id of the pod to be removed
+    * @param podId   the id of the pod to be removed
     * @param version the new version of the root group
     * @return the new root group with the specified pod removed.
     */
-  def removePod(podId: PathId, version: Timestamp = Timestamp.now()): RootGroup = {
+  def removePod(podId: AbsolutePathId, version: Timestamp = Group.defaultVersion): RootGroup = {
     pod(podId).fold(updateVersion(version)) { oldPod =>
       val oldGroup = transitiveGroupsById(oldPod.id.parent)
-      putGroup(Group(
-        id = oldGroup.id,
-        apps = oldGroup.apps,
-        pods = oldGroup.pods - oldPod.id,
-        groupsById = oldGroup.groupsById,
-        dependencies = oldGroup.dependencies,
-        version = version,
-        transitiveAppsById = oldGroup.transitiveAppsById,
-        transitivePodsById = oldGroup.transitivePodsById - oldPod.id), version)
+      putGroup(
+        Group(
+          id = oldGroup.id,
+          apps = oldGroup.apps,
+          pods = oldGroup.pods - oldPod.id,
+          groupsById = oldGroup.groupsById,
+          dependencies = oldGroup.dependencies,
+          version = version,
+          enforceRole = oldGroup.enforceRole
+        ),
+        version
+      )
     }
   }
 
   /**
     * Returns a new `RootGroup` where all transitive groups, apps, and pods have their `version` set to `Timestamp(0)`.
     */
-  @SuppressWarnings(Array("PartialFunctionInsteadOfMatch"))
   def withNormalizedVersions: RootGroup = {
     def in(group: Group): Group = {
       Group(
         id = group.id,
         apps = group.apps.map { case (appId, app) => appId -> app.copy(versionInfo = VersionInfo.NoVersion) },
-        pods = group.pods.map { case (podId, pod) => podId -> pod.copy(version = Timestamp(0)) },
+        pods = group.pods.map { case (podId, pod) => podId -> pod.copy(versionInfo = VersionInfo.NoVersion) },
         groupsById = group.groupsById.map { case (subGroupId, subGroup) => subGroupId -> in(subGroup) },
         dependencies = group.dependencies,
         version = Timestamp(0),
-        transitiveAppsById = group.transitiveAppsById.map { case (appId, app) => appId -> app.copy(versionInfo = VersionInfo.NoVersion) },
-        transitivePodsById = group.transitivePodsById.map { case (podId, pod) => podId -> pod.copy(version = Timestamp(0)) })
+        enforceRole = group.enforceRole
+      )
     }
-    RootGroup.fromGroup(in(this))
+
+    updatedWith(in(this))
+  }
+
+  def updatedWith(group: Group): RootGroup = {
+    RootGroup.fromGroup(group, newGroupStrategy)
   }
 }
 
 object RootGroup {
   def apply(
-    apps: Map[AppDefinition.AppKey, AppDefinition] = Group.defaultApps,
-    pods: Map[PathId, PodDefinition] = Group.defaultPods,
-    groupsById: Map[Group.GroupKey, Group] = Group.defaultGroups,
-    dependencies: Set[PathId] = Group.defaultDependencies,
-    version: Timestamp = Group.defaultVersion): RootGroup = new RootGroup(apps, pods, groupsById, dependencies, version)
+      apps: Map[AbsolutePathId, AppDefinition],
+      pods: Map[AbsolutePathId, PodDefinition],
+      groupsById: Map[AbsolutePathId, Group],
+      dependencies: Set[AbsolutePathId],
+      newGroupStrategy: NewGroupStrategy,
+      version: Timestamp
+  ): RootGroup = new RootGroup(apps, pods, groupsById, dependencies, newGroupStrategy, version)
 
-  def empty: RootGroup = RootGroup(version = Timestamp(0))
+  def empty(newGroupStrategy: NewGroupStrategy = NewGroupStrategy.Fail, version: Timestamp = Timestamp(0)) =
+    RootGroup(Map.empty, Map.empty, Map.empty, Set.empty, newGroupStrategy = newGroupStrategy, version = version)
 
-  def fromGroup(group: Group): RootGroup = {
+  def fromGroup(group: Group, newGroupStrategy: NewGroupStrategy): RootGroup = {
     require(group.id.isRoot)
-    RootGroup(group.apps, group.pods, group.groupsById, group.dependencies, group.version)
+    RootGroup(group.apps, group.pods, group.groupsById, group.dependencies, newGroupStrategy, group.version)
   }
 
-  def rootGroupValidator(enabledFeatures: Set[String]): Validator[RootGroup] = {
-    noCyclicDependencies and
-      Group.validGroup(PathId.empty, enabledFeatures) and
-      ExternalVolumes.validRootGroup()
-  }
+  def validRootGroup(config: MarathonConf): Validator[RootGroup] =
+    validator[RootGroup] { rootGroup =>
+      rootGroup is noCyclicDependencies
+      rootGroup is Group.validGroup(PathId.root, config)
+      rootGroup is ExternalVolumes.validRootGroup()
+      rootGroup.transitiveApps as "apps" is Group.everyApp(
+        validAppRole(config, rootGroup)
+      )
+      rootGroup.transitivePods as "pods" is Group.everyPod(
+        validPodRole(config, rootGroup)
+      )
+    }
 
   private def noCyclicDependencies: Validator[RootGroup] =
-    isTrue("Dependency graph has cyclic dependencies.") { _.hasNonCyclicDependencies }
+    isTrue("Dependency graph has cyclic dependencies.") {
+      _.hasNonCyclicDependencies
+    }
+
+  private def validAppRole(config: MarathonConf, rootGroup: RootGroup): Validator[AppDefinition] =
+    (app: AppDefinition) => {
+      AppDefinition.validWithRoleEnforcement(RoleSettings.forService(config, app.id, rootGroup, false)).apply(app)
+    }
+
+  private def validPodRole(config: MarathonConf, rootGroup: RootGroup): Validator[PodDefinition] =
+    (pod: PodDefinition) => {
+      PodsValidation.validPodDefinitionWithRoleEnforcement(RoleSettings.forService(config, pod.id, rootGroup, false)).apply(pod)
+    }
+
+  trait NewGroupStrategy {
+    def newGroup(id: AbsolutePathId): Group
+  }
+
+  object NewGroupStrategy {
+
+    object Fail extends NewGroupStrategy {
+      override def newGroup(id: AbsolutePathId): Group = throw new RuntimeException(s"No such group: ${id}")
+    }
+
+    case class UsingConfig(newGroupEnforceRoleBehavior: NewGroupEnforceRoleBehavior) extends NewGroupStrategy {
+      override def newGroup(id: AbsolutePathId): Group =
+        Group.empty(id, enforceRole = if (id.isTopLevel) newGroupEnforceRoleBehavior.option else None)
+    }
+  }
 }

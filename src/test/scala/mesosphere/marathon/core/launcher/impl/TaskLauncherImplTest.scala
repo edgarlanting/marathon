@@ -5,33 +5,38 @@ import java.util
 import java.util.Collections
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.instance.TestInstanceBuilder._
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
-import mesosphere.marathon.core.launcher.{ InstanceOp, TaskLauncher }
+import mesosphere.marathon.core.instance.update.InstanceUpdateOperation
+import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder}
+import mesosphere.marathon.core.launcher.{InstanceOp, TaskLauncher}
 import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.state.PathId
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.metrics.dummy.DummyMetrics
+import mesosphere.marathon.state.{AbsolutePathId, Timestamp}
+import scala.jdk.CollectionConverters._
 import mesosphere.marathon.test.MarathonTestHelper
 import mesosphere.mesos.protos.Implicits._
 import mesosphere.mesos.protos.OfferID
 import org.apache.mesos.Protos.TaskInfo
-import org.apache.mesos.{ Protos, SchedulerDriver }
+import org.apache.mesos.{Protos, SchedulerDriver}
 import org.mockito.Mockito
 import org.mockito.Mockito.when
 
 class TaskLauncherImplTest extends UnitTest {
   private[this] val offerId = OfferID("offerId")
   private[this] val offerIdAsJava: util.Collection[Protos.OfferID] = Collections.singleton[Protos.OfferID](offerId)
+  private[this] val metrics: Metrics = DummyMetrics
   private[this] def launch(taskInfoBuilder: TaskInfo.Builder): InstanceOp.LaunchTask = {
     val taskInfo = taskInfoBuilder.build()
-    val instance = TestInstanceBuilder.newBuilderWithInstanceId(instanceId).addTaskWithBuilder().taskFromTaskInfo(taskInfo).build().getInstance()
-    val task: Task.LaunchedEphemeral = instance.appTask
-    new InstanceOpFactoryHelper(Some("principal"), Some("role")).launchEphemeral(taskInfo, task, instance)
+    val instance =
+      TestInstanceBuilder.newBuilderWithInstanceId(instanceId).addTaskWithBuilder().taskFromTaskInfo(taskInfo).build().getInstance()
+    val stateOp =
+      InstanceUpdateOperation.Provision(instanceId, instance.agentInfo.get, instance.runSpec, instance.tasksMap, Timestamp.now())
+    new InstanceOpFactoryHelper(metrics, Some("principal")).provision(taskInfo, stateOp)
   }
-  private[this] val appId = PathId("/test")
+  private[this] val appId = AbsolutePathId("/test")
   private[this] val instanceId = Instance.Id.forRunSpec(appId)
-  private[this] val launch1 = launch(MarathonTestHelper.makeOneCPUTask(Task.Id.forInstanceId(instanceId, None)))
-  private[this] val launch2 = launch(MarathonTestHelper.makeOneCPUTask(Task.Id.forInstanceId(instanceId, None)))
+  private[this] val launch1 = launch(MarathonTestHelper.makeOneCPUTask(Task.Id(instanceId)))
+  private[this] val launch2 = launch(MarathonTestHelper.makeOneCPUTask(Task.Id(instanceId)))
   private[this] val ops = Seq(launch1, launch2)
   private[this] val opsAsJava = ops.flatMap(_.offerOperations).asJava
   private[this] val filter = Protos.Filters.newBuilder().setRefuseSeconds(0).build()
@@ -39,7 +44,7 @@ class TaskLauncherImplTest extends UnitTest {
   case class Fixture(driver: Option[SchedulerDriver] = Some(mock[SchedulerDriver])) {
     val driverHolder: MarathonSchedulerDriverHolder = new MarathonSchedulerDriverHolder
     driverHolder.driver = driver
-    val launcher: TaskLauncher = new TaskLauncherImpl(driverHolder)
+    val launcher: TaskLauncher = new TaskLauncherImpl(metrics, driverHolder)
 
     def verifyClean(): Unit = {
       driverHolder.driver.foreach(Mockito.verifyNoMoreInteractions(_))

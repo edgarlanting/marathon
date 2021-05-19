@@ -6,19 +6,19 @@ import java.util.concurrent.CountDownLatch
 
 import akka.actor.Props
 import akka.event.EventStream
-import akka.testkit.{ EventFilter, ImplicitSender, TestActorRef }
+import akka.testkit.{EventFilter, ImplicitSender, TestActorRef}
 import mesosphere.AkkaUnitTest
-import mesosphere.marathon.core.event.{ EventStreamAttached, EventStreamDetached, MarathonEvent, Subscribe }
+import mesosphere.marathon.core.event.{EventStreamAttached, EventStreamDetached, MarathonEvent, Subscribe}
 
 import scala.concurrent.duration._
 
 class HttpEventStreamHandleActorTest extends AkkaUnitTest with ImplicitSender {
-  case class Fixture(
-      handle: HttpEventStreamHandle = mock[HttpEventStreamHandle],
-      stream: EventStream = mock[EventStream]) {
-    val handleActor: TestActorRef[HttpEventStreamHandleActor] = TestActorRef(Props(
-      new HttpEventStreamHandleActor(handle, stream, 1)
-    ))
+  case class Fixture(handle: HttpEventStreamHandle = mock[HttpEventStreamHandle], stream: EventStream = mock[EventStream]) {
+    val handleActor: TestActorRef[HttpEventStreamHandleActor] = TestActorRef(
+      Props(
+        new HttpEventStreamHandleActor(handle, stream, 1)
+      )
+    )
   }
   "HttpEventStreamHandleActor" should {
     "A message send to the handle actor will be transferred to the stream handle" in new Fixture {
@@ -34,7 +34,7 @@ class HttpEventStreamHandleActorTest extends AkkaUnitTest with ImplicitSender {
       verify(handle, times(1)).sendEvent(any[MarathonEvent])
     }
 
-    "If the consumer is slow and maxOutstanding limit is reached, messages get dropped" in new Fixture {
+    "If the consumer is slow and maxOutstanding limit is reached, connection is closed" in new Fixture {
       Given("A handler that will postpone the sending")
       val latch = new CountDownLatch(1)
       handle.sendEvent(any[MarathonEvent]) answers (_ => latch.await())
@@ -48,6 +48,7 @@ class HttpEventStreamHandleActorTest extends AkkaUnitTest with ImplicitSender {
       Then("Only one message is send to the handler")
       latch.countDown()
       filter.awaitDone(1.second)
+      verify(handle, atLeastOnce).close()
     }
 
     "If the handler throws an EOF exception, the actor stops acting" in new Fixture {
@@ -69,9 +70,11 @@ class HttpEventStreamHandleActorTest extends AkkaUnitTest with ImplicitSender {
       val handle = mock[HttpEventStreamHandle]
       val stream = mock[EventStream]
       handle.sendEvent(any[MarathonEvent]) answers { args => events ::= args(0).asInstanceOf[MarathonEvent].eventType; latch.await() }
-      val handleActor: TestActorRef[HttpEventStreamHandleActor] = TestActorRef(Props(
-        new HttpEventStreamHandleActor(handle, stream, 50)
-      ))
+      val handleActor: TestActorRef[HttpEventStreamHandleActor] = TestActorRef(
+        Props(
+          new HttpEventStreamHandleActor(handle, stream, 50)
+        )
+      )
       val attached = EventStreamAttached("remote")
       val detached = EventStreamDetached("remote")
       val subscribe = Subscribe("ip", "url")

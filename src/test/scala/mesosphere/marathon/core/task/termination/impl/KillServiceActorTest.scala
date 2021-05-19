@@ -4,31 +4,35 @@ package core.task.termination.impl
 import java.util.UUID
 
 import akka.Done
-import akka.actor.{ ActorRef, PoisonPill, Terminated }
-import akka.testkit.TestProbe
+import akka.actor.{PoisonPill, Terminated}
+import akka.stream.scaladsl.Source
+import akka.testkit.{TestActorRef, TestProbe}
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.AkkaUnitTest
-import mesosphere.marathon.core.base.ConstantClock
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.event.{ InstanceChanged, UnknownInstanceTerminated }
-import mesosphere.marathon.core.instance.update.{ InstanceChange, InstanceUpdateOperation }
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
+import mesosphere.marathon.core.event.{InstanceChanged, UnknownInstanceTerminated}
+import mesosphere.marathon.core.instance.update.InstanceChange
+import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder}
 import mesosphere.marathon.core.pod.MesosContainer
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.bus.TaskStatusUpdateTestHelper
 import mesosphere.marathon.core.task.termination.KillConfig
-import mesosphere.marathon.core.task.tracker.TaskStateOpProcessor
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.metrics.dummy.DummyMetrics
 import mesosphere.marathon.raml.Resources
-import mesosphere.marathon.state.{ PathId, Timestamp }
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, Timestamp}
+import scala.jdk.CollectionConverters._
+import mesosphere.marathon.test.SettableClock
 import org.apache.mesos
 import org.apache.mesos.SchedulerDriver
 import org.mockito.ArgumentCaptor
+import org.scalatest.concurrent.Eventually
 
-import scala.concurrent.Promise
 import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
-class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
+class KillServiceActorTest extends AkkaUnitTest with StrictLogging with Eventually {
 
   val defaultConfig: KillConfig = new KillConfig {
     override lazy val killChunkSize: Int = 5
@@ -59,10 +63,10 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
 
     "asked to kill an unknown instance" should {
       "issue a kill to the driver" in withActor(defaultConfig) { (f, actor) =>
-
-        val taskId = Task.Id.forRunSpec(PathId("/unknown"))
+        val instanceId = Instance.Id.forRunSpec(AbsolutePathId("/unknown"))
+        val taskId = Task.Id(instanceId)
         actor ! KillServiceActor.KillUnknownTaskById(taskId)
-        f.publishUnknownInstanceTerminated(taskId.instanceId)
+        f.publishUnknownInstanceTerminated(instanceId)
 
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(taskId.mesosTaskId)
         noMoreInteractions(f.driver)
@@ -70,14 +74,12 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
     }
 
     "asked to kill single known unreachable instance" should {
-      "issue no kill to the driver because the task is unreachable and send an expunge" in withActor(defaultConfig) { (f, actor) =>
-
+      "issue no kill to the driver because the task is unreachable" in withActor(defaultConfig) { (f, actor) =>
         val instance = f.mockInstance(f.runSpecId, f.now(), mesos.Protos.TaskState.TASK_UNREACHABLE)
         val promise = Promise[Done]()
         actor ! KillServiceActor.KillInstances(Seq(instance), promise)
 
         noMoreInteractions(f.driver)
-        verify(f.stateOpProcessor, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).process(InstanceUpdateOperation.ForceExpunge(instance.instanceId))
 
         f.publishInstanceChanged(TaskStatusUpdateTestHelper.killed(instance).wrapped)
 
@@ -96,7 +98,6 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
 
         val (runningTaskId, _) = runningInstance.tasksMap.head
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(runningTaskId.mesosTaskId)
-        verify(f.stateOpProcessor, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).process(InstanceUpdateOperation.ForceExpunge(unreachableInstance.instanceId))
 
         val (stagingTaskId, _) = stagingInstance.tasksMap.head
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(stagingTaskId.mesosTaskId)
@@ -106,18 +107,17 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         f.publishInstanceChanged(TaskStatusUpdateTestHelper.gone(unreachableInstance).wrapped)
         f.publishInstanceChanged(TaskStatusUpdateTestHelper.unreachable(stagingInstance).wrapped)
 
-        promise.future.futureValue should be (Done)
+        promise.future.futureValue should be(Done)
       }
     }
 
     "asked to kill multiple tasks at once with an empty list" should {
       "issue no kill" in withActor(defaultConfig) { (f, actor) =>
-
         val emptyList = Seq.empty[Instance]
         val promise = Promise[Done]()
         actor ! KillServiceActor.KillInstances(emptyList, promise)
 
-        promise.future.futureValue should be (Done)
+        promise.future.futureValue should be(Done)
         noMoreInteractions(f.driver)
       }
     }
@@ -148,18 +148,18 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         f.publishInstanceChanged(TaskStatusUpdateTestHelper.killed(instance2).wrapped)
         f.publishInstanceChanged(TaskStatusUpdateTestHelper.killed(instance3).wrapped)
 
-        promise1.future.futureValue should be (Done)
-        promise2.future.futureValue should be (Done)
-        promise3.future.futureValue should be (Done)
+        promise1.future.futureValue should be(Done)
+        promise2.future.futureValue should be(Done)
+        promise3.future.futureValue should be(Done)
       }
     }
 
     "killing instances is throttled (single requests)" should {
       "issue 5 kills immediately to the driver" in withActor(defaultConfig) { (f, actor) =>
-        val instances: Map[Instance.Id, Instance] = (1 to 10).map { index =>
+        val instances: Map[Instance.Id, Instance] = (1 to 10).iterator.map { index =>
           val instance = f.mockInstance(f.runSpecId, f.clock.now(), mesos.Protos.TaskState.TASK_RUNNING)
           instance.instanceId -> instance
-        }(collection.breakOut)
+        }.toMap
 
         instances.valuesIterator.foreach { instance =>
           actor ! KillServiceActor.KillInstances(Seq(instance), Promise[Done]())
@@ -169,8 +169,8 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2).times(5)).killTask(captor.capture())
         reset(f.driver)
 
-        captor.getAllValues.foreach { id =>
-          val instanceId = Task.Id(id).instanceId
+        captor.getAllValues().asScala.foreach { id =>
+          val instanceId = Task.Id.parse(id).instanceId
           instances.get(instanceId).foreach { instance =>
             f.publishInstanceChanged(TaskStatusUpdateTestHelper.killed(instance).wrapped)
           }
@@ -183,21 +183,20 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
 
     "killing instances is throttled (batch request)" should {
       "issue 5 kills immediately to the driver" in withActor(defaultConfig) { (f, actor) =>
-
-        val instances: Map[Instance.Id, Instance] = (1 to 10).map { index =>
+        val instances: Map[Instance.Id, Instance] = (1 to 10).iterator.map { index =>
           val instance = f.mockInstance(f.runSpecId, f.clock.now(), mesos.Protos.TaskState.TASK_RUNNING)
           instance.instanceId -> instance
-        }(collection.breakOut)
+        }.toMap
 
         val promise = Promise[Done]()
-        actor ! KillServiceActor.KillInstances(instances.values.to[Seq], promise)
+        actor ! KillServiceActor.KillInstances(instances.values.to(Seq), promise)
 
         val captor: ArgumentCaptor[mesos.Protos.TaskID] = ArgumentCaptor.forClass(classOf[mesos.Protos.TaskID])
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2).times(5)).killTask(captor.capture())
         reset(f.driver)
 
-        captor.getAllValues.foreach { id =>
-          val instanceId = Task.Id(id).instanceId
+        captor.getAllValues.asScala.foreach { id =>
+          val instanceId = Task.Id.parse(id).instanceId
           instances.get(instanceId).foreach { instance =>
             f.publishInstanceChanged(TaskStatusUpdateTestHelper.killed(instance).wrapped)
           }
@@ -218,7 +217,7 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         val (taskId, _) = instance.tasksMap.head
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(taskId.mesosTaskId)
 
-        f.clock.+=(10.seconds)
+        f.clock.advanceBy(10.seconds)
 
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(taskId.mesosTaskId)
       }
@@ -229,7 +228,8 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         val stagingContainer = f.container("stagingContainer")
         val runningContainer = f.container("runningContainer")
         val finishedContainer = f.container("finishedContainer")
-        var instance = TestInstanceBuilder.newBuilder(f.runSpecId)
+        var instance = TestInstanceBuilder
+          .newBuilder(f.runSpecId)
           .addTaskStaged(containerName = Some(stagingContainer.name))
           .addTaskStaged(containerName = Some(runningContainer.name))
           .addTaskStaged(containerName = Some(finishedContainer.name))
@@ -247,7 +247,7 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         captor.getAllValues should contain(f.taskIdFor(instance, stagingContainer))
         captor.getAllValues should contain(f.taskIdFor(instance, runningContainer))
 
-        f.clock.+=(10.seconds)
+        f.clock.advanceBy(10.seconds)
 
         val (taskId, _) = instance.tasksMap.head
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(taskId.mesosTaskId)
@@ -259,7 +259,8 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         val stagingContainer = f.container("stagingContainer")
         val runningContainer = f.container("runningContainer")
         val finishedContainer = f.container("finishedContainer")
-        var instance = TestInstanceBuilder.newBuilder(f.runSpecId)
+        var instance = TestInstanceBuilder
+          .newBuilder(f.runSpecId)
           .addTaskStaged(containerName = Some(stagingContainer.name))
           .addTaskStaged(containerName = Some(runningContainer.name))
           .addTaskStaged(containerName = Some(finishedContainer.name))
@@ -277,18 +278,19 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         captor.getAllValues should contain(f.taskIdFor(instance, stagingContainer))
         captor.getAllValues should contain(f.taskIdFor(instance, runningContainer))
 
-        f.clock.+=(10.seconds)
+        f.clock.advanceBy(10.seconds)
 
         val (taskId, _) = instance.tasksMap.head
         verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(taskId.mesosTaskId)
       }
     }
 
-    "a pod instance with only terminal tasks will be expunged and no kills are issued" should {
+    "a pod instance with only terminal tasks - no kills are issued" should {
       "issue no kills" in withActor(defaultConfig) { (f, actor) =>
         val finishedContainer1 = f.container("finishedContainer1")
         val finishedContainer2 = f.container("finishedContainer2")
-        var instance = TestInstanceBuilder.newBuilder(f.runSpecId)
+        var instance = TestInstanceBuilder
+          .newBuilder(f.runSpecId)
           .addTaskRunning(containerName = Some(finishedContainer1.name))
           .addTaskRunning(containerName = Some(finishedContainer2.name))
           .getInstance()
@@ -298,16 +300,70 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
         val promise = Promise[Done]()
         actor ! KillServiceActor.KillInstances(Seq(instance), promise)
 
+        promise.future.futureValue should be(Done)
+        actor.underlyingActor.instancesToKill should be('empty)
+        actor.underlyingActor.inFlight should be('empty)
         noMoreInteractions(f.driver)
-
-        verify(f.stateOpProcessor, timeout(f.killConfig.killRetryTimeout.toMillis.toInt)).process(InstanceUpdateOperation.ForceExpunge(instance.instanceId))
       }
+    }
+
+    "KillServiceActor" should {
+      "not put scheduled instance into the actor queue" in withActor(defaultConfig) { (f, actor) =>
+        val scheduledInstance = Instance.scheduled(AppDefinition(AbsolutePathId("/scheduled-instance"), role = "*"))
+
+        val promise = Promise[Done]()
+        actor ! KillServiceActor.KillInstances(Seq(scheduledInstance), promise)
+
+        eventually {
+          promise.isCompleted
+        }
+
+        actor.underlyingActor.inFlight.isEmpty shouldBe (true) withClue (s"Expecting nothing in flight, actually '${actor.underlyingActor.inFlight}'")
+        actor.underlyingActor.instancesToKill.isEmpty shouldBe (true) withClue (s"Expecting nothing in instances to kill, actually '${actor.underlyingActor.instancesToKill}'")
+      }
+    }
+
+    "initialize actor based on not running instances from tracker state" in {
+      Given("KillServiceActor and instance tracker with active and decommissioned instance")
+      val f = new Fixture(defaultConfig)
+      val decommissionedInstance = TestInstanceBuilder
+        .newBuilder(AbsolutePathId("/decommissioned-app"))
+        .decommissioned()
+        .addTaskRunning()
+        .getInstance()
+      f.instanceTracker
+        .instancesBySpec()(any[ExecutionContext])
+        .returns(Future.successful(InstanceTracker.InstancesBySpec.forInstances(Seq(decommissionedInstance))))
+
+      When("Actor is started")
+      val actor = system.actorOf(
+        KillServiceActor.props(f.driverHolder, f.instanceTracker, f.killConfig, f.metrics, f.clock),
+        s"KillService-${UUID.randomUUID()}"
+      )
+
+      Then("Kill is issued for the decommissioned task")
+      val captor = ArgumentCaptor.forClass(classOf[mesos.Protos.TaskID])
+      verify(f.driver, timeout(f.killConfig.killRetryTimeout.toMillis.toInt * 2)).killTask(captor.capture())
+
+      captor.getAllValues should have size 1
+      captor.getAllValues should contain(Task.Id(decommissionedInstance.instanceId, None).mesosTaskId)
+
+      And("Wait for actor being killed")
+      // teardown actor after test is done
+      actor ! PoisonPill
+      val probe = TestProbe()
+      probe.watch(actor)
+      val terminated = probe.expectMsgAnyClassOf(classOf[Terminated])
+      assert(terminated.actor == actor)
     }
   }
 
-  def withActor(killConfig: KillConfig)(testCode: (Fixture, ActorRef) => Any): Unit = {
+  def withActor(killConfig: KillConfig)(testCode: (Fixture, TestActorRef[KillServiceActor]) => Any): Unit = {
     val f = new Fixture(killConfig)
-    val actor = system.actorOf(KillServiceActor.props(f.driverHolder, f.stateOpProcessor, killConfig, f.clock), s"KillService-${UUID.randomUUID()}")
+    val actor: TestActorRef[KillServiceActor] = TestActorRef(
+      KillServiceActor.props(f.driverHolder, f.instanceTracker, killConfig, f.metrics, f.clock),
+      s"KillService-${UUID.randomUUID()}"
+    )
 
     try {
       testCode(f, actor)
@@ -322,17 +378,19 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
 
   class Fixture(val killConfig: KillConfig) {
 
-    val runSpecId = PathId("/test")
+    val runSpecId = AbsolutePathId("/test")
     val driver = mock[SchedulerDriver]
     val driverHolder: MarathonSchedulerDriverHolder = {
       val holder = new MarathonSchedulerDriverHolder
       holder.driver = Some(driver)
       holder
     }
-    val stateOpProcessor: TaskStateOpProcessor = mock[TaskStateOpProcessor]
-    val clock = ConstantClock()
+    val instanceTracker: InstanceTracker = mock[InstanceTracker]
+    instanceTracker.instanceUpdates returns Source.empty
+    val clock = new SettableClock()
+    val metrics: Metrics = DummyMetrics
 
-    def mockInstance(appId: PathId, stagedAt: Timestamp, mesosState: mesos.Protos.TaskState): Instance = {
+    def mockInstance(appId: AbsolutePathId, stagedAt: Timestamp, mesosState: mesos.Protos.TaskState): Instance = {
       TestInstanceBuilder.newBuilder(appId).addTaskWithBuilder().taskForStatus(mesosState, stagedAt).build().getInstance()
     }
 
@@ -353,7 +411,7 @@ class KillServiceActorTest extends AkkaUnitTest with StrictLogging {
     def container(name: String) = MesosContainer(name = name, resources = Resources())
 
     def taskIdFor(instance: Instance, container: MesosContainer): mesos.Protos.TaskID = {
-      val taskId = Task.Id.forInstanceId(instance.instanceId, Some(container))
+      val taskId = Task.Id(instance.instanceId, Some(container))
       taskId.mesosTaskId
     }
 

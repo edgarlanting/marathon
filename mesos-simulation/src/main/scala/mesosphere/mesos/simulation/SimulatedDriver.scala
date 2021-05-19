@@ -3,12 +3,13 @@ package mesosphere.mesos.simulation
 import java.util
 import java.util.Collections
 
-import akka.actor.{ ActorRef, ActorSystem, Props }
-import com.typesafe.config.{ Config, ConfigFactory }
-import mesosphere.marathon.stream.Implicits._
+import akka.actor.{ActorRef, ActorSystem, Props}
+import com.typesafe.config.{Config, ConfigFactory}
+import com.typesafe.scalalogging.StrictLogging
+import scala.jdk.CollectionConverters._
 import org.apache.mesos.Protos._
+import org.apache.mesos.scheduler.Protos.OfferConstraints
 import org.apache.mesos.SchedulerDriver
-import org.slf4j.LoggerFactory
 
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
@@ -23,17 +24,15 @@ import scala.concurrent.duration.Duration
   * [[mesosphere.mesos.simulation.DriverActor]].
   * Unimplemented methods throw [[scala.NotImplementedError]]s.
   */
-class SimulatedDriver(driverProps: Props) extends SchedulerDriver {
-
-  private[this] val log = LoggerFactory.getLogger(getClass)
+class SimulatedDriver(driverProps: Props) extends SchedulerDriver with StrictLogging {
 
   private[this] def driverCmd(cmd: AnyRef): Status = {
     driverActorRefOpt match {
       case Some(driverActor) =>
-        log.debug(s"send driver cmd $cmd")
+        logger.debug(s"send driver cmd $cmd")
         driverActor ! cmd
       case None =>
-        log.debug("no driver actor configured")
+        logger.debug("no driver actor configured")
     }
     status
   }
@@ -42,26 +41,27 @@ class SimulatedDriver(driverProps: Props) extends SchedulerDriver {
     driverCmd(DriverActor.DeclineOffer(offerId))
 
   override def launchTasks(offerIds: util.Collection[OfferID], tasks: util.Collection[TaskInfo]): Status =
-    driverCmd(DriverActor.LaunchTasks(offerIds.toSeq, tasks.toSeq))
+    driverCmd(DriverActor.LaunchTasks(offerIds.asScala.toSeq, tasks.asScala.toSeq))
 
   // Mesos 0.23.x
-  override def acceptOffers(
-    offerIds: util.Collection[OfferID], ops: util.Collection[Offer.Operation], filters: Filters): Status =
-    driverCmd(DriverActor.AcceptOffers(offerIds.toSeq, ops.toSeq, filters))
+  override def acceptOffers(offerIds: util.Collection[OfferID], ops: util.Collection[Offer.Operation], filters: Filters): Status =
+    driverCmd(DriverActor.AcceptOffers(offerIds.asScala.toSeq, ops.asScala.toSeq, filters))
 
   override def killTask(taskId: TaskID): Status = driverCmd(DriverActor.KillTask(taskId))
   override def reconcileTasks(statuses: util.Collection[TaskStatus]): Status = {
-    driverCmd(DriverActor.ReconcileTask(statuses.toSeq))
+    driverCmd(DriverActor.ReconcileTask(statuses.asScala.toSeq))
   }
 
   override def suppressOffers(): Status = driverCmd(DriverActor.SuppressOffers)
 
   override def reviveOffers(): Status = driverCmd(DriverActor.ReviveOffers)
 
+  override def reviveOffers(collection: util.Collection[String]): Status = ???
+
   override def declineOffer(offerId: OfferID, filters: Filters): Status = Status.DRIVER_RUNNING
 
-  override def launchTasks(offerIds: util.Collection[OfferID], tasks: util.Collection[TaskInfo],
-    filters: Filters): Status = launchTasks(offerIds, tasks)
+  override def launchTasks(offerIds: util.Collection[OfferID], tasks: util.Collection[TaskInfo], filters: Filters): Status =
+    launchTasks(offerIds, tasks)
   override def launchTasks(offerId: OfferID, tasks: util.Collection[TaskInfo], filters: Filters): Status =
     launchTasks(Collections.singleton(offerId), tasks)
   override def launchTasks(offerId: OfferID, tasks: util.Collection[TaskInfo]): Status =
@@ -77,13 +77,14 @@ class SimulatedDriver(driverProps: Props) extends SchedulerDriver {
   @volatile
   var driverActorRefOpt: Option[ActorRef] = None
 
-  private def status: Status = system match {
-    case None => Status.DRIVER_STOPPED
-    case Some(_) => Status.DRIVER_RUNNING
-  }
+  private def status: Status =
+    system match {
+      case None => Status.DRIVER_STOPPED
+      case Some(_) => Status.DRIVER_RUNNING
+    }
 
   override def start(): Status = {
-    log.info("Starting simulated Mesos")
+    logger.info("Starting simulated Mesos")
     val config: Config = ConfigFactory.load(getClass.getClassLoader, "mesos-simulation.conf")
     val sys: ActorSystem = ActorSystem("mesos-simulation", config)
     system = Some(sys)
@@ -116,8 +117,17 @@ class SimulatedDriver(driverProps: Props) extends SchedulerDriver {
         Await.result(sys.whenTerminated, Duration.Inf)
         driverActorRefOpt = None
         system = None
-        log.info("Stopped simulated Mesos")
+        logger.info("Stopped simulated Mesos")
         Status.DRIVER_STOPPED
     }
   }
+
+  override def suppressOffers(roles: util.Collection[String]): Status = ???
+
+  override def updateFramework(frameworkInfo: FrameworkInfo, suppressedRoles: util.Collection[String]): Status = ???
+  override def updateFramework(
+      frameworkInfo: FrameworkInfo,
+      suppressedRoles: util.Collection[String],
+      offerConstraints: OfferConstraints
+  ): Status = ???
 }

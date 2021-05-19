@@ -2,7 +2,7 @@ package mesosphere.mesos
 
 import mesosphere.marathon.api.serialization.PortMappingSerializer
 import mesosphere.marathon.raml.Endpoint
-import mesosphere.marathon.state.{ AppDefinition, PortDefinition }
+import mesosphere.marathon.state.{AppDefinition, PortDefinition}
 import mesosphere.marathon.state.Container.PortMapping
 import org.apache.mesos.Protos.Port
 import mesosphere.marathon.core.pod.Network
@@ -10,6 +10,7 @@ import mesosphere.marathon.core.pod.Network
 import scala.collection.immutable.Seq
 
 object PortDiscovery {
+
   /**
     * Generic interface to read either an EndPoint or a PortMapping. This allows us to write generically against these
     * two separate, but similar, data structures.
@@ -38,7 +39,7 @@ object PortDiscovery {
     implicit object ContainerPortMappingReader extends PortMappingReader[PortMapping] {
       def name(portMapping: PortMapping) = portMapping.name
       def labels(portMapping: PortMapping) = portMapping.labels
-      def protocols(portMapping: PortMapping) = portMapping.protocol.split(',').to[Seq]
+      def protocols(portMapping: PortMapping) = portMapping.protocol.split(',').to(Seq)
       def networkNames(portMapping: PortMapping) = portMapping.networkNames
       def containerPort(portMapping: PortMapping) = Some(portMapping.containerPort)
       def hostPort(portMapping: PortMapping) = portMapping.hostPort
@@ -47,7 +48,7 @@ object PortDiscovery {
     implicit object PortDefinitionReader extends PortMappingReader[PortDefinition] {
       def name(portDefinition: PortDefinition) = portDefinition.name
       def labels(portDefinition: PortDefinition) = portDefinition.labels
-      def protocols(portDefinition: PortDefinition) = portDefinition.protocol.split(',').to[Seq]
+      def protocols(portDefinition: PortDefinition) = portDefinition.protocol.split(',').to(Seq)
       def networkNames(portDefinition: PortDefinition) = Nil
       def containerPort(portDefinition: PortDefinition) = None
       def hostPort(portDefinition: PortDefinition) = Some(portDefinition.port)
@@ -74,15 +75,12 @@ object PortDiscovery {
     if (!networks.isHostModeNetworking) {
       // The run spec uses bridge and user modes with portMappings, use them to create the Port messages.
       // Just like apps, we prefer to generate network-scope=host when there's a hostPort available.
-      mappings.flatMap { mp =>
+      mappings.iterator.flatMap { mp =>
         (r.containerPort(mp), r.hostPort(mp)) match {
           case (Some(_), Some(hostPort)) =>
             r.protocols(mp).map { protocol =>
-              PortMappingSerializer.toMesosPort(
-                name = r.name(mp),
-                labels = r.labels(mp) ++ discoveryLabelsHost,
-                protocol = protocol,
-                effectivePort = hostPort)
+              PortMappingSerializer
+                .toMesosPort(name = r.name(mp), labels = r.labels(mp) ++ discoveryLabelsHost, protocol = protocol, effectivePort = hostPort)
             }
           case (Some(containerPort), None) =>
             for {
@@ -93,27 +91,25 @@ object PortDiscovery {
                 name = r.name(mp),
                 labels = r.labels(mp) ++ discoveryLabelsContainer(networkName),
                 protocol = protocol,
-                effectivePort = containerPort)
+                effectivePort = containerPort
+              )
             }
           case _ =>
             throw new IllegalStateException(
-              s"unexpected combination of network mode and endpoint ports for ${mp.getClass.getSimpleName} $mp")
+              s"unexpected combination of network mode and endpoint ports for ${mp.getClass.getSimpleName} $mp"
+            )
         }
-      }(collection.breakOut)
+      }.toSeq
     } else {
       // network-scope is assumed to be host, no need for an additional scope label here.
       for {
         ep <- mappings
 
-        hostPort: Int = r.hostPort(ep).getOrElse(throw new IllegalStateException(
-          "expected non-empty host port in conjunction with host networking"))
+        hostPort: Int =
+          r.hostPort(ep).getOrElse(throw new IllegalStateException("expected non-empty host port in conjunction with host networking"))
 
         protocol <- r.protocols(ep)
-      } yield PortMappingSerializer.toMesosPort(
-        name = r.name(ep),
-        labels = r.labels(ep),
-        protocol = protocol,
-        effectivePort = hostPort)
+      } yield PortMappingSerializer.toMesosPort(name = r.name(ep), labels = r.labels(ep), protocol = protocol, effectivePort = hostPort)
     }
   }
 
@@ -140,11 +136,11 @@ object PortDiscovery {
           .map {
             case (portMapping, assignment) =>
               if (portMapping.hostPort.isEmpty != assignment.isEmpty)
-                throw new IllegalStateException(
-                  s"unsupported combination of portMapping ${portMapping} and host port allocation")
+                throw new IllegalStateException(s"unsupported combination of portMapping ${portMapping} and host port allocation")
               else
                 portMapping.copy(hostPort = assignment)
-          })
+          }
+      )
     } else {
       // The port numbers are the allocated ports, we need to overwrite them the port numbers assigned to this particular task.
       generate(
@@ -153,9 +149,9 @@ object PortDiscovery {
           case (portDefinition, Some(assignment)) =>
             portDefinition.copy(port = assignment)
           case _ =>
-            throw new IllegalStateException(
-              "illegal portDefinition without host assignment")
-        })
+            throw new IllegalStateException("illegal portDefinition without host assignment")
+        }
+      )
 
     }
   val NetworkScopeHost = "host"
@@ -172,7 +168,5 @@ object PortDiscovery {
     Seq(NetworkScopeLabel -> NetworkScopeHost)
 
   private def discoveryLabelsContainer(networkName: String): Seq[(String, String)] =
-    Seq(
-      NetworkScopeLabel -> NetworkScopeContainer,
-      NetworkNameLabel -> networkName)
+    Seq(NetworkScopeLabel -> NetworkScopeContainer, NetworkNameLabel -> networkName)
 }

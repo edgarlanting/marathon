@@ -1,7 +1,7 @@
 package mesosphere.marathon
 package core.matcher.base.util
 
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
 import mesosphere.marathon.core.launcher.InstanceOp
 import mesosphere.marathon.core.matcher.base.OfferMatcher.MatchedInstanceOps
 
@@ -13,7 +13,8 @@ import scala.collection.immutable
 trait OfferMatcherSpec {
 
   /** All TaskInfos of launched tasks. */
-  def launchedTaskInfos(matched: MatchedInstanceOps): immutable.Seq[Mesos.TaskInfo] = matched.ops.collect {
-    case InstanceOp.LaunchTask(taskInfo, _, _, _) => taskInfo
-  }(collection.breakOut)
+  def launchedTaskInfos(matched: MatchedInstanceOps): immutable.Seq[Mesos.TaskInfo] =
+    matched.ops.iterator.collect {
+      case InstanceOp.LaunchTask(taskInfo, _, _, _) => taskInfo
+    }.toSeq
 }

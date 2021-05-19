@@ -1,119 +1,93 @@
 (ns jepsen.marathon
   (:gen-class)
-  (:require [clojure.tools.logging :refer :all]
-            [clojure.string :as str]
+  (:require [cheshire.core :as json]
             [clj-http.client :as http]
-            [clj-time.core :as time]
             [clj-time.format :as time.format]
-            [cheshire.core :as json]
+            [clj-time.core :as time]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [clojure.tools.logging :refer :all]
+            [clostache.parser :as parser]
             [jepsen.control :as c]
-            [jepsen.generator :as gen]
+            [jepsen.control.util :as cu]
+            [jepsen.store :as store]
+            [jepsen.checker :as checker]
+            [jepsen.cli :as cli]
             [jepsen.client :as client]
             [jepsen.db :as db]
-            [jepsen.cli :as cli]
-            [jepsen.tests :as tests]
-            [jepsen.control.util :as cu]
-            [jepsen.os.debian :as debian]
+            [jepsen.generator :as gen]
+            [jepsen.marathon-utils :refer :all]
             [jepsen.mesos :as mesos]
+            [jepsen.nemesis :as nemesis]
+            [jepsen.os.debian :as debian]
+            [jepsen.os.ubuntu :as ubuntu]
+            [jepsen.tests :as tests]
+            [jepsen.util :as util :refer [meh timeout]]
             [jepsen.zookeeper :as zk]
-            [jepsen.util :as util :refer [meh timeout]]))
+            [slingshot.slingshot :as slingshot]))
 
-(def marathon-pidfile "~/marathon/master.pid")
-(def marathon-dir     "~/marathon/bin/")
-(def marathon-bin     "marathon")
-(def marathon-run-log "~/marathon-log-file.log")
-(def app-dir          "/tmp/marathon-test/")
-(def test-duration    200)
+(def marathon-home     "/home/ubuntu/marathon")
+(def marathon-bin      "marathon")
+(def app-dir           "/tmp/marathon-test/")
+(def marathon-service  "/lib/systemd/system/marathon.service")
+(def marathon-log      "/home/ubuntu/marathon.log")
+(def test-duration     200)
+(def verify-check256sum-download
+  (str
+   "bash resources/download-checked.sh \\
+   https://github.com/timcharper/mcli/archive/v0.2.tar.gz \\
+   $(pwd)/v0.2.tar.gz 939b6360a1f5ce93daf654f19c97bc4290227a72ec590b21c5f84fd2165752ba"))
 
 (defn install!
   [test node]
   (c/su
-   (cu/install-archive! "https://downloads.mesosphere.io/marathon/snapshots/marathon-1.5.0-SNAPSHOT-586-g2a75b8e.tgz" "/home/vagrant/marathon")
-   (c/exec :mkdir :-p app-dir)))
+   (info node "Fetching Marathon Snapshot")
+   (cu/install-archive!
+    "https://s3.amazonaws.com/downloads.mesosphere.io/marathon/snapshots/marathon-1.5.0-SNAPSHOT-713-g14280a6.tgz"
+    marathon-home)
+   (info node "Done fetching Marathon Snapshot")
+   (c/exec :mkdir :-p app-dir))
+  (dosync
+   (info "Verifying checksum and downloading mcli v0.2: " (= 0 (:exit (shell/sh "sh" "-c" verify-check256sum-download))))
+   (shell/sh "tar" "-xzf" "v0.2.tar.gz")))
+
+(defn configure
+  [test node]
+  (c/su
+   (c/exec :touch marathon-service)
+   (c/exec :echo :-e  (parser/render-resource
+                       "services-templates/marathon-service.mustache"
+                       {:marathon-home marathon-home
+                        :node node
+                        :zk-url (zk/zk-url test)
+                        :log-file marathon-log})
+           :|
+           :tee marathon-service)
+   (c/exec :systemctl :daemon-reload)))
 
 (defn uninstall!
   [test node]
   (c/su
    (c/exec :rm :-rf
-           (c/lit "~/marathon")
-           (c/lit app-dir))))
+           (c/lit marathon-home)
+           (c/lit app-dir))
+   (c/exec :rm marathon-service)
+   (c/exec :rm marathon-log))
+  (shell/sh "rm" "-rf" "mcli-0.2")
+  (shell/sh "rm" "v0.2.tar.gz"))
 
 (defn start-marathon!
   [test node]
   (c/su
-   (cu/start-daemon! {:logfile marathon-run-log
-                      :make-pidfile? true
-                      :pidfile marathon-pidfile
-                      :chdir marathon-dir}
-                     marathon-bin
-                     :--disable_ha
-                     :--framework_name          "marathon-dev"
-                     :--hostname                 node
-                     :--http_address             node
-                     :--http_port                "8080"
-                     :--https_address            node
-                     :--https_port               "8443"
-                     :--master                   (str "zk://" node ":2181/mesos"))))
+   (meh (c/exec
+         :systemctl :start :marathon.service))))
 
 (defn stop-marathon!
   [node]
   (info node "Stopping Marathon framework")
-  (meh (c/exec :kill
-               :-KILL
-               (str "`")
-               (str "cat")
-               marathon-pidfile
-               (str "`")))
-  (meh (c/exec :rm :-rf marathon-pidfile)))
-
-(defn ping-marathon!
-  [node]
-  (http/get (str "http://" node ":8080/ping")))
-
-(defn app-cmd
-  [app-id]
-  (str "LOG=$(mktemp -p " app-dir "); "
-       "echo \"" app-id "\" >> $LOG; "
-       "date -u -Ins >> $LOG; "
-       "sleep " (* test-duration 10) ";"
-       "date -u -Ins >> $LOG;"))
-
-(defn add-app!
-  [node app-id]
-  (http/post (str "http://" node ":8080/v2/apps")
-             {:form-params   {:id    app-id
-                              :cmd   (app-cmd app-id)
-                              :cpus  0.001
-                              :mem   10.0}
-              :content-type   :json}))
-
-(defrecord Client [node]
-  client/Client
-  (setup! [this test node]
-    (assoc this :node node))
-
-  (invoke! [this test op]
-    (timeout 10000 (assoc op :type :info, :value :timed-out)
-             (try
-               (case (:f op)
-                 :add-app (do (info "Adding app:" (:id (:value op)))
-                              (add-app! node (:id (:value op)))
-                              (assoc op :type :ok)))
-               (catch org.apache.http.ConnectionClosedException e
-                 (assoc op :type :fail, :value (.getMessage e)))
-               (catch java.net.ConnectException e
-                 (assoc op :type :fail, :value (.getMessage e))))))
-
-  (teardown! [_ test]))
-
-(defn add-app
-  []
-  (let [id (atom 0)]
-    (reify gen/Generator
-      (op [_ test process]
-        {:type   :invoke
-         :f      :add-app
-         :value  {:id    (str "basic-app-" (swap! id inc))}}))))
+  (c/su
+   (meh (c/exec
+         :systemctl :stop :marathon.service))))
 
 (defn db
   "Setup and teardown marathon, mesos and zookeeper"
@@ -122,43 +96,22 @@
     (reify db/DB
       (setup! [_ test node]
         (db/setup! zk test node)
+        (install! test node)
+        (configure test node)
         (info node "starting setting mesos")
         (db/setup! mesos test node)
-        (install! test node)
         (start-marathon! test node))
       (teardown! [_ test node]
         (stop-marathon! node)
         (db/teardown! zk test node)
         (info node "stopping mesos")
         (db/teardown! mesos test node)
-        (uninstall! test node)))))
-
-(defn marathon-test
-  "Given an options map from the command-line runner (e.g. :nodes, :ssh,
-   :concurrency, ...), constructs a test map."
-  [opts]
-  (merge tests/noop-test
-         {:name      "marathon"
-          :os        debian/os
-          :db        (db "1.3.0" "zookeeper-version")
-          :client (->Client nil)
-          :generator (gen/phases
-                      (->> (add-app)
-                           (gen/stagger 10)
-                           (gen/nemesis
-                            (gen/seq (cycle [(gen/sleep 10)
-                                             {:type :info, :f :start}
-                                             (gen/sleep 10)
-                                             {:type :info, :f :stop}])))
-                           (gen/time-limit test-duration))
-                      (gen/nemesis (gen/once {:type :info, :f :stop}))
-                      (gen/log "Waiting for app executions")
-                      (gen/sleep 5))}
-         opts))
-
-(defn -main
-  "Handles command line arguments. Can either run a test, or a web server for
-   browsing results."
-  [& args]
-  (cli/run! (cli/single-test-cmd {:test-fn marathon-test})
-            args))
+        (info node "stopping Marathon framework")
+        (uninstall! test node))
+      db/LogFiles
+      (log-files [_ test node]
+        (store-mcli-logs test "apps" "mcli-apps.log")
+        (store-mcli-logs test "tasks" "mcli-tasks.log")
+        (concat (db/log-files zk test node)
+                (db/log-files mesos test node)
+                [marathon-log])))))

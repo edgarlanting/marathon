@@ -6,13 +6,13 @@ title: Networking
 
 This document describes the networking API released as of Marathon 1.5.
 
-While Marathon continues to consume the [legacy ports API](ports.html) that was shipped in versions 1.4.x and prior, all new applications should be declared using the new, non-deprecated networking API fields that are documented here. Applications using the old networking API fields will be automatically migrated to the new networking API in Marathon 1.5.x. As of version 1.5, Marathon will only produce responses in the new 1.5 networking API format.
+While Marathon continues to consume the [legacy ports API]({{ site.baseurl }}/1.4/docs/ports.html) that was shipped in versions 1.4.x and prior, all new applications should be declared using the new, non-deprecated networking API fields that are documented here. Applications using the old networking API fields will be automatically migrated to the new networking API in Marathon 1.5.x. As of version 1.5, Marathon will only produce responses in the new 1.5 networking API format.
 
-See the [Migrating to the 1.5 Networking API]({{ site.baseurl }}/docs/upgrade/network-api-migration.html) for more information on changes you may need to make to your applications.
+See the [Migrating to the 1.5 Networking API](upgrade/network-api-for-apps.html) for more information on changes you may need to make to your applications.
 
 ### VIPs
 
-If you are running Marathon within a [DC/OS cluster](https://dcos.io/get-started), you can use [virtual addresses (VIPs)](https://dcos.io/docs/1.8/usage/service-discovery/virtual-ip-addresses/) to make ports management easier.
+If you are running Marathon within a [DC/OS cluster](https://dcos.io/get-started), you can use [virtual addresses (VIPs)](https://docs.d2iq.com/mesosphere/dcos/latest/networking/load-balancing-vips/) to make ports management easier.
 VIPs simplify inter-app communication and implement a reliable service-oriented architecture.
 VIPs map traffic from a single virtual address to multiple IP addresses and ports.
 
@@ -21,7 +21,7 @@ VIPs map traffic from a single virtual address to multiple IP addresses and port
 Several [command-line flags](command-line-flags.html) determine Marathon's behavior with respect to networking.
 
 * `default_network_name` is injected as the `name` of a `container` mode network when left blank by an application.
-* `local_port_min` and `local_port_max` define a port range from which Marathon automatically allocates *service-port*s.
+* `local_port_min` and `local_port_max` define a port range from which Marathon automatically allocates \*service-port\*s.
 
 ## Networking Modes
 
@@ -47,7 +47,10 @@ Similar to `container`, an application should be allocated its own network names
 Mesos CNI provides a special `mesos-bridge` that application containers are attached to.
 When using the Docker containerizer, this translates to the Docker "default bridge" network.
 
-*NOTE*: All network modes are supported for both the Mesos and Docker containerizers.
+**Notes**:
+
+- All network modes are supported for both the Mesos and Docker containerizers.
+- The `Network.name` parameter is only supported with `container` networking.
 
 ### Usage:
 
@@ -91,6 +94,55 @@ See [the port definition section](#port-definition) for more information.
 
 **Note:** Pods (endpoints) do not support service ports.
 
+## Ports Use Cases
+
+The following use cases explore how you can configure port mapping to meet your needs. 
+
+You can configure 3 defined ports: `containerPort`, `hostPort`, and `servicePort`, as well as the label for `VIP_0` in your port mapping.
+
+All applications on Mesos are hosted in containers. Containers can run with a network configuration in bridge or host mode.
+
+Let us assume an application called "ACME," which opens port `8080`.
+
+#### Host Mode Use Case
+
+When in host mode, the container will have the host network interface defined in the container namespace. The container will not do any port mapping and the application will open up port `8080` on the host network interface. In this case, there is no container port and the `hostPort` is `8080`.
+
+#### Bridge Mode Use Case
+
+If the container is run in bridge mode, it gets its own network interface and the `containerPort` is `8080`. In bridge mode, the container will open a pseudo random port on the host and bridge/NAT communication to the container port.
+
+For example, lets say the host port is `31000`. Now, the `containerPort` is `8080`, but the `hostPort` is `31000`. Clients connecting to this service will open port `31000` on the host the service is running on. The container will route traffic to the internal port in the container, `8080`.
+
+##### Multiple App Instances Use Case
+
+Now, let's say you have 3 instances of app ACME: `10.0.0.2:31000`, `10.0.0.2:31001`, and `10.0.0.3:31000`. There is a common need to have a port that will route with an algorithm to each of those instances. The algorithm used is determined by the configuration of the load balancer. This "port" is metadata specific to this application.  All instances of the application will be hosted behind this port.
+
+In Marathon, this is referred to as the service port. The service port is specified in the `servicePort` parameter of the ACME app definition. Let us assume `servicePort` is specified as `8080`.
+
+The service port is metadata; Marathon does not do anything with this information except track it and provide it to a load balancer. The DevOps team setting up this service is expected to create a script or provide a means to read the `servicePort` and configure the load balancer to route calls to that port (port `8080` in this case) to each of the instances of the application. All metadata is queryable from Marathon.
+
+The [Marathon-LB service](https://docs.d2iq.com/mesosphere/dcos/latest/networking/marathon-lb/), when configured, does exactly this.  Marathon-LB will register all instances of an app and route to its configured `servicePort`. Marathon-LB is an HAProxy service with scripts that will register all instances of an app and route to its configured `servicePort`. In the configuration in this example, a client will connect to a load balancer at port `8080` (`servicePort`), which will route (with an algorithm) to `10.0.0.2:31000` (`hostPort`), which will in turn route to `8080` (`containerPort`) of the internal application.
+
+#### The `VIP_0` Label Use Case
+
+`VIP_0`, defined in `portDefinitions` as a label, is like `servicePort` in that it is informational and implementation-dependent. However, when used with [DC/OS](https://docs.mesosphere.com), services internal to DC/OS will make available to the cluster that DNS name and port as a route to services. An example configuration:
+
+```
+    app_def['portDefinitions'] = [{
+        "port": 0,
+        "protocol": "tcp",
+        "name": "acme",
+        "labels": {
+            "VIP_0": "/acme:10000"
+        }
+    }]
+```
+
+This configuration will create a fully qualified domain name (FQDN) according to the following schema: `<vip-name>.marathon.l4lb.thisdcos.directory:<vip-port>`, which will load balance all instances of the application. Here, the FQDN would be `acme.marathon.l4lb.thisdcos.directory:10000`.
+
+Marathon itself does nothing with this configuration. Marathon manages it as metadata for the application. A client in DC/OS could open a connection to `acme.marathon.l4lb.thisdcos.directory` at port `10000`, which would route to `10.0.0.2:31000`, which will in turn route to the `containerPort` of `8080`.
+
 #### Declaring ports in an application
 
 ##### *endpoint*:
@@ -121,7 +173,7 @@ Marathon ignores the value of `requirePorts` when interpreting a *port-mapping*.
 
 #### Summary
 
-* Review *port-definition*, *host-port*, and *service-port* in (Terminology)[#Terminology].
+* Review *port-definition*, *host-port*, and *service-port* in [Terminology](#Terminology).
 * Location in app definition: `{ "portDefinitions": [ <port-definition>... ], "requirePorts": <bool>, ... }`
 * Used in conjunction with `host` mode networking.
 * `requirePorts` applies to `portDefinitions`.
@@ -134,7 +186,7 @@ Marathon ignores the value of `requirePorts` when interpreting a *port-mapping*.
 
 Summary:
 
-* Review *port-mapping*, *container-port*, and *host-port* in (Terminology)[#Terminology].
+* Review *port-mapping*, *container-port*, and *host-port* in [Terminology](#Terminology).
 * Location in app definition: `{ "container": { "portMappings": [ <port-mapping>... ], ... }, ... }`
 * Used in conjunction with `container` and `container/bridge` mode networking.
 * When using `container/bridge` mode networking, an unspecified (`null`) value for `hostPort` is translated to `"hostPort": 0`.
@@ -159,7 +211,7 @@ It is **highly recommended** to name the ports of an app to provide clarity with
 When using `container` or `container/bridge` mode networking, be sure to bind your application to the `containerPort`s you have specified in your `portMapping`s.
 If you have set `containerPort` to `0`, this will be the same as `hostPort` and you can use the `$PORTxxx` environment variables.
 
-Additional [per-task enviroment variables](task-environment-variables.html) are also provided.
+Additional [per-task enviroment variables](task-environment-vars.html) are also provided.
 
 ### Discovery Via Mesos
 
@@ -174,7 +226,7 @@ Additional [per-task enviroment variables](task-environment-variables.html) are 
 
 #### Virtual addresses
 
-See the DC/OS documentation for [virtual addresses (VIPs)](https://dcos.io/docs/1.8/usage/service-discovery/virtual-ip-addresses/).
+See the DC/OS documentation for [virtual addresses (VIPs)](https://docs.d2iq.com/mesosphere/dcos/latest/networking/load-balancing-vips/).
 
 ## Examples
 
@@ -295,6 +347,47 @@ Specify `container/bridge` mode through the `networks` property:
     }
   },
 ```
+##### Installing the `mesos-bridge` CNI plugin
+If you are not using DC/OS and want to enable `container/bridge` mode with the Universal Container Runtime (UCR), several more steps are necessary to install and use the `mesos-bridge` CNI plugin.
+
+**Prerequisites**
+- Mesos version 1.2.0 or higher.
+- Marathon version 1.5 or higher.
+
+1. Clone the CNI repository from [https://github.com/containernetworking/cni](https://github.com/containernetworking/cni) and build according to their instructions.
+
+1. Navigate to or create a `/var/lib/mesos/cni` directory on each of your agent nodes as well as `config` and `plugins` subdirectories.
+
+1. Copy the contents of the `bin` folder created in the previous step to `/var/lib/mesos/cni/plugins` on each agent node.
+
+1. Create a file called `mesos-bridge.json`, copy the following configuration into it, and add it to `/var/lib/mesos/cni/config`.
+
+```json
+   {
+     "name": "mesos-bridge",
+     "type": "mesos-cni-port-mapper",
+     "excludeDevices": ["mesos-bridge"],
+     "chain": "MESOS-BRIDGE-PORT-MAPPER",
+     "delegate": {
+       "type": "bridge",
+       "bridge": "mesos-bridge",
+       "isGateway": true,
+       "ipMasq": true,
+       "ipam": {
+         "type": "host-local",
+         "subnet": "10.1.1.0/24",
+         "routes": [{
+           "dst": "0.0.0.0/0"
+         }]
+       }
+     }
+   }
+```
+
+1. Soft-link the `mesos-cni-port-mapper` plugin to your plugins directory using the following command
+```
+   $ sudo ln -sf /usr/libexec/mesos/mesos-cni-port-mapper /var/lib/mesos/cni/plugins/mesos-cni-port-mapper
+```
 
 #### Enabling `container` Mode
 
@@ -380,6 +473,8 @@ The default is `tcp`:
     ]
   }
 ```
+
+It is possible to specify multiple protocols by using a comma as a separator: `udp,tcp` (note the lack of spaces).
 
 ##### Specifying Service Ports
 

@@ -2,12 +2,12 @@ package mesosphere.marathon
 package core.launcher.impl
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.task.Task
-import mesosphere.marathon.state.PathId
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.core.instance.{Instance, Reservation}
+import mesosphere.marathon.state.AbsolutePathId
+import scala.jdk.CollectionConverters._
 import mesosphere.marathon.test.MarathonTestHelper
 import mesosphere.util.state.FrameworkId
-import org.apache.mesos.{ Protos => MesosProtos }
+import org.apache.mesos.{Protos => MesosProtos}
 
 class TaskLabelsTest extends UnitTest {
   "TaskLabels" should {
@@ -16,49 +16,54 @@ class TaskLabelsTest extends UnitTest {
 
       Given("unlabeled resources")
       When("checking for taskIds")
-      val taskIds = f.unlabeledResources.flatMap(TaskLabels.taskIdForResource(f.frameworkId, _))
+      val instanceIds = f.unlabeledResources.flatMap(TaskLabels.instanceIdForResource(f.frameworkId, _))
 
-      Then("we don't get any taskIds")
-      taskIds should be(empty)
+      Then("we don't get any instanceIds")
+      instanceIds should be(empty)
     }
 
     "correct labels => taskId" in {
       val f = new Fixture
 
       Given("correctly labeled resources")
-      When("checking for taskIds")
-      val taskIds = f.labeledResources.flatMap(TaskLabels.taskIdForResource(f.frameworkId, _))
+      When("checking for instanceIds")
+      val instanceIds = f.labeledResources.flatMap(TaskLabels.instanceIdForResource(f.frameworkId, _))
 
-      Then("we get as many taskIds as resources")
-      taskIds should be(Seq.fill(f.labeledResources.size)(f.taskId))
+      Then("we get as many instanceIds as resources")
+      instanceIds should be(Seq.fill(f.labeledResources.size)(f.reservationId.instanceId))
     }
 
     "labels with incorrect frameworkId are ignored" in {
       val f = new Fixture
 
       Given("labeled resources for other framework")
-      When("checking for taskIds")
-      val taskIds = f.labeledResourcesForOtherFramework.flatMap(TaskLabels.taskIdForResource(f.frameworkId, _))
+      When("checking for instanceIds")
+      val instanceIds = f.labeledResourcesForOtherFramework.flatMap(TaskLabels.instanceIdForResource(f.frameworkId, _))
 
-      Then("we don't get task ids")
-      taskIds should be(empty)
+      Then("we don't get instanceIds")
+      instanceIds should be(empty)
     }
   }
   class Fixture {
-    val appId = PathId("/test")
-    val taskId = Task.Id.forRunSpec(appId)
+    val appId = AbsolutePathId("/test")
+    val instanceId = Instance.Id.forRunSpec(appId)
+    val reservationId = Reservation.SimplifiedId(instanceId)
     val frameworkId = MarathonTestHelper.frameworkId
     val otherFrameworkId = FrameworkId("very other different framework id")
 
-    val unlabeledResources = MarathonTestHelper.makeBasicOffer().getResourcesList
+    val unlabeledResources = MarathonTestHelper.makeBasicOffer().getResourcesList.asScala
     require(unlabeledResources.nonEmpty)
     require(unlabeledResources.forall(!_.hasReservation))
 
     def labelResourcesFor(frameworkId: FrameworkId): Seq[MesosProtos.Resource] = {
-      MarathonTestHelper.makeBasicOffer(
-        reservation = Some(TaskLabels.labelsForTask(frameworkId, taskId)),
-        role = "test"
-      ).getResourcesList.to[Seq]
+      MarathonTestHelper
+        .makeBasicOffer(
+          reservation = Some(TaskLabels.labelsForTask(frameworkId, reservationId)),
+          role = "test"
+        )
+        .getResourcesList
+        .asScala
+        .to(Seq)
     }
 
     val labeledResources = labelResourcesFor(frameworkId)

@@ -22,14 +22,12 @@ protected[providers] object OptionSupport {
       val parsed = Try(v.toLong)
       parsed match {
         case util.Success(x) if x > 0 => Success
-        case _ => Failure(Set(RuleViolation(v, s"Expected a valid, positive integer instead of $v", None)))
+        case _ => Failure(Set(RuleViolation(v, s"Expected a valid, positive integer instead of $v")))
       }
     }
   }
 
   /** a validator to enforce that values parse to booleans */
   import mesosphere.marathon.api.v2.Validation.isTrue
-  lazy val validBoolean: Validator[String] = isTrue[String]("Expected a valid boolean")(s =>
-    Try(s.toBoolean).getOrElse(false)
-  )
+  lazy val validBoolean: Validator[String] = isTrue[String]("Expected a valid boolean")(s => Try(s.toBoolean).getOrElse(false))
 }

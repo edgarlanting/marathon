@@ -3,17 +3,20 @@ package core.storage.store.impl.zk
 
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
-import java.time.{ Instant, OffsetDateTime, ZoneOffset }
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 import java.util.UUID
 
+import akka.Done
 import akka.http.scaladsl.marshalling.Marshaller
 import akka.http.scaladsl.unmarshalling.Unmarshaller
+import akka.stream.scaladsl.Sink
 import akka.util.ByteString
+import com.mesosphere.utils.zookeeper.ZookeeperServerTest
 import mesosphere.AkkaUnitTest
-import mesosphere.marathon.core.storage.store.{ IdResolver, PersistenceStoreTest, TestClass1 }
-import mesosphere.marathon.integration.setup.ZookeeperServerTest
-
-import scala.concurrent.duration._
+import mesosphere.marathon.core.base.JvmExitsCrashStrategy
+import mesosphere.marathon.core.storage.store.{IdResolver, PersistenceStoreTest, TestClass1}
+import mesosphere.marathon.metrics.dummy.DummyMetrics
+import mesosphere.marathon.state.Timestamp
 
 trait ZkTestClass1Serialization {
   implicit object ZkTestClass1Resolver extends IdResolver[String, TestClass1, String, ZkId] {
@@ -53,18 +56,47 @@ trait ZkTestClass1Serialization {
     }
 }
 
-class ZkPersistenceStoreTest extends AkkaUnitTest
-    with PersistenceStoreTest with ZookeeperServerTest with ZkTestClass1Serialization {
+class ZkPersistenceStoreTest extends AkkaUnitTest with PersistenceStoreTest with ZookeeperServerTest with ZkTestClass1Serialization {
 
   lazy val rootClient = zkClient()
 
+  private val metrics = DummyMetrics
+
   def defaultStore: ZkPersistenceStore = {
     val root = UUID.randomUUID().toString
-    val client = zkClient(namespace = Some(root))
-    new ZkPersistenceStore(client, Duration.Inf)
+    val client = RichCuratorFramework(zkClient(namespace = Some(root)), JvmExitsCrashStrategy)
+    val store = new ZkPersistenceStore(metrics, client)
+    store.markOpen()
+    store
   }
 
   behave like basicPersistenceStore("ZookeeperPersistenceStore", defaultStore)
   behave like backupRestoreStore("ZookeeperPersistenceStore", defaultStore)
-}
 
+  "ZkId should trim anything but millis after serialization" in {
+    val dateTime = OffsetDateTime.of(2015, 5, 14, 15, 43, 21, 0, ZoneOffset.UTC)
+    val withNanos = dateTime.withNano(123456789)
+    val zkId = ZkId("cat", "path", Some(withNanos))
+    val zkIdVersion = zkId.path.reverse.takeWhile(_ != '/').reverse
+    zkIdVersion shouldEqual "2015-05-14T15:43:21.123Z"
+    ZkId("cat", "path", Some(OffsetDateTime.parse(zkIdVersion))).path shouldEqual zkId.path
+  }
+
+  def trimmingTest(offsetDateTime: OffsetDateTime): Unit = {
+    val store = defaultStore
+
+    val offsetDateTimeOnlyMillisStr = offsetDateTime.format(Timestamp.formatter)
+    val offsetDateTimeOnlyMillis = OffsetDateTime.parse(offsetDateTimeOnlyMillisStr)
+    val tc = TestClass1("abc", 1, offsetDateTime)
+    store.store("test", tc).futureValue shouldEqual Done
+    store.versions("test").runWith(Sink.seq).futureValue shouldEqual Seq(offsetDateTimeOnlyMillis)
+  }
+  "handle nanoseconds when providing versions" in {
+    val offsetDateTime = OffsetDateTime.of(2015, 2, 3, 12, 30, 15, 123456789, ZoneOffset.UTC)
+    trimmingTest(offsetDateTime)
+  }
+  "handle milliseconds when providing versions" in {
+    val offsetDateTime = OffsetDateTime.of(2015, 2, 3, 12, 30, 15, 123000000, ZoneOffset.UTC)
+    trimmingTest(offsetDateTime)
+  }
+}

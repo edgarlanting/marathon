@@ -1,0 +1,45 @@
+#%RAML 1.0 Library
+uses:
+  strings: stringTypes.raml
+  deploymentAction: deploymentAction.raml
+  deploymentPlan: deploymentPlan.raml
+  readiness: readinessCheck.raml
+  pragma: pragma.raml
+
+types:
+
+  # Annotate the deployment action with more information required for the event
+  DeploymentActionInfo:
+    type: deploymentAction.DeploymentAction
+    (pragma.serializeOnly): # Used only for serialization
+    description: A deployment action with additional status information
+    properties:
+      readinessCheckResults:
+        type: readiness.TaskReadinessCheckResult[]
+        description: |
+          If there are readiness checks present for this deployment this property contains
+          their status for every task.
+
+  # Annotate the deployment plan with more information required for the event
+  DeploymentStepInfo:
+    type: deploymentPlan.DeploymentPlan
+    (pragma.serializeOnly): # Used only for serialization
+    description: The status details of a deployment step
+    properties:
+      affectedApps:
+        type: strings.PathId[]
+        description: The IDs of the apps affected by this deployment
+      affectedPods:
+        type: strings.PathId[]
+        description: The IDs of the pods affected by this deployment
+      currentActions:
+        type: DeploymentActionInfo[]
+        description: The "actions" of the currently active deployment step
+      currentStep:
+        type: integer
+        format: int32
+        description: The index of the current step as found in the "steps" property
+      totalSteps:
+        type: integer
+        format: int32
+        description: The total number of steps in the deployment

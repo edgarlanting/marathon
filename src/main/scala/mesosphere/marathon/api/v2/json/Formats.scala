@@ -1,26 +1,26 @@
 package mesosphere.marathon
 package api.v2.json
 
-import mesosphere.marathon.core.appinfo._
-import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.deployment.{ DeploymentAction, DeploymentPlan, DeploymentStep, DeploymentStepInfo }
+import java.time.OffsetDateTime
+
+import com.fasterxml.jackson.databind.SerializationFeature
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
+import com.fasterxml.jackson.datatype.jsr310.ser.OffsetDateTimeSerializer
 import mesosphere.marathon.core.event._
 import mesosphere.marathon.core.health._
 import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.plugin.{ PluginDefinition, PluginDefinitions }
-import mesosphere.marathon.core.pod.PodDefinition
-import mesosphere.marathon.core.readiness.{ HttpResponse, ReadinessCheckResult }
-import mesosphere.marathon.core.task.Task
+import mesosphere.marathon.core.plugin.{PluginDefinition, PluginDefinitions}
+import mesosphere.marathon.core.readiness.{HttpResponse, ReadinessCheckResult}
 import mesosphere.marathon.core.task.state.NetworkInfo
-import mesosphere.marathon.raml.Raml
+import mesosphere.marathon.raml.{Raml, RamlSerializer}
 import mesosphere.marathon.state._
-import org.apache.mesos.{ Protos => mesos }
-import play.api.data.validation.ValidationError
+import org.apache.mesos.{Protos => mesos}
+import play.api.libs.json.JsonValidationError
 import play.api.libs.functional.syntax._
-import play.api.libs.json.Json.JsValueWrapper
 import play.api.libs.json._
 
 import scala.concurrent.duration._
+import scala.collection.compat._
 
 // TODO: We should replace this entire thing with the auto-generated formats from the RAML.
 // See https://mesosphere.atlassian.net/browse/MARATHON-1291
@@ -46,28 +46,25 @@ object Formats extends Formats {
         _.toSeconds
       )
   }
+
+  /**
+    * Register Jackson serializer for RAML models.
+    */
+  def configureJacksonSerializer(): Unit = {
+
+    // We want to serialize OffsetDateTime with our own format
+    val s = new OffsetDateTimeSerializer(OffsetDateTimeSerializer.INSTANCE, false, Timestamp.formatter) {}
+
+    val jtm = new JavaTimeModule()
+    jtm.addSerializer(classOf[OffsetDateTime], s)
+
+    RamlSerializer.serializer.registerModule(jtm)
+    RamlSerializer.serializer.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+    RamlSerializer.serializer.disable(SerializationFeature.FLUSH_AFTER_WRITE_VALUE)
+  }
 }
 
-trait Formats
-    extends AppAndGroupFormats
-    with HealthCheckFormats
-    with ReadinessCheckFormats
-    with DeploymentFormats
-    with EventFormats
-    with PluginFormats {
-
-  implicit lazy val TaskFailureWrites: Writes[TaskFailure] = Writes { failure =>
-    Json.obj(
-      "appId" -> failure.appId,
-      "host" -> failure.host,
-      "message" -> failure.message,
-      "state" -> failure.state.name(),
-      "taskId" -> failure.taskId.getValue,
-      "timestamp" -> failure.timestamp,
-      "version" -> failure.version,
-      "slaveId" -> failure.slaveId.fold[JsValue](JsNull){ slaveId => JsString(slaveId.getValue) }
-    )
-  }
+trait Formats extends HealthCheckFormats with ReadinessCheckFormats with DeploymentFormats with EventFormats with PluginFormats {
 
   implicit lazy val networkInfoProtocolWrites = Writes[mesos.NetworkInfo.Protocol] { protocol =>
     JsString(protocol.name)
@@ -78,7 +75,6 @@ trait Formats
 
   implicit lazy val networkInfoProtocolReads = Reads[mesos.NetworkInfo.Protocol] { json =>
     json.validate[String].flatMap { protocolString: String =>
-
       Option(mesos.NetworkInfo.Protocol.valueOf(protocolString)) match {
         case Some(protocol) => JsSuccess(protocol)
         case None =>
@@ -97,7 +93,7 @@ trait Formats
 
     (
       (__ \ "ipAddress").format[String] ~
-      (__ \ "protocol").format[mesos.NetworkInfo.Protocol]
+        (__ \ "protocol").format[mesos.NetworkInfo.Protocol]
     )(toIpAddress, toTuple)
   }
 
@@ -107,63 +103,18 @@ trait Formats
 
   implicit val TaskStatusNetworkInfoFormat: Format[NetworkInfo] = (
     (__ \ "hostName").format[String] ~
-    (__ \ "hostPorts").format[Seq[Int]] ~
-    (__ \ "ipAddresses").format[Seq[mesos.NetworkInfo.IPAddress]]
+      (__ \ "hostPorts").format[Seq[Int]] ~
+      (__ \ "ipAddresses").format[Seq[mesos.NetworkInfo.IPAddress]]
   )(NetworkInfo(_, _, _), unlift(NetworkInfo.unapply))
 
-  import scala.collection.mutable
-  implicit val TaskWrites: Writes[Task] = Writes { task =>
-    val fields = mutable.HashMap[String, JsValueWrapper](
-      "id" -> task.taskId,
-      "state" -> Condition.toMesosTaskStateOrStaging(task.status.condition)
-    )
-    if (task.isActive) {
-      fields.update("startedAt", task.status.startedAt)
-      fields.update("stagedAt", task.status.stagedAt)
-      fields.update("ports", task.status.networkInfo.hostPorts)
-      fields.update("version", task.runSpecVersion)
-    }
-    if (task.status.networkInfo.ipAddresses.nonEmpty) {
-      fields.update("ipAddresses", task.status.networkInfo.ipAddresses)
-    }
-    task.reservationWithVolumes.foreach { reservation =>
-      fields.update("localVolumes", reservation.volumeIds)
-    }
+  def newPathIdWrites[O <: PathId]: Writes[O] = Writes[O] { id => JsString(id.toString) }
+  implicit val PathIdReads: Reads[PathId] = Reads.of[String](Reads.minLength[String](1)).map(PathId(_))
+  implicit val PathIdWrites: Writes[PathId] = newPathIdWrites[PathId]
 
-    Json.obj(fields.to[Seq]: _*)
-  }
+  implicit val AbsolutePathIdReads: Reads[AbsolutePathId] = Reads.of[String](Reads.minLength[String](1)).map(AbsolutePathId(_))
+  implicit val AbsolutePathIdWrites: Writes[AbsolutePathId] = newPathIdWrites[AbsolutePathId]
 
-  implicit lazy val EnrichedTaskWrites: Writes[EnrichedTask] = Writes { task =>
-    val taskJson = TaskWrites.writes(task.task).as[JsObject]
-
-    val enrichedJson = taskJson ++ Json.obj(
-      "appId" -> task.appId,
-      "slaveId" -> task.agentInfo.agentId,
-      "host" -> task.agentInfo.host
-    )
-
-    val withServicePorts = if (task.servicePorts.nonEmpty)
-      enrichedJson ++ Json.obj("servicePorts" -> task.servicePorts)
-    else
-      enrichedJson
-
-    if (task.healthCheckResults.nonEmpty)
-      withServicePorts ++ Json.obj("healthCheckResults" -> task.healthCheckResults)
-    else
-      withServicePorts
-  }
-
-  implicit lazy val PathIdFormat: Format[PathId] = Format(
-    Reads.of[String](Reads.minLength[String](1)).map(PathId(_)),
-    Writes[PathId] { id => JsString(id.toString) }
-  )
-
-  implicit lazy val InstanceIdFormat: Format[Instance.Id] = Format(
-    Reads.of[String](Reads.minLength[String](3)).map(Instance.Id(_)),
-    Writes[Instance.Id] { id => JsString(id.idString) }
-  )
-
-  implicit lazy val TimestampFormat: Format[Timestamp] = Format(
+  implicit val TimestampFormat: Format[Timestamp] = Format(
     Reads.of[String].map(Timestamp(_)),
     Writes[Timestamp] { t => JsString(t.toString) }
   )
@@ -173,7 +124,7 @@ trait Formats
    */
 
   def nonEmpty[C <: Iterable[_]](implicit reads: Reads[C]): Reads[C] =
-    Reads.filterNot[C](ValidationError("set must not be empty"))(_.isEmpty)(reads)
+    Reads.filterNot[C](JsonValidationError("set must not be empty"))(_.isEmpty)(reads)
 
   def enumFormat[A <: java.lang.Enum[A]](read: String => A, errorMsg: String => String): Format[A] = {
     val reads = Reads[A] {
@@ -194,18 +145,18 @@ trait Formats
 }
 
 trait DeploymentFormats {
-  import Formats._
 
   implicit lazy val ByteArrayFormat: Format[Array[Byte]] =
     Format(
       Reads.of[Seq[Int]].map(_.map(_.toByte).toArray),
       Writes { xs =>
-        JsArray(xs.to[Seq].map(b => JsNumber(b.toInt)))
+        JsArray(xs.to(Seq).map(b => JsNumber(b.toInt)))
       }
     )
 
   implicit lazy val URLToStringMapFormat: Format[Map[java.net.URL, String]] = Format(
-    Reads.of[Map[String, String]]
+    Reads
+      .of[Map[String, String]]
       .map(
         _.map { case (k, v) => new java.net.URL(k) -> v }
       ),
@@ -213,38 +164,6 @@ trait DeploymentFormats {
       Json.toJson(m)
     }
   )
-
-  def actionInstanceOn(runSpec: RunSpec): String = runSpec match {
-    case _: AppDefinition => "app"
-    case _: PodDefinition => "pod"
-  }
-
-  implicit lazy val DeploymentActionWrites: Writes[DeploymentAction] = Writes { action =>
-    Json.obj(
-      "action" -> DeploymentAction.actionName(action),
-      actionInstanceOn(action.runSpec) -> action.runSpec.id
-    )
-  }
-
-  implicit lazy val DeploymentStepWrites: Writes[DeploymentStep] = Json.writes[DeploymentStep]
-
-  implicit lazy val DeploymentStepInfoWrites: Writes[DeploymentStepInfo] = Writes { info =>
-    def currentAction(action: DeploymentAction): JsObject = Json.obj (
-      "action" -> DeploymentAction.actionName(action),
-      actionInstanceOn(action.runSpec) -> action.runSpec.id,
-      "readinessCheckResults" -> info.readinessChecksByApp(action.runSpec.id)
-    )
-    Json.obj(
-      "id" -> info.plan.id,
-      "version" -> info.plan.version,
-      "affectedApps" -> info.plan.affectedAppIds,
-      "affectedPods" -> info.plan.affectedPodIds,
-      "steps" -> info.plan.steps,
-      "currentActions" -> info.step.actions.map(currentAction),
-      "currentStep" -> info.stepIndex,
-      "totalSteps" -> info.plan.steps.size
-    )
-  }
 }
 
 trait EventFormats {
@@ -265,20 +184,9 @@ trait EventFormats {
     Json.obj(
       "clientIp" -> event.clientIp,
       "uri" -> event.uri,
-      "appDefinition" -> event.appDefinition,
+      "appDefinition" -> Raml.toRaml(event.appDefinition),
       "eventType" -> event.eventType,
       "timestamp" -> event.timestamp
-    )
-  }
-
-  implicit lazy val DeploymentPlanWrites: Writes[DeploymentPlan] = Writes { plan =>
-
-    Json.obj(
-      "id" -> plan.id,
-      "original" -> Raml.toRaml[Group, raml.Group](plan.original),
-      "target" -> Raml.toRaml[Group, raml.Group](plan.target),
-      "steps" -> plan.steps,
-      "version" -> plan.version
     )
   }
 
@@ -313,11 +221,13 @@ trait EventFormats {
   implicit lazy val HealthStatusChangedWrites: Writes[HealthStatusChanged] = Json.writes[HealthStatusChanged]
   implicit lazy val GroupChangeSuccessWrites: Writes[GroupChangeSuccess] = Json.writes[GroupChangeSuccess]
   implicit lazy val GroupChangeFailedWrites: Writes[GroupChangeFailed] = Json.writes[GroupChangeFailed]
+
   implicit lazy val DeploymentSuccessWrites: Writes[DeploymentSuccess] = Json.writes[DeploymentSuccess]
   implicit lazy val DeploymentFailedWrites: Writes[DeploymentFailed] = Json.writes[DeploymentFailed]
   implicit lazy val DeploymentStatusWrites: Writes[DeploymentStatus] = Json.writes[DeploymentStatus]
   implicit lazy val DeploymentStepSuccessWrites: Writes[DeploymentStepSuccess] = Json.writes[DeploymentStepSuccess]
   implicit lazy val DeploymentStepFailureWrites: Writes[DeploymentStepFailure] = Json.writes[DeploymentStepFailure]
+
   implicit lazy val MesosStatusUpdateEventWrites: Writes[MesosStatusUpdateEvent] = Json.writes[MesosStatusUpdateEvent]
   implicit lazy val MesosFrameworkMessageEventWrites: Writes[MesosFrameworkMessageEvent] =
     Json.writes[MesosFrameworkMessageEvent]
@@ -332,8 +242,8 @@ trait EventFormats {
       "instanceId" -> change.id,
       "condition" -> change.condition.toString,
       "runSpecId" -> change.runSpecId,
-      "agentId" -> change.instance.agentInfo.agentId,
-      "host" -> change.instance.agentInfo.host,
+      "agentId" -> change.instance.agentInfo.flatMap(_.agentId),
+      "host" -> change.instance.hostname,
       "runSpecVersion" -> change.runSpecVersion,
       "timestamp" -> change.timestamp,
       "eventType" -> change.eventType
@@ -359,35 +269,37 @@ trait EventFormats {
     )
   }
 
-  def eventToJson(event: MarathonEvent): JsValue = event match {
-    case event: AppTerminatedEvent => Json.toJson(event)
-    case event: ApiPostEvent => Json.toJson(event)
-    case event: Subscribe => Json.toJson(event)
-    case event: Unsubscribe => Json.toJson(event)
-    case event: EventStreamAttached => Json.toJson(event)
-    case event: EventStreamDetached => Json.toJson(event)
-    case event: AddHealthCheck => Json.toJson(event)
-    case event: RemoveHealthCheck => Json.toJson(event)
-    case event: FailedHealthCheck => Json.toJson(event)
-    case event: HealthStatusChanged => Json.toJson(event)
-    case event: UnhealthyInstanceKillEvent => Json.toJson(event)
-    case event: GroupChangeSuccess => Json.toJson(event)
-    case event: GroupChangeFailed => Json.toJson(event)
-    case event: DeploymentSuccess => Json.toJson(event)
-    case event: DeploymentFailed => Json.toJson(event)
-    case event: DeploymentStatus => Json.toJson(event)
-    case event: DeploymentStepSuccess => Json.toJson(event)
-    case event: DeploymentStepFailure => Json.toJson(event)
-    case event: MesosStatusUpdateEvent => Json.toJson(event)
-    case event: MesosFrameworkMessageEvent => Json.toJson(event)
-    case event: SchedulerDisconnectedEvent => Json.toJson(event)
-    case event: SchedulerRegisteredEvent => Json.toJson(event)
-    case event: SchedulerReregisteredEvent => Json.toJson(event)
-    case event: InstanceChanged => Json.toJson(event)
-    case event: InstanceHealthChanged => Json.toJson(event)
-    case event: UnknownInstanceTerminated => Json.toJson(event)
-    case event: PodEvent => Json.toJson(event)
-  }
+  def eventToJson(event: MarathonEvent): JsValue =
+    event match {
+      case event: AppTerminatedEvent => Json.toJson(event)
+      case event: ApiPostEvent => Json.toJson(event)
+      case event: Subscribe => Json.toJson(event)
+      case event: Unsubscribe => Json.toJson(event)
+      case event: EventStreamAttached => Json.toJson(event)
+      case event: EventStreamDetached => Json.toJson(event)
+      case event: AddHealthCheck => Json.toJson(event)
+      case event: RemoveHealthCheck => Json.toJson(event)
+      case event: FailedHealthCheck => Json.toJson(event)
+      case event: HealthStatusChanged => Json.toJson(event)
+      case event: UnhealthyInstanceKillEvent => Json.toJson(event)
+      case event: GroupChangeSuccess => Json.toJson(event)
+      case event: GroupChangeFailed => Json.toJson(event)
+      case event: MesosStatusUpdateEvent => Json.toJson(event)
+      case event: MesosFrameworkMessageEvent => Json.toJson(event)
+      case event: SchedulerDisconnectedEvent => Json.toJson(event)
+      case event: SchedulerRegisteredEvent => Json.toJson(event)
+      case event: SchedulerReregisteredEvent => Json.toJson(event)
+      case event: InstanceChanged => Json.toJson(event)
+      case event: InstanceHealthChanged => Json.toJson(event)
+      case event: UnknownInstanceTerminated => Json.toJson(event)
+      case event: PodEvent => Json.toJson(event)
+
+      case event: DeploymentSuccess => Json.toJson(event)
+      case event: DeploymentFailed => Json.toJson(event)
+      case event: DeploymentStatus => Json.toJson(event)
+      case event: DeploymentStepSuccess => Json.toJson(event)
+      case event: DeploymentStepFailure => Json.toJson(event)
+    }
 }
 
 trait HealthCheckFormats {
@@ -412,119 +324,15 @@ trait ReadinessCheckFormats {
   implicit lazy val ReadinessCheckResultFormat: Format[ReadinessCheckResult] = Json.format[ReadinessCheckResult]
 }
 
-@SuppressWarnings(Array("PartialFunctionInsteadOfMatch"))
-trait AppAndGroupFormats {
-
-  import Formats._
-
-  implicit lazy val IdentifiableWrites = Json.writes[Identifiable]
-
-  implicit lazy val RunSpecWrites: Writes[RunSpec] = {
-    Writes[RunSpec] {
-      case app: AppDefinition => Json.toJson(Raml.toRaml(app))
-      case pod: PodDefinition => Json.toJson(Raml.toRaml(pod))
-    }
-  }
-
-  implicit lazy val TaskCountsWrites: Writes[TaskCounts] =
-    Writes { counts =>
-      Json.obj(
-        "tasksStaged" -> counts.tasksStaged,
-        "tasksRunning" -> counts.tasksRunning,
-        "tasksHealthy" -> counts.tasksHealthy,
-        "tasksUnhealthy" -> counts.tasksUnhealthy
-      )
-    }
-
-  lazy val TaskCountsWritesWithoutPrefix: Writes[TaskCounts] =
-    Writes { counts =>
-      Json.obj(
-        "staged" -> counts.tasksStaged,
-        "running" -> counts.tasksRunning,
-        "healthy" -> counts.tasksHealthy,
-        "unhealthy" -> counts.tasksUnhealthy
-      )
-    }
-
-  implicit lazy val TaskLifeTimeWrites: Writes[TaskLifeTime] =
-    Writes { lifeTime =>
-      Json.obj(
-        "averageSeconds" -> lifeTime.averageSeconds,
-        "medianSeconds" -> lifeTime.medianSeconds
-      )
-    }
-
-  implicit lazy val TaskStatsWrites: Writes[TaskStats] =
-    Writes { stats =>
-      val statsJson = Json.obj("counts" -> TaskCountsWritesWithoutPrefix.writes(stats.counts))
-      Json.obj(
-        "stats" -> stats.maybeLifeTime.fold(ifEmpty = statsJson)(lifeTime =>
-          statsJson ++ Json.obj("lifeTime" -> lifeTime)
-        )
-      )
-    }
-
-  @SuppressWarnings(Array("PartialFunctionInsteadOfMatch"))
-  implicit lazy val TaskStatsByVersionWrites: Writes[TaskStatsByVersion] =
-    Writes { byVersion =>
-      val maybeJsons = Map[String, Option[TaskStats]](
-        "startedAfterLastScaling" -> byVersion.maybeStartedAfterLastScaling,
-        "withLatestConfig" -> byVersion.maybeWithLatestConfig,
-        "withOutdatedConfig" -> byVersion.maybeWithOutdatedConfig,
-        "totalSummary" -> byVersion.maybeTotalSummary
-      )
-      Json.toJson(
-        maybeJsons.flatMap {
-          case (k, v) => v.map(k -> TaskStatsWrites.writes(_))
-        }
-      )
-    }
-
-  implicit lazy val ExtendedAppInfoWrites: Writes[AppInfo] =
-    Writes { info =>
-      val appJson = RunSpecWrites.writes(info.app).as[JsObject]
-
-      val maybeJson = Seq[Option[JsObject]](
-        info.maybeCounts.map(TaskCountsWrites.writes(_).as[JsObject]),
-        info.maybeDeployments.map(deployments => Json.obj("deployments" -> deployments)),
-        info.maybeReadinessCheckResults.map(readiness => Json.obj("readinessCheckResults" -> readiness)),
-        info.maybeTasks.map(tasks => Json.obj("tasks" -> tasks)),
-        info.maybeLastTaskFailure.map(lastFailure => Json.obj("lastTaskFailure" -> lastFailure)),
-        info.maybeTaskStats.map(taskStats => Json.obj("taskStats" -> taskStats))
-      ).flatten
-
-      maybeJson.foldLeft(appJson)((result, obj) => result ++ obj)
-    }
-
-  implicit lazy val GroupInfoWrites: Writes[GroupInfo] =
-    Writes { info =>
-
-      val maybeJson = Seq[Option[JsObject]](
-        info.maybeApps.map(apps => Json.obj("apps" -> apps)),
-        info.maybeGroups.map(groups => Json.obj("groups" -> groups)),
-        info.maybePods.map(pods => Json.obj("pods" -> pods))
-      ).flatten
-
-      val groupJson = Json.obj (
-        "id" -> info.group.id,
-        "dependencies" -> info.group.dependencies,
-        "version" -> info.group.version
-      )
-
-      maybeJson.foldLeft(groupJson)((result, obj) => result ++ obj)
-    }
-
-}
-
 trait PluginFormats {
 
   implicit lazy val pluginDefinitionFormat: Writes[PluginDefinition] = (
     (__ \ "id").write[String] ~
-    (__ \ "plugin").write[String] ~
-    (__ \ "implementation").write[String] ~
-    (__ \ "tags").writeNullable[Set[String]] ~
-    (__ \ "info").writeNullable[JsObject]
-  ) (d => (d.id, d.plugin, d.implementation, d.tags, d.info))
+      (__ \ "plugin").write[String] ~
+      (__ \ "implementation").write[String] ~
+      (__ \ "tags").writeNullable[Set[String]] ~
+      (__ \ "info").writeNullable[JsObject]
+  )(d => (d.id, d.plugin, d.implementation, d.tags, d.info))
 
   implicit lazy val pluginDefinitionsFormat: Writes[PluginDefinitions] = Json.writes[PluginDefinitions]
 }

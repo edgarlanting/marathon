@@ -1,73 +1,72 @@
 package mesosphere.marathon
 package core.launchqueue.impl
 
+import java.time.Clock
+
 import akka.Done
 import akka.actor._
 import akka.event.LoggingReceive
+import akka.pattern._
+import akka.stream.scaladsl.SourceQueue
 import com.typesafe.scalalogging.StrictLogging
-import mesosphere.marathon.core.base.Clock
-import mesosphere.marathon.core.flow.OfferReviver
 import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.instance.update.{ InstanceChange, InstanceDeleted, InstanceUpdated }
-import mesosphere.marathon.core.launcher.{ InstanceOp, InstanceOpFactory, OfferMatchResult }
-import mesosphere.marathon.core.launchqueue.LaunchQueue.QueuedInstanceInfo
+import mesosphere.marathon.core.instance.update.{InstanceDeleted, InstanceUpdateOperation, InstanceUpdated}
+import mesosphere.marathon.core.launcher.{InstanceOp, InstanceOpFactory, OfferMatchResult}
 import mesosphere.marathon.core.launchqueue.LaunchQueueConfig
 import mesosphere.marathon.core.launchqueue.impl.TaskLauncherActor.RecheckIfBackOffUntilReached
 import mesosphere.marathon.core.matcher.base.OfferMatcher
-import mesosphere.marathon.core.matcher.base.OfferMatcher.{ InstanceOpWithSource, MatchedInstanceOps }
-import mesosphere.marathon.core.matcher.base.util.InstanceOpSourceDelegate.InstanceOpNotification
-import mesosphere.marathon.core.matcher.base.util.{ ActorOfferMatcher, InstanceOpSourceDelegate }
+import mesosphere.marathon.core.matcher.base.OfferMatcher.{InstanceOpWithSource, MatchedInstanceOps}
+import mesosphere.marathon.core.matcher.base.util.{ActorOfferMatcher, InstanceOpSourceDelegate}
 import mesosphere.marathon.core.matcher.manager.OfferMatcherManager
 import mesosphere.marathon.core.task.tracker.InstanceTracker
-import mesosphere.marathon.state.{ RunSpec, Timestamp }
-import org.apache.mesos.{ Protos => Mesos }
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.state._
+import mesosphere.marathon.util.CancellableOnce
+import org.apache.mesos.{Protos => Mesos}
+import scala.concurrent.ExecutionContext.Implicits.global
 
+import scala.collection.mutable
 import scala.concurrent.Promise
 import scala.concurrent.duration._
 
 private[launchqueue] object TaskLauncherActor {
   def props(
-    config: LaunchQueueConfig,
-    offerMatcherManager: OfferMatcherManager,
-    clock: Clock,
-    taskOpFactory: InstanceOpFactory,
-    maybeOfferReviver: Option[OfferReviver],
-    instanceTracker: InstanceTracker,
-    rateLimiterActor: ActorRef,
-    offerMatchStatisticsActor: ActorRef)(
-    runSpec: RunSpec,
-    initialCount: Int): Props = {
-    Props(new TaskLauncherActor(
-      config,
-      offerMatcherManager,
-      clock, taskOpFactory,
-      maybeOfferReviver,
-      instanceTracker, rateLimiterActor, offerMatchStatisticsActor,
-      runSpec, initialCount))
+      config: LaunchQueueConfig,
+      offerMatcherManager: OfferMatcherManager,
+      clock: Clock,
+      taskOpFactory: InstanceOpFactory,
+      instanceTracker: InstanceTracker,
+      rateLimiterActor: ActorRef,
+      offerMatchStatistics: SourceQueue[OfferMatchStatistics.OfferMatchUpdate],
+      localRegion: () => Option[Region]
+  )(runSpecId: AbsolutePathId): Props = {
+    Props(
+      new TaskLauncherActor(
+        config,
+        offerMatcherManager,
+        clock,
+        taskOpFactory,
+        instanceTracker,
+        rateLimiterActor,
+        offerMatchStatistics,
+        runSpecId,
+        localRegion
+      )
+    )
   }
 
-  sealed trait Requests
+  sealed trait Message
 
-  /**
-    * Increase the instance count of the receiver.
-    * The actor responds with a [[QueuedInstanceInfo]] message.
-    */
-  case class AddInstances(spec: RunSpec, count: Int) extends Requests
-  /**
-    * Get the current count.
-    * The actor responds with a [[QueuedInstanceInfo]] message.
-    */
-  case object GetCount extends Requests
+  sealed trait Requests extends Message
 
   /**
     * Results in rechecking whether we may launch tasks.
     */
   private case object RecheckIfBackOffUntilReached extends Requests
 
-  case object Stop extends Requests
+  private case class LoadedInstances(value: Map[Instance.Id, Instance]) extends Message
+  private case class SynchronizedInstance(value: Option[Instance]) extends Message
 
-  private val OfferOperationRejectedTimeoutReason: String =
+  val OfferOperationRejectedTimeoutReason: String =
     "InstanceLauncherActor: no accept received within timeout. " +
       "You can reconfigure the timeout with --task_operation_notification_timeout."
 }
@@ -80,287 +79,273 @@ private class TaskLauncherActor(
     offerMatcherManager: OfferMatcherManager,
     clock: Clock,
     instanceOpFactory: InstanceOpFactory,
-    maybeOfferReviver: Option[OfferReviver],
     instanceTracker: InstanceTracker,
     rateLimiterActor: ActorRef,
-    offerMatchStatisticsActor: ActorRef,
-
-    private[this] var runSpec: RunSpec,
-    private[this] var instancesToLaunch: Int) extends Actor with StrictLogging with Stash {
+    offerMatchStatistics: SourceQueue[OfferMatchStatistics.OfferMatchUpdate],
+    runSpecId: AbsolutePathId,
+    localRegion: () => Option[Region]
+) extends Actor
+    with Stash
+    with StrictLogging {
   // scalastyle:on parameter.number
 
-  private[this] var inFlightInstanceOperations = Map.empty[Instance.Id, Cancellable]
+  import TaskLauncherActor._
 
-  private[this] var recheckBackOff: Option[Cancellable] = None
-  private[this] var backOffUntil: Option[Timestamp] = None
+  /** instances that are in the tracker */
+  private[impl] var instanceMap: Map[Instance.Id, Instance] = Map.empty
 
-  /** instances that are in flight and those in the tracker */
-  private[this] var instanceMap: Map[Instance.Id, Instance] = _
+  private[impl] def inFlightInstanceOperations = instanceMap.values.filter(_.isProvisioned)
+
+  private[impl] val offerOperationAcceptTimeout = mutable.Map.empty[Instance.Id, Cancellable]
+
+  private[impl] def scheduledInstances: Iterable[Instance] = instanceMap.values.filter(_.isScheduled)
+  def scheduledVersions = scheduledInstances.map(_.runSpec.configRef).toSet
+
+  def instancesToLaunch = scheduledInstances.size
+
+  private[this] var recheckBackOff: Cancellable = CancellableOnce.noop
+
+  /* A map of times a RunSpec version is allowed to launch. Sourced from RateLimiter DelayUpdate.
+   * When we receive signal that there is no delay, the current time is used.
+   */
+  val launchAllowedAt: mutable.Map[RunSpecConfigRef, Timestamp] = mutable.Map.empty
 
   /** Decorator to use this actor as a [[OfferMatcher#TaskOpSource]] */
   private[this] val myselfAsLaunchSource = InstanceOpSourceDelegate(self)
 
-  private[this] val startedAt = clock.now()
-
   override def preStart(): Unit = {
     super.preStart()
 
-    logger.info(s"Started instanceLaunchActor for ${runSpec.id} version ${runSpec.version} with initial count $instancesToLaunch")
-
-    instanceMap = instanceTracker.instancesBySpecSync.instancesMap(runSpec.id).instanceMap
-    rateLimiterActor ! RateLimiterActor.GetDelay(runSpec)
+    instanceTracker
+      .instancesBySpec()
+      .map(bySpec => LoadedInstances(bySpec.instancesMap(runSpecId).instanceMap))
+      .pipeTo(self)
   }
 
   override def postStop(): Unit = {
-    OfferMatcherRegistration.unregister()
-    recheckBackOff.foreach(_.cancel())
+    unregister()
+    recheckBackOff.cancel()
 
     if (inFlightInstanceOperations.nonEmpty) {
-      logger.warn(s"Actor shutdown while instances are in flight: ${inFlightInstanceOperations.keys.mkString(", ")}")
-      inFlightInstanceOperations.values.foreach(_.cancel())
+      logger.warn(s"Actor shutdown while instances are in flight: ${inFlightInstanceOperations.map(_.instanceId).mkString(", ")}")
     }
+    offerOperationAcceptTimeout.valuesIterator.foreach(_.cancel())
 
-    offerMatchStatisticsActor ! OfferMatchStatisticsActor.LaunchFinished(runSpec.id)
+    offerMatchStatistics.offer(OfferMatchStatistics.LaunchFinished(runSpecId))
 
     super.postStop()
 
-    logger.info(s"Stopped InstanceLauncherActor for ${runSpec.id} version ${runSpec.version}")
+    logger.info(s"Stopped InstanceLauncherActor for ${runSpecId}.")
   }
 
-  override def receive: Receive = waitForInitialDelay
+  override def receive: Receive = loading
 
-  private[this] def waitForInitialDelay: Receive = LoggingReceive.withLabel("waitingForInitialDelay") {
-    case RateLimiterActor.DelayUpdate(spec, delayUntil) if spec == runSpec =>
-      stash()
+  /**
+    * Initial loading of instances. The preStart calls the instance tracker and pipes the result here.
+    */
+  private[this] def loading: Receive = {
+    case LoadedInstances(loadedInstances) =>
+      instanceMap = loadedInstances
+      val readable = instanceMap.values
+        .map(i =>
+          s"${i.instanceId}:{condition: ${i.state.condition}, goal: ${i.state.goal}, version: ${i.runSpecVersion}, reservation: ${i.reservation}}"
+        )
+        .mkString(", ")
+      logger.info(s"Loaded instance map: instances=[$readable]")
+      logger.info(s"Started instanceLaunchActor for $runSpecId with initial count $instancesToLaunch")
+      scheduledVersions.foreach { configRef =>
+        rateLimiterActor ! RateLimiterActor.GetDelay(configRef)
+      }
+
       unstashAll()
       context.become(active)
-    case msg @ RateLimiterActor.DelayUpdate(spec, delayUntil) if spec != runSpec =>
-      logger.warn(s"Received delay update for other runSpec: $msg")
-    case message: Any => stash()
+      logger.debug("Became active.")
+
+    case Status.Failure(cause) =>
+      // escalate this failure
+      throw new IllegalStateException("while loading tasks", cause)
+
+    case other: AnyRef =>
+      logger.debug(s"Stashing $other")
+      stash()
+
   }
 
-  private[this] def active: Receive = LoggingReceive.withLabel("active") {
-    Seq(
-      receiveStop,
-      receiveDelayUpdate,
-      receiveTaskLaunchNotification,
-      receiveInstanceUpdate,
-      receiveGetCurrentCount,
-      receiveAddCount,
-      receiveProcessOffers,
-      receiveUnknown
-    ).reduce(_.orElse[Any, Unit](_))
+  /**
+    * Processes the result from [[TaskLauncherActor.syncInstance()]].
+    *
+    * @param instanceId The id of the instance which is synchronized.
+    */
+  private[this] def syncing(instanceId: Instance.Id): Receive = {
+    case SynchronizedInstance(maybeInstance) =>
+      maybeInstance match {
+        case Some(instance) =>
+          instanceMap += instanceId -> instance
+
+          // This timeout is only between us creating provisioned instance operation based on received offer
+          // and that instance in provisioned state being persisted so this makes no sense for instances in all other states
+          if (!instance.isProvisioned) {
+            offerOperationAcceptTimeout.get(instanceId).foreach(_.cancel())
+            offerOperationAcceptTimeout -= instanceId
+          }
+          logger.info(s"Synced single $instanceId from InstanceTracker: $instance")
+
+          // Request delay for new run spec config.
+          if (!launchAllowedAt.contains(instance.runSpec.configRef)) {
+            // signal no interest in new offers until we get the back off delay.
+            // this makes sure that we see unused offers again that we rejected for the old configuration.
+            unregister()
+            rateLimiterActor ! RateLimiterActor.GetDelay(instance.runSpec.configRef)
+          }
+        case None =>
+          logger.info(s"Instance $instanceId does not exist in InstanceTracker - removing it from internal state.")
+          removeInstanceFromInternalState(instanceId)
+      }
+
+      manageOfferMatcherStatus(clock.now())
+      context.become(active)
+      unstashAll()
+
+    case other: AnyRef =>
+      stash()
   }
 
-  private[this] def stopping: Receive = LoggingReceive.withLabel("stopping") {
-    Seq(
-      receiveStop,
-      receiveWaitingForInFlight,
-      receiveUnknown
-    ).reduce(_.orElse[Any, Unit](_))
-  }
-
-  private[this] def receiveWaitingForInFlight: Receive = {
-    case notification: InstanceOpNotification =>
-      receiveTaskLaunchNotification(notification)
-      waitForInFlightIfNecessary()
-
-    case TaskLauncherActor.Stop => // ignore, already stopping
-
-    case "waitingForInFlight" => sender() ! "waitingForInFlight" // for testing
-  }
+  private[this] def active: Receive =
+    LoggingReceive.withLabel("active") {
+      Seq(
+        receiveDelayUpdate,
+        receiveTaskLaunchNotification,
+        receiveInstanceUpdate,
+        receiveProcessOffers,
+        receiveUnknown
+      ).reduce(_.orElse[Any, Unit](_))
+    }
 
   private[this] def receiveUnknown: Receive = {
+    case Status.Failure(ex) =>
+      logger.error(s"TaskLauncherActor received a failure from $sender", ex)
+
     case msg: Any =>
+      logger.debug(s"Received unknown message. msg=$msg")
       // fail fast and do not let the sender time out
       sender() ! Status.Failure(new IllegalStateException(s"Unhandled message: $msg"))
-  }
-
-  private[this] def receiveStop: Receive = {
-    case TaskLauncherActor.Stop =>
-      if (inFlightInstanceOperations.nonEmpty) {
-        // try to stop gracefully but also schedule timeout
-        import context.dispatcher
-        logger.info(s"schedule timeout for stopping in ${config.taskOpNotificationTimeout().milliseconds}")
-        context.system.scheduler.scheduleOnce(config.taskOpNotificationTimeout().milliseconds, self, PoisonPill)
-      }
-      waitForInFlightIfNecessary()
-  }
-
-  private[this] def waitForInFlightIfNecessary(): Unit = {
-    if (inFlightInstanceOperations.isEmpty) {
-      context.stop(self)
-    } else {
-      val taskIds = inFlightInstanceOperations.keys.take(3).mkString(", ")
-      logger.info(
-        s"Stopping but still waiting for ${inFlightInstanceOperations.size} in-flight messages, " +
-          s"first three task ids: $taskIds"
-      )
-      context.become(stopping)
-    }
   }
 
   /**
     * Receive rate limiter updates.
     */
   private[this] def receiveDelayUpdate: Receive = {
-    case RateLimiterActor.DelayUpdate(spec, delayUntil) if spec == runSpec =>
+    case RateLimiter.DelayUpdate(ref, maybeDelayUntil) if scheduledVersions.contains(ref) =>
+      val now = clock.now()
+      // If there's no delay, then launch immediately
+      launchAllowedAt += ref -> maybeDelayUntil.fold(now)(_.deadline)
 
-      if (!backOffUntil.contains(delayUntil)) {
+      manageOfferMatcherStatus(now)
 
-        backOffUntil = Some(delayUntil)
-
-        recheckBackOff.foreach(_.cancel())
-        recheckBackOff = None
-
-        val now: Timestamp = clock.now()
-        if (backOffUntil.exists(_ > now)) {
-          import context.dispatcher
-          recheckBackOff = Some(
-            context.system.scheduler.scheduleOnce(now until delayUntil, self, RecheckIfBackOffUntilReached)
-          )
-        }
-
-        OfferMatcherRegistration.manageOfferMatcherStatus()
-      }
+      scheduleNextManageOfferStatus(now)
 
       logger.debug(s"After delay update $status")
 
-    case msg @ RateLimiterActor.DelayUpdate(spec, delayUntil) if spec != runSpec =>
-      logger.warn(s"Received delay update for other runSpec: $msg")
+    case RateLimiter.DelayUpdate(ref, delayUntil) if ref.id != runSpecId =>
+      logger.warn(s"BUG! Received delay update for other run spec $ref and delay $delayUntil. Current run spec is $runSpecId")
 
-    case RecheckIfBackOffUntilReached => OfferMatcherRegistration.manageOfferMatcherStatus()
+    case RecheckIfBackOffUntilReached => manageOfferMatcherStatus(clock.now())
+  }
+
+  private[this] def scheduleNextManageOfferStatus(now: Timestamp): Unit = {
+    recheckBackOff.cancel()
+    val pendingBackOffs = launchAllowedAt.values.filter { _ > now }
+    if (pendingBackOffs.nonEmpty) {
+      val nextCheck = pendingBackOffs.min
+      recheckBackOff = context.system.scheduler.scheduleOnce(now.until(nextCheck), self, RecheckIfBackOffUntilReached)(context.dispatcher)
+    }
   }
 
   private[this] def receiveTaskLaunchNotification: Receive = {
-    case InstanceOpSourceDelegate.InstanceOpRejected(op, reason) if inFlight(op) =>
-      removeInstance(op.instanceId)
-      logger.debug(s"Task op '${op.getClass.getSimpleName}' for ${op.instanceId} was REJECTED, reason '$reason', rescheduling. $status")
-
-      op match {
-        // only increment for launch ops, not for reservations:
-        case _: InstanceOp.LaunchTask => instancesToLaunch += 1
-        case _: InstanceOp.LaunchTaskGroup => instancesToLaunch += 1
-        case _ => ()
+    case InstanceOpSourceDelegate.InstanceOpRejected(op, TaskLauncherActor.OfferOperationRejectedTimeoutReason) =>
+      if (inFlightInstanceOperations.exists(_.instanceId == op.instanceId) && offerOperationAcceptTimeout.contains(op.instanceId)) {
+        // TaskLauncherActor is not always in sync with the state in InstanceTracker.
+        // Especially when accepting offer, its state is ahead of InstanceTracker because it marks the instance as provisioned even before we persist it.
+        // We do this because we need to know that we already attempted to launch that instance to not use the same one for another offer.
+        // If everything goes well, some time after we manually adjust the internal state we should receive instance update to Provisioned.
+        // It might happen that the we were not able to persist that Provisioned operation for some reason.
+        // This timeout is here just to prevent us from staying in a state where we have different state locally than in InstanceTracker
+        // This timeout should be set that far in the future that the offer operation should have already timed out anyway so it should be safe to do.
+        // By explicitly syncing here we would either get the instance in Provisioned (we persisted the update) or scheduled (something failed).
+        syncInstance(op.instanceId)
       }
 
-      OfferMatcherRegistration.manageOfferMatcherStatus()
-
-    case InstanceOpSourceDelegate.InstanceOpRejected(op, TaskLauncherActor.OfferOperationRejectedTimeoutReason) =>
-      // This is a message that we scheduled in this actor.
-      // When we receive a launch confirmation or rejection, we cancel this timer but
-      // there is still a race and we might send ourselves the message nevertheless, so we just
-      // ignore it here.
-      logger.debug(s"Ignoring task launch rejected for '${op.instanceId}' as the task is not in flight anymore")
-
     case InstanceOpSourceDelegate.InstanceOpRejected(op, reason) =>
-      logger.warn(s"Unexpected task op '${op.getClass.getSimpleName}' rejected for ${op.instanceId} with reason $reason")
+      logger.debug(s"Task op '${op.getClass.getSimpleName}' for ${op.instanceId} was REJECTED, reason '$reason', rescheduling. $status")
+      syncInstance(op.instanceId)
 
     case InstanceOpSourceDelegate.InstanceOpAccepted(op) =>
-      inFlightInstanceOperations -= op.instanceId
-      logger.debug(s"Task op '${op.getClass.getSimpleName}' for ${op.instanceId} was accepted. $status")
+      logger.debug(s"Instance operation ${op.getClass.getSimpleName} for instance ${op.instanceId} got accepted")
+      offerOperationAcceptTimeout.get(op.instanceId).foreach(_.cancel())
+      offerOperationAcceptTimeout -= op.instanceId
   }
 
   private[this] def receiveInstanceUpdate: Receive = {
-    case change: InstanceChange =>
-      change match {
-        case update: InstanceUpdated =>
-          logger.debug(s"receiveInstanceUpdate: ${update.id} is ${update.condition}")
-          instanceMap += update.id -> update.instance
+    case update: InstanceUpdated =>
+      syncInstance(update.instance.instanceId)
+      sender() ! Done
 
-        case update: InstanceDeleted =>
-          logger.info(s"receiveInstanceUpdate: ${update.id} was deleted (${update.condition})")
-          removeInstance(update.id)
-          // A) If the app has constraints, we need to reconsider offers that
-          // we already rejected. E.g. when a host:unique constraint prevented
-          // us to launch tasks on a particular node before, we need to reconsider offers
-          // of that node after a task on that node has died.
-          //
-          // B) If a reservation timed out, already rejected offers might become eligible for creating new reservations.
-          if (runSpec.constraints.nonEmpty || (runSpec.residency.isDefined && shouldLaunchInstances)) {
-            maybeOfferReviver.foreach(_.reviveOffers())
-          }
-      }
+    case update: InstanceDeleted =>
+      // if an instance was deleted, it's not needed anymore and we only have to remove it from the internal state
+      logger.info(s"${update.instance.instanceId} was deleted. Will remove from internal state.")
+      removeInstanceFromInternalState(update.instance.instanceId)
       sender() ! Done
   }
 
-  private[this] def removeInstance(instanceId: Instance.Id): Unit = {
-    inFlightInstanceOperations.get(instanceId).foreach(_.cancel())
-    inFlightInstanceOperations -= instanceId
-    instanceMap -= instanceId
-  }
-
-  private[this] def receiveGetCurrentCount: Receive = {
-    case TaskLauncherActor.GetCount =>
-      replyWithQueuedInstanceCount()
-  }
-
-  private[this] def receiveAddCount: Receive = {
-    case TaskLauncherActor.AddInstances(newRunSpec, addCount) =>
-      val configChange = runSpec.isUpgrade(newRunSpec)
-      if (configChange || runSpec.needsRestart(newRunSpec) || runSpec.isOnlyScaleChange(newRunSpec)) {
-        runSpec = newRunSpec
-        instancesToLaunch = addCount
-
-        if (configChange) {
-          logger.info(s"getting new runSpec for '${runSpec.id}', version ${runSpec.version} with $addCount initial instances")
-
-          suspendMatchingUntilWeGetBackoffDelayUpdate()
-
-        } else {
-          logger.info(s"scaling change for '${runSpec.id}', version ${runSpec.version} with $addCount initial instances")
-        }
-      } else {
-        logger.info(s"add {$addCount instances to $instancesToLaunch instances to launch")
-        instancesToLaunch += addCount
-      }
-
-      OfferMatcherRegistration.manageOfferMatcherStatus()
-
-      replyWithQueuedInstanceCount()
-  }
-
-  private[this] def suspendMatchingUntilWeGetBackoffDelayUpdate(): Unit = {
-    // signal no interest in new offers until we get the back off delay.
-    // this makes sure that we see unused offers again that we rejected for the old configuration.
-    OfferMatcherRegistration.unregister()
-
-    // get new back off delay, don't do anything until we get that.
-    backOffUntil = None
-    rateLimiterActor ! RateLimiterActor.GetDelay(runSpec)
-    context.become(waitForInitialDelay)
-  }
-
-  private[this] def replyWithQueuedInstanceCount(): Unit = {
-    val instancesLaunched = instanceMap.values.count(_.isLaunched)
-    val instancesLaunchesInFlight = inFlightInstanceOperations.keys
-      .count(instanceId => instanceMap.get(instanceId).exists(_.isLaunched))
-    sender() ! QueuedInstanceInfo(
-      runSpec,
-      inProgress = instancesToLaunch > 0 || inFlightInstanceOperations.nonEmpty,
-      instancesLeftToLaunch = instancesToLaunch,
-      finalInstanceCount = instancesToLaunch + instancesLaunchesInFlight + instancesLaunched,
-      backOffUntil.getOrElse(clock.now()),
-      startedAt
-    )
-  }
-
   private[this] def receiveProcessOffers: Receive = {
-    case ActorOfferMatcher.MatchOffer(offer, promise) if !shouldLaunchInstances =>
+    case ActorOfferMatcher.MatchOffer(offer, promise) if !shouldLaunchInstances(clock.now()) =>
       logger.debug(s"Ignoring offer ${offer.getId.getValue}: $status")
       promise.trySuccess(MatchedInstanceOps.noMatch(offer.getId))
 
     case ActorOfferMatcher.MatchOffer(offer, promise) =>
-      val reachableInstances = instanceMap.filterNotAs{ case (_, instance) => instance.state.condition.isLost }
-      val matchRequest = InstanceOpFactory.Request(runSpec, offer, reachableInstances, instancesToLaunch)
-      instanceOpFactory.matchOfferRequest(matchRequest) match {
-        case matched: OfferMatchResult.Match =>
-          offerMatchStatisticsActor ! matched
-          handleInstanceOp(matched.instanceOp, offer, promise)
-        case notMatched: OfferMatchResult.NoMatch =>
-          offerMatchStatisticsActor ! notMatched
+      logger.info(s"Matching offer ${offer.getId.getValue} and need to launch $instancesToLaunch tasks.")
+      val reachableInstances = instanceMap.filterNot {
+        case (_, instance) =>
+          instance.state.condition.isLost || instance.isScheduled
+      }
+      val candidateInstances = scheduledInstances.iterator.filter { instance => offer.getAllocationInfo.getRole == instance.role }.filter {
+        instance => launchAllowed(clock.now(), instance.runSpec.configRef)
+      }.toSeq
+
+      candidateInstances match {
+        case NonEmptyIterable(scheduledInstancesWithoutBackoff) =>
+          val matchRequest = InstanceOpFactory.Request(offer, reachableInstances, scheduledInstancesWithoutBackoff, localRegion())
+          instanceOpFactory.matchOfferRequest(matchRequest) match {
+            case matched: OfferMatchResult.Match =>
+              logger.info(s"Matched offer ${offer.getId.getValue} for run spec ${runSpecId}.")
+              offerMatchStatistics.offer(OfferMatchStatistics.MatchResult(matched))
+              handleInstanceOp(matched.instanceOp, offer, promise)
+            case notMatched: OfferMatchResult.NoMatch =>
+              logger.info(s"Did not match offer ${offer.getId.getValue} for run spec ${runSpecId}. Reasons: ${notMatched.reasons}")
+              offerMatchStatistics.offer(OfferMatchStatistics.MatchResult(notMatched))
+              promise.trySuccess(MatchedInstanceOps.noMatch(offer.getId))
+          }
+        case _ =>
+          logger.debug(s"Ignoring offer ${offer.getId.getValue}: $status")
           promise.trySuccess(MatchedInstanceOps.noMatch(offer.getId))
       }
+  }
+
+  def syncInstance(instanceId: Instance.Id): Unit = {
+    logger.debug(s"Synchronizing $instanceId")
+    context.become(syncing(instanceId))
+    instanceTracker.instancesBySpec.map(bySpec => SynchronizedInstance(bySpec.instance(instanceId))).pipeTo(self)
+  }
+
+  def removeInstanceFromInternalState(instanceId: Instance.Id): Unit = {
+    instanceMap -= instanceId
+    offerOperationAcceptTimeout.get(instanceId).foreach(_.cancel())
+    offerOperationAcceptTimeout -= instanceId
+
+    // Remove backoffs for deleted config refs
+    launchAllowedAt.keySet.diff(scheduledVersions).foreach(launchAllowedAt.remove)
+    manageOfferMatcherStatus(clock.now())
+
   }
 
   /**
@@ -372,115 +357,100 @@ private class TaskLauncherActor(
     * @param promise Promise that tells offer matcher that the offer has been accepted.
     */
   private[this] def handleInstanceOp(instanceOp: InstanceOp, offer: Mesos.Offer, promise: Promise[MatchedInstanceOps]): Unit = {
-    def updateActorState(): Unit = {
-      val instanceId = instanceOp.instanceId
-      instanceOp match {
-        // only decrement for launched instances, not for reservations:
-        case _: InstanceOp.LaunchTask => instancesToLaunch -= 1
-        case _: InstanceOp.LaunchTaskGroup => instancesToLaunch -= 1
-        case _ => ()
-      }
 
-      // We will receive the updated instance once it's been persisted. Before that,
-      // we can only store the possible state, as we don't have the updated state
-      // yet.
-      instanceOp.stateOp.possibleNewState.foreach { newState =>
-        instanceMap += instanceId -> newState
-        // In case we don't receive an update a TaskOpRejected message with TASK_OP_REJECTED_TIMEOUT_REASON
-        // reason is scheduled within config.taskOpNotificationTimeout milliseconds. This will trigger another
-        // attempt to launch the task.
-        //
-        // NOTE: this can lead to a race condition where an additional task is launched: in a nutshell if a TaskOp A
-        // is rejected due to an internal timeout, TaskLauncherActor will schedule another TaskOp.Launch B, because
-        // it's under the impression that A has not succeeded/got lost. If the timeout is triggered internally, the
-        // tasksToLaunch count will be increased by 1. The TaskOp A can still be accepted though, and if it is,
-        // two tasks (A and B) might be launched instead of one (given Marathon receives sufficient offers and is
-        // able to create another TaskOp).
-        // This would lead to the app being over-provisioned (e.g. "3 of 2 tasks" launched) but eventually converge
-        // to the target task count when tasks over capacity are killed. With a sufficiently high timeout this case
-        // should be fairly rare.
-        // A better solution would involve an overhaul of the way TaskLaunchActor works and might be
-        // a subject to change in the future.
-        scheduleTaskOpTimeout(instanceOp)
-      }
-
-      OfferMatcherRegistration.manageOfferMatcherStatus()
+    // Mark instance in internal map as provisioned
+    instanceOp.stateOp match {
+      case InstanceUpdateOperation.Provision(instanceId, agentInfo, runSpecVersion, tasks, now) =>
+        assert(instanceMap.contains(instanceId), s"Internal task launcher state did not include newly provisioned instance $instanceId")
+        val existingInstance = instanceMap(instanceId)
+        instanceMap += instanceId -> existingInstance.provisioned(agentInfo, runSpecVersion, tasks, now)
+        scheduleTaskOpTimeout(context, instanceOp)
+        logger.info(s"Updated instance map to ${instanceMap.values.map(i => i.instanceId -> i.state.condition)}")
+      case InstanceUpdateOperation.Reserve(instanceId, reservation, agentInfo) =>
+        assert(instanceMap.contains(instanceId), s"Internal task launcher state did not include reserved instance $instanceId")
+        val existingInstance = instanceMap(instanceId)
+        instanceMap += instanceId -> existingInstance.reserved(reservation, agentInfo)
+        scheduleTaskOpTimeout(context, instanceOp)
+        logger.info(s"Updated instance map to reserve ${instanceMap.values.map(i => i.instanceId -> i.state.condition)}")
+      case other =>
+        logger.info(s"Unexpected updated operation $other")
     }
 
-    updateActorState()
+    manageOfferMatcherStatus(clock.now())
 
-    logger.debug(s"Request ${instanceOp.getClass.getSimpleName} for instance '${instanceOp.instanceId.idString}', version '${runSpec.version}'. $status")
+    logger.info(s"Request ${instanceOp.getClass.getSimpleName} for instance '${instanceOp.instanceId.idString}'. $status")
     promise.trySuccess(MatchedInstanceOps(offer.getId, Seq(InstanceOpWithSource(myselfAsLaunchSource, instanceOp))))
   }
 
-  private[this] def scheduleTaskOpTimeout(instanceOp: InstanceOp): Unit = {
-    val reject = InstanceOpSourceDelegate.InstanceOpRejected(
-      instanceOp, TaskLauncherActor.OfferOperationRejectedTimeoutReason
+  private[this] def scheduleTaskOpTimeout(context: ActorContext, instanceOp: InstanceOp): Unit = {
+    import context.dispatcher
+    val message: InstanceOpSourceDelegate.InstanceOpRejected = InstanceOpSourceDelegate.InstanceOpRejected(
+      instanceOp,
+      TaskLauncherActor.OfferOperationRejectedTimeoutReason
     )
-    val cancellable = scheduleTaskOperationTimeout(context, reject)
-    inFlightInstanceOperations += instanceOp.instanceId -> cancellable
+    val scheduledProvisionTimeout = context.system.scheduler.scheduleOnce(config.taskOpNotificationTimeout().milliseconds, self, message)
+    offerOperationAcceptTimeout += instanceOp.instanceId -> scheduledProvisionTimeout
   }
 
-  private[this] def inFlight(op: InstanceOp): Boolean = inFlightInstanceOperations.contains(op.instanceId)
-
-  protected def scheduleTaskOperationTimeout(
-    context: ActorContext,
-    message: InstanceOpSourceDelegate.InstanceOpRejected): Cancellable =
-    {
-      import context.dispatcher
-      context.system.scheduler.scheduleOnce(config.taskOpNotificationTimeout().milliseconds, self, message)
-    }
-
-  private[this] def backoffActive: Boolean = backOffUntil.forall(_ > clock.now())
-  private[this] def shouldLaunchInstances: Boolean = instancesToLaunch > 0 && !backoffActive
+  /**
+    * Returns the time at which we know we can launch this instance
+    *
+    * Since this actor subscribes to task delays asynchronously, we pessimistically assume that an instance cannot be
+    * launched until we've received a DelayUpdate for the respective config version
+    */
+  private[this] def launchAllowed(now: Timestamp, configRef: RunSpecConfigRef): Boolean = launchAllowedAt.get(configRef).exists(_ <= now)
+  private[this] def shouldLaunchInstances(now: Timestamp): Boolean = {
+    if (scheduledInstances.nonEmpty || launchAllowedAt.nonEmpty)
+      logger.info(
+        s"Found scheduled instances: ${scheduledInstances.map(_.instanceId).mkString(",")} and current back-off map: $launchAllowedAt"
+      )
+    scheduledInstances.nonEmpty && scheduledVersions.exists { configRef => launchAllowed(now, configRef) }
+  }
 
   private[this] def status: String = {
-    val backoffStr = backOffUntil match {
-      case Some(until) if until > clock.now() => s"currently waiting for backoff($until)"
-      case _ => "not backing off"
+    val activeBackOffs = launchAllowedAt.values.filter(_ > clock.now())
+    val backoffStr = if (activeBackOffs.nonEmpty) {
+      s"currently waiting for backoffs $activeBackOffs"
+    } else {
+      "not backing off"
     }
 
     val inFlight = inFlightInstanceOperations.size
-    val launchedOrRunning = instanceMap.values.count(_.isLaunched) - inFlight
-    val instanceCountDelta = instanceMap.size + instancesToLaunch - runSpec.instances
-    val matchInstanceStr = if (instanceCountDelta == 0) "" else s"instance count delta $instanceCountDelta."
-    s"$instancesToLaunch instancesToLaunch, $inFlight in flight, " +
-      s"$launchedOrRunning confirmed. $matchInstanceStr $backoffStr"
+    val launchedInstances = instanceMap.values.filterNot(_.isProvisioned).count(_.isActive)
+    s"$instancesToLaunch instancesToLaunch, $inFlight in flight, $launchedInstances confirmed. $backoffStr"
   }
 
-  /** Manage registering this actor as offer matcher. Only register it if instancesToLaunch > 0. */
-  private[this] object OfferMatcherRegistration {
-    private[this] val myselfAsOfferMatcher: OfferMatcher = {
-      //set the precedence only, if this app is resident
-      new ActorOfferMatcher(self, runSpec.residency.map(_ => runSpec.id))(context.system.scheduler)
-    }
-    private[this] var registeredAsMatcher = false
+  /** Manage registering this actor as offer matcher. Only register it if there are empty reservations or scheduled instances. */
+  private[this] lazy val myselfAsOfferMatcher: OfferMatcher = {
+    //set the precedence only, if this app is resident
+    val isResident = scheduledInstances.exists(_.runSpec.isResident)
+    new ActorOfferMatcher(self, if (isResident) Some(runSpecId) else None)
+  }
+  private[this] var registeredAsMatcher = false
 
-    /** Register/unregister as necessary */
-    def manageOfferMatcherStatus(): Unit = {
-      val shouldBeRegistered = shouldLaunchInstances
+  /** Register/unregister as necessary */
+  private[this] def manageOfferMatcherStatus(now: Timestamp): Unit = {
+    val shouldBeRegistered = shouldLaunchInstances(now)
 
-      if (shouldBeRegistered && !registeredAsMatcher) {
-        logger.debug(s"Registering for ${runSpec.id}, ${runSpec.version}.")
-        offerMatcherManager.addSubscription(myselfAsOfferMatcher)(context.dispatcher)
-        registeredAsMatcher = true
-      } else if (!shouldBeRegistered && registeredAsMatcher) {
-        if (instancesToLaunch > 0) {
-          logger.info(s"Backing off due to task failures. Stop receiving offers for ${runSpec.id}, ${runSpec.version}")
-        } else {
-          logger.info(s"No tasks left to launch. Stop receiving offers for ${runSpec.id}, ${runSpec.version}")
-        }
-        offerMatcherManager.removeSubscription(myselfAsOfferMatcher)(context.dispatcher)
-        registeredAsMatcher = false
+    if (shouldBeRegistered && !registeredAsMatcher) {
+      logger.debug(s"Registering for ${runSpecId}.")
+      offerMatcherManager.addSubscription(myselfAsOfferMatcher)(context.dispatcher)
+      registeredAsMatcher = true
+    } else if (!shouldBeRegistered && registeredAsMatcher) {
+      if (instancesToLaunch > 0) {
+        logger.info(s"Backing off due to task failures. Stop receiving offers for ${runSpecId}")
+      } else {
+        logger.info(s"No tasks left to launch. Stop receiving offers for ${runSpecId}")
       }
+      unregister()
     }
+  }
 
-    def unregister(): Unit = {
-      if (registeredAsMatcher) {
-        logger.info("Deregister as matcher.")
-        offerMatcherManager.removeSubscription(myselfAsOfferMatcher)(context.dispatcher)
-        registeredAsMatcher = false
-      }
+  private[this] def unregister(): Unit = {
+    if (registeredAsMatcher) {
+      logger.info("Deregister as matcher.")
+      offerMatcherManager.removeSubscription(myselfAsOfferMatcher)(context.dispatcher)
+      registeredAsMatcher = false
     }
   }
 }

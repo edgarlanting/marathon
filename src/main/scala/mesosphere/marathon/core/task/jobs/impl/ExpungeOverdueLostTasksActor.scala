@@ -1,16 +1,16 @@
 package mesosphere.marathon
 package core.task.jobs.impl
 
-import akka.actor.{ Actor, Cancellable, Props }
+import java.time.Clock
+
+import akka.actor.{Actor, Cancellable, Props}
 import akka.pattern.pipe
 import com.typesafe.scalalogging.StrictLogging
-import mesosphere.marathon.core.base.Clock
 import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.instance.update.InstanceUpdateOperation
 import mesosphere.marathon.core.task.jobs.TaskJobsConfig
-import mesosphere.marathon.core.task.tracker.{ InstanceTracker, TaskStateOpProcessor }
+import mesosphere.marathon.core.task.tracker.InstanceTracker
 import mesosphere.marathon.core.task.tracker.InstanceTracker.SpecInstances
-import mesosphere.marathon.state.{ PathId, Timestamp, UnreachableDisabled, UnreachableEnabled }
+import mesosphere.marathon.state.{AbsolutePathId, Timestamp, UnreachableDisabled, UnreachableEnabled}
 
 /**
   * Business logic of overdue tasks actor.
@@ -21,37 +21,35 @@ trait ExpungeOverdueLostTasksActorLogic extends StrictLogging {
 
   val config: TaskJobsConfig
   val clock: Clock
-  val stateOpProcessor: TaskStateOpProcessor
+  val instanceTracker: InstanceTracker
 
   def triggerExpunge(instance: Instance): Unit = {
     val since = instance.state.since
     logger.warn(s"Instance ${instance.instanceId} is unreachable since $since and will be expunged.")
-    val stateOp = InstanceUpdateOperation.ForceExpunge(instance.instanceId)
-    stateOpProcessor.process(stateOp)
+    instanceTracker.forceExpunge(instance.instanceId)
   }
 
   /**
     * @return instances that should be expunged according to the RunSpec definition.
     */
-  def filterUnreachableForExpunge(instances: Map[PathId, SpecInstances], now: Timestamp) =
-    instances.values.
-      flatMap(_.instances).
-      withFilter { i => shouldExpunge(i, now) }
+  def filterUnreachableForExpunge(instances: Map[AbsolutePathId, SpecInstances], now: Timestamp) =
+    instances.values.flatMap(_.instances).withFilter { i => shouldExpunge(i, now) }
 
-  private[impl] def shouldExpunge(instance: Instance, now: Timestamp): Boolean = instance.unreachableStrategy match {
-    case UnreachableDisabled =>
-      false
-    case unreachableEnabled: UnreachableEnabled =>
-      instance.isUnreachableInactive &&
-        instance.tasksMap.valuesIterator.exists(_.isUnreachableExpired(now, unreachableEnabled.expungeAfter))
-  }
+  private[impl] def shouldExpunge(instance: Instance, now: Timestamp): Boolean =
+    instance.unreachableStrategy match {
+      case UnreachableDisabled =>
+        false
+      case unreachableEnabled: UnreachableEnabled =>
+        // Instances configured to expunge immediately will be expunged in response to the Mesos TASK_UNREACHABLE
+        instance.isUnreachableInactive &&
+          instance.tasksMap.valuesIterator.exists(_.isUnreachableExpired(now, unreachableEnabled.expungeAfter))
+    }
 }
 
-class ExpungeOverdueLostTasksActor(
-    val clock: Clock,
-    val config: TaskJobsConfig,
-    instanceTracker: InstanceTracker,
-    val stateOpProcessor: TaskStateOpProcessor) extends Actor with StrictLogging with ExpungeOverdueLostTasksActorLogic {
+class ExpungeOverdueLostTasksActor(val clock: Clock, val config: TaskJobsConfig, val instanceTracker: InstanceTracker)
+    extends Actor
+    with StrictLogging
+    with ExpungeOverdueLostTasksActorLogic {
 
   import ExpungeOverdueLostTasksActor._
   implicit val ec = context.dispatcher
@@ -60,9 +58,7 @@ class ExpungeOverdueLostTasksActor(
 
   override def preStart(): Unit = {
     logger.info("ExpungeOverdueLostTasksActor has started")
-    tickTimer = Some(context.system.scheduler.schedule(
-      config.taskLostExpungeInitialDelay,
-      config.taskLostExpungeInterval, self, Tick))
+    tickTimer = Some(context.system.scheduler.schedule(config.taskLostExpungeInitialDelay, config.taskLostExpungeInterval, self, Tick))
   }
 
   override def postStop(): Unit = {
@@ -81,8 +77,7 @@ object ExpungeOverdueLostTasksActor {
 
   case object Tick
 
-  def props(clock: Clock, config: TaskJobsConfig,
-    instanceTracker: InstanceTracker, stateOpProcessor: TaskStateOpProcessor): Props = {
-    Props(new ExpungeOverdueLostTasksActor(clock, config, instanceTracker, stateOpProcessor))
+  def props(clock: Clock, config: TaskJobsConfig, instanceTracker: InstanceTracker): Props = {
+    Props(new ExpungeOverdueLostTasksActor(clock, config, instanceTracker))
   }
 }

@@ -2,8 +2,7 @@ package mesosphere.marathon
 package raml
 
 import mesosphere.UnitTest
-import mesosphere.marathon.core.readiness.{ ReadinessCheck => CoreReadinessCheck }
-import mesosphere.marathon.state.ReadinessCheckSerializer
+import mesosphere.marathon.core.readiness.{ReadinessCheck => CoreReadinessCheck}
 
 import scala.concurrent.duration._
 
@@ -11,7 +10,7 @@ class ReadinessConversionsTest extends UnitTest {
 
   def convertToProtobufThenToRAML(check: => CoreReadinessCheck, raml: => ReadinessCheck): Unit = {
     "converts to protobuf, then to RAML" in {
-      val proto = ReadinessCheckSerializer.toProto(check)
+      val proto = state.ReadinessCheckSerializer.toProto(check)
       val proto2Raml = proto.toRaml
       proto2Raml should be(raml)
     }

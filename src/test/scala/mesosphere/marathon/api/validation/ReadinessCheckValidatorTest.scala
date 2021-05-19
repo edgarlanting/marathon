@@ -1,7 +1,7 @@
 package mesosphere.marathon
 package api.validation
 
-import com.wix.accord.{ Validator, validate }
+import com.wix.accord.{Validator, validate}
 import mesosphere.UnitTest
 import mesosphere.marathon.core.readiness.ReadinessCheck
 import mesosphere.marathon.state.PortDefinition
@@ -120,11 +120,8 @@ class ReadinessCheckValidatorTest extends UnitTest {
     }
   }
   class Fixture {
-    val app = MarathonTestHelper.makeBasicApp().withPortDefinitions(
-      Seq(
-        PortDefinition(
-          port = 123,
-          name = Some(ReadinessCheck.DefaultPortName))))
+    val app =
+      MarathonTestHelper.makeBasicApp().withPortDefinitions(Seq(PortDefinition(port = 123, name = Some(ReadinessCheck.DefaultPortName))))
     implicit val readinessCheckValidator: Validator[ReadinessCheck] = ReadinessCheck.readinessCheckValidator(app)
   }
 }

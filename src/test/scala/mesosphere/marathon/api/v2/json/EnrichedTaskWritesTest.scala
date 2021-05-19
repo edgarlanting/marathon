@@ -4,69 +4,67 @@ package api.v2.json
 import mesosphere.UnitTest
 import mesosphere.marathon.api.JsonTestHelper
 import mesosphere.marathon.core.appinfo.EnrichedTask
-import mesosphere.marathon.core.instance.{ Instance, TestInstanceBuilder }
+import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder}
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.state.NetworkInfo
-import mesosphere.marathon.state.{ AppDefinition, PathId, Timestamp }
-import mesosphere.marathon.stream.Implicits._
-import org.apache.mesos.{ Protos => MesosProtos }
+import mesosphere.marathon.raml.AnyToRaml
+import mesosphere.marathon.raml.TaskConversion._
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, Timestamp}
+import scala.jdk.CollectionConverters._
+import org.apache.mesos.{Protos => MesosProtos}
 
 class EnrichedTaskWritesTest extends UnitTest {
-
-  import Formats.EnrichedTaskWrites
 
   class Fixture {
     val time = Timestamp(1024)
 
-    val runSpec = AppDefinition(id = PathId("/foo/bar"))
+    val runSpec = AppDefinition(id = AbsolutePathId("/foo/bar"), role = "*")
     val runSpecId = runSpec.id
     val hostName = "agent1.mesos"
     val agentId = "abcd-1234"
-    val agentInfo = Instance.AgentInfo(hostName, Some(agentId), attributes = Seq.empty)
+    val agentInfo = Instance.AgentInfo(hostName, Some(agentId), None, None, attributes = Seq.empty)
 
     val networkInfos = Seq(
-      MesosProtos.NetworkInfo.newBuilder()
+      MesosProtos.NetworkInfo
+        .newBuilder()
         .addIpAddresses(MesosProtos.NetworkInfo.IPAddress.newBuilder().setIpAddress("123.123.123.123"))
         .addIpAddresses(MesosProtos.NetworkInfo.IPAddress.newBuilder().setIpAddress("123.123.123.124"))
         .build()
     )
 
     val taskWithoutIp = {
-      val instance = TestInstanceBuilder.newBuilder(runSpecId = runSpecId, version = time)
+      val instance = TestInstanceBuilder
+        .newBuilder(runSpecId = runSpecId, version = time)
         .withAgentInfo(agentInfo)
         .addTaskStaging(since = time)
         .getInstance()
-      EnrichedTask(runSpecId, instance.appTask, agentInfo, healthCheckResults = Nil, servicePorts = Nil)
+      EnrichedTask(instance.runSpecId, instance.appTask, agentInfo, Nil, Nil, None, "*")
     }
 
     def mesosStatus(taskId: Task.Id) = {
-      MesosProtos.TaskStatus.newBuilder()
+      MesosProtos.TaskStatus
+        .newBuilder()
         .setTaskId(taskId.mesosTaskId)
         .setState(MesosProtos.TaskState.TASK_STAGING)
         .setContainerStatus(
           MesosProtos.ContainerStatus.newBuilder().addAllNetworkInfos(networkInfos.asJava)
-        ).build
+        )
+        .build
     }
 
     val taskWithMultipleIPs = {
-      val taskStatus = mesosStatus(Task.Id("/foo/bar"))
+      val instanceId = Instance.Id.forRunSpec(AbsolutePathId("/foo/bar"))
+      val taskStatus = mesosStatus(Task.Id(instanceId))
       val networkInfo = NetworkInfo(hostName, hostPorts = Nil, ipAddresses = Nil).update(taskStatus)
-      val instance = TestInstanceBuilder.newBuilder(runSpecId = runSpecId, version = time)
-        .withAgentInfo(agentInfo)
-        .addTaskWithBuilder().taskStaging(since = time)
-        .withNetworkInfo(networkInfo)
-        .build().getInstance()
-      EnrichedTask(runSpecId, instance.appTask, agentInfo, healthCheckResults = Nil, servicePorts = Nil)
-    }
-
-    val taskWithLocalVolumes = {
-      val localVolumeId = Task.LocalVolumeId.unapply("appid#container#random").value
-      val instance = TestInstanceBuilder.newBuilder(runSpecId = runSpecId, version = time)
+      val instance = TestInstanceBuilder
+        .newBuilder(runSpecId = runSpecId, version = time)
         .withAgentInfo(agentInfo)
         .addTaskWithBuilder()
-        .taskResidentLaunched(localVolumeId)
-        .build().getInstance()
-      EnrichedTask(runSpecId, instance.appTask, agentInfo, healthCheckResults = Nil, servicePorts = Nil)
+        .taskStaging(since = time)
+        .withNetworkInfo(networkInfo)
+        .build()
+        .getInstance()
+      EnrichedTask(instance.runSpecId, instance.appTask, agentInfo, Nil, Nil, None, "*")
     }
   }
 
@@ -77,17 +75,21 @@ class EnrichedTaskWritesTest extends UnitTest {
         s"""
         |{
         |  "appId": "${f.runSpecId}",
+        |  "healthCheckResults" : [],
         |  "id": "${f.taskWithoutIp.task.taskId.idString}",
+        |  "ipAddresses" : [],
         |  "host": "agent1.mesos",
         |  "state": "TASK_STAGING",
         |  "ports": [],
-        |  "startedAt": null,
+        |  "servicePorts" : [],
         |  "stagedAt": "1970-01-01T00:00:01.024Z",
         |  "version": "1970-01-01T00:00:01.024Z",
-        |  "slaveId": "abcd-1234"
+        |  "slaveId": "abcd-1234",
+        |  "localVolumes" : [],
+        |  "role" : "*"
         |}
       """.stripMargin
-      JsonTestHelper.assertThatJsonOf(f.taskWithoutIp).correspondsToJsonString(json)
+      JsonTestHelper.assertThatJsonOf(f.taskWithoutIp.toRaml).correspondsToJsonString(json)
     }
 
     "JSON serialization of a Task with multiple IPs" in {
@@ -96,6 +98,7 @@ class EnrichedTaskWritesTest extends UnitTest {
         s"""
         |{
         |  "appId": "${f.runSpecId}",
+        |  "healthCheckResults" : [],
         |  "id": "${f.taskWithMultipleIPs.task.taskId.idString}",
         |  "host": "agent1.mesos",
         |  "state": "TASK_STAGING",
@@ -110,43 +113,15 @@ class EnrichedTaskWritesTest extends UnitTest {
         |    }
         |  ],
         |  "ports": [],
-        |  "startedAt": null,
+        |  "servicePorts" : [],
         |  "stagedAt": "1970-01-01T00:00:01.024Z",
         |  "version": "1970-01-01T00:00:01.024Z",
-        |  "slaveId": "abcd-1234"
-        |}
-      """.stripMargin
-      JsonTestHelper.assertThatJsonOf(f.taskWithMultipleIPs).correspondsToJsonString(json)
-    }
-
-    "JSON serialization of a Task with reserved local volumes" in {
-      val f = new Fixture()
-      val enrichedTask = f.taskWithLocalVolumes
-      val task = enrichedTask.task
-      val status = task.status
-      val json =
-        s"""
-        |{
-        |  "appId": "${f.runSpecId}",
-        |  "id": "${task.taskId.idString}",
-        |  "host": "agent1.mesos",
-        |  "state" : "TASK_RUNNING",
-        |  "ports": [],
-        |  "startedAt": "${status.startedAt.value.toString}",
-        |  "stagedAt": "${status.stagedAt.toString}",
-        |  "version": "${task.runSpecVersion}",
         |  "slaveId": "abcd-1234",
-        |  "localVolumes": [
-        |    {
-        |      "runSpecId" : "/appid",
-        |      "containerPath": "container",
-        |      "uuid": "random",
-        |      "persistenceId": "appid#container#random"
-        |    }
-        |  ]
+        |  "localVolumes" : [],
+        |  "role" : "*"
         |}
       """.stripMargin
-      JsonTestHelper.assertThatJsonOf(f.taskWithLocalVolumes).correspondsToJsonString(json)
+      JsonTestHelper.assertThatJsonOf(f.taskWithMultipleIPs.toRaml).correspondsToJsonString(json)
     }
   }
 }

@@ -1,26 +1,66 @@
 package mesosphere.marathon
 package raml
 
-import mesosphere.marathon.core.pod
-
-import mesosphere.marathon.state.{ DiskType, ExternalVolumeInfo, PersistentVolumeInfo, SecretVolume }
-import mesosphere.marathon.stream.Implicits._
+import mesosphere.marathon.state.{DiskType, Volume}
 import mesosphere.mesos.protos.Implicits._
-import org.apache.mesos.{ Protos => Mesos }
+import org.apache.mesos.{Protos => Mesos}
+
+import scala.jdk.CollectionConverters._
 
 trait VolumeConversion extends ConstraintConversion with DefaultConversions {
 
-  implicit val volumeRamlReader: Reads[PodVolume, pod.Volume] = Reads {
-    case ev: EphemeralVolume => core.pod.EphemeralVolume(ev.name)
-    case hv: HostVolume => pod.HostVolume(hv.name, hv.host)
-    case sv: PodSecretVolume =>
-      core.pod.SecretVolume(sv.name, sv.secret)
+  /**
+    * Will select the default disk type to use depending on whether or not a disk profileName is given.
+    *
+    * There are three types of disk currently supported by Marathon: Root, Path and Mount. These are the disk types
+    * introduced by Mesos and documented as Multiple Disks:
+    * http://mesos.apache.org/documentation/latest/multiple-disk/
+    *
+    * A Root disk usually maps to the storage on the main operating system drive. Root is the default type used when
+    * none is provided by the user. Other volume types will only exist if an operator created those using the present
+    * operating system drive. That means, when external services or tools carve up raw disks, they will produce disks
+    * of types Mount or Path, which can be used by frameworks. The only such service we are currently aware of and
+    * integrate with is the DC/OS Storage Service (DSS) which is in beta:
+    * https://docs.mesosphere.com/services/beta-storage/
+    *
+    * There are additional two types of disk that Marathon currently does not support directly, since they are of no
+    * direct value to the user: Raw and Block. For more information on these, see
+    * http://mesos.apache.org/documentation/latest/csi/
+    *
+    * DSS will use Mesos Raw disks and create Mount or Block devices out of them. The mechanism for frameworks to select
+    * such a Mount volume is the profileName, which will be populated by DSS. Therefore, if a disk profileName is set,
+    * the disk type default to Mount.
+    */
+  def defaultDiskTypeForProfile(profileName: Option[String]): DiskType = profileName.map(_ => DiskType.Mount).getOrElse(DiskType.Root)
+
+  implicit val volumeRamlReader: Reads[PodVolume, state.Volume] = Reads {
+    case ev: PodEphemeralVolume => state.EphemeralVolume(name = Some(ev.name))
+    case hv: PodHostVolume => state.HostVolume(name = Some(hv.name), hostPath = hv.host)
+    case sv: PodSecretVolume => state.SecretVolume(name = Some(sv.name), secret = sv.secret)
+    case pv: PodPersistentVolume =>
+      val diskType = pv.persistent.`type`.fromRaml.getOrElse(defaultDiskTypeForProfile(pv.persistent.profileName))
+      val persistentInfo = state.PersistentVolumeInfo(
+        `type` = diskType,
+        size = pv.persistent.size,
+        maxSize = pv.persistent.maxSize,
+        profileName = pv.persistent.profileName,
+        constraints = pv.persistent.constraints.fromRaml
+      )
+      state.PersistentVolume(name = Some(pv.name), persistent = persistentInfo)
   }
 
-  implicit val volumeRamlWriter: Writes[pod.Volume, PodVolume] = Writes {
-    case e: pod.EphemeralVolume => raml.EphemeralVolume(e.name)
-    case h: pod.HostVolume => raml.HostVolume(h.name, h.hostPath)
-    case s: pod.SecretVolume => raml.PodSecretVolume(s.name, s.secret)
+  implicit val volumeRamlWriter: Writes[state.Volume, PodVolume] = Writes {
+    case e: state.EphemeralVolume =>
+      raml.PodEphemeralVolume(name = e.name.getOrElse(throw new IllegalArgumentException("name must not be empty")))
+    case h: state.HostVolume =>
+      raml.PodHostVolume(name = h.name.getOrElse(throw new IllegalArgumentException("name must not be empty")), host = h.hostPath)
+    case s: state.SecretVolume =>
+      raml.PodSecretVolume(name = s.name.getOrElse(throw new IllegalArgumentException("name must not be empty")), secret = s.secret)
+    case p: state.PersistentVolume =>
+      raml.PodPersistentVolume(
+        name = p.name.getOrElse(throw new IllegalArgumentException("name must not be empty")),
+        persistent = p.persistent.toRaml
+      )
   }
 
   implicit val volumeModeWrites: Writes[Mesos.Volume.Mode, ReadMode] = Writes {
@@ -33,105 +73,194 @@ trait VolumeConversion extends ConstraintConversion with DefaultConversions {
     case ReadMode.Rw => Mesos.Volume.Mode.RW
   }
 
-  implicit val volumeWrites: Writes[state.Volume, AppVolume] = Writes { volume =>
+  implicit val readOnlyFlagReads: Reads[ReadMode, Boolean] = Reads {
+    case ReadMode.Ro => true
+    case ReadMode.Rw => false
+  }
 
-    implicit val externalVolumeWrites: Writes[state.ExternalVolumeInfo, ExternalVolume] = Writes { ev =>
-      ExternalVolume(size = ev.size, name = Some(ev.name), provider = Some(ev.provider), options = ev.options)
+  implicit val readOnlyFlagWrites: Writes[Boolean, ReadMode] = Writes { readOnly =>
+    if (readOnly) ReadMode.Ro else ReadMode.Rw
+  }
+
+  implicit val persistentVolumeInfoWrites: Writes[state.PersistentVolumeInfo, PersistentVolumeInfo] = Writes { pv =>
+    val pvType = Option(pv.`type` match {
+      case DiskType.Mount => PersistentVolumeType.Mount
+      case DiskType.Path => PersistentVolumeType.Path
+      case DiskType.Root => PersistentVolumeType.Root
+    })
+    PersistentVolumeInfo(
+      `type` = pvType,
+      size = pv.size,
+      maxSize = pv.maxSize,
+      profileName = pv.profileName,
+      constraints = pv.constraints.toRaml[Set[Seq[String]]]
+    )
+  }
+
+  implicit val volumeWrites: Writes[state.VolumeWithMount[Volume], AppVolume] = Writes { volumeWithMount =>
+    implicit val externalVolumeWrites: Writes[state.ExternalVolumeInfo, ExternalVolumeInfo] = Writes {
+      case ev: state.DVDIExternalVolumeInfo =>
+        raml.DVDIExternalVolumeInfo(
+          size = ev.size,
+          name = Some(ev.name),
+          provider = Some(ev.provider),
+          options = ev.options,
+          shared = ev.shared
+        )
+      case ev: state.CSIExternalVolumeInfo =>
+        val capability = ev.accessType match {
+          case state.CSIExternalVolumeInfo.BlockAccessType =>
+            raml.CSICapability(accessMode = ev.accessMode.name, accessType = "block", fsType = None, mountFlags = Nil)
+          case mount: state.CSIExternalVolumeInfo.MountAccessType =>
+            raml.CSICapability(
+              accessMode = ev.accessMode.name,
+              accessType = "mount",
+              fsType = Some(mount.fsType),
+              mountFlags = mount.mountFlags
+            )
+        }
+        val options = raml.CSIExternalVolumeInfoOptions(
+          pluginName = ev.pluginName,
+          capability = capability,
+          nodeStageSecret = ev.nodeStageSecret,
+          nodePublishSecret = ev.nodePublishSecret,
+          volumeContext = ev.volumeContext
+        )
+        raml.CSIExternalVolumeInfo(name = ev.name, provider = ev.provider, options = options)
     }
 
-    implicit val persistentVolumeInfoWrites: Writes[state.PersistentVolumeInfo, PersistentVolume] = Writes { pv =>
-      val pvType = Option(pv.`type` match {
-        case DiskType.Mount => PersistentVolumeType.Mount
-        case DiskType.Path => PersistentVolumeType.Path
-        case DiskType.Root => PersistentVolumeType.Root
-      })
-      PersistentVolume(pvType, pv.size, pv.maxSize, pv.constraints.toRaml[Set[Seq[String]]])
-    }
-
+    val volume = volumeWithMount.volume
+    val mount = volumeWithMount.mount
     volume match {
-      case dv: state.DockerVolume => AppDockerVolume(
-        volume.containerPath,
-        dv.hostPath,
-        mode = volume.mode.toRaml)
-      case ev: state.ExternalVolume => AppExternalVolume(
-        volume.containerPath,
-        external = ev.external.toRaml,
-        mode = volume.mode.toRaml)
-      case pv: state.PersistentVolume => AppPersistentVolume(
-        volume.containerPath,
-        persistent = pv.persistent.toRaml,
-        mode = volume.mode.toRaml)
-      case sv: state.SecretVolume => AppSecretVolume(
-        volume.containerPath,
-        secret = sv.secret
-      )
+      case dv: state.HostVolume => AppHostVolume(containerPath = mount.mountPath, hostPath = dv.hostPath, mode = mount.readOnly.toRaml)
+      case ev: state.ExternalVolume =>
+        AppExternalVolume(containerPath = mount.mountPath, external = ev.external.toRaml, mode = mount.readOnly.toRaml)
+      case pv: state.PersistentVolume =>
+        AppPersistentVolume(containerPath = mount.mountPath, persistent = pv.persistent.toRaml, mode = mount.readOnly.toRaml)
+      case sv: state.SecretVolume =>
+        AppSecretVolume(
+          containerPath = mount.mountPath,
+          secret = sv.secret
+        )
     }
   }
 
-  implicit val volumeReads: Reads[AppVolume, state.Volume] = Reads {
+  implicit val volumeReads: Reads[AppVolume, state.VolumeWithMount[Volume]] = Reads {
     case v: AppExternalVolume => volumeExternalReads.read(v)
     case v: AppPersistentVolume => volumePersistentReads.read(v)
-    case v: AppDockerVolume => volumeDockerReads.read(v)
+    case v: AppHostVolume => volumeHostReads.read(v)
     case v: AppSecretVolume => volumeSecretReads.read(v)
     case unsupported => throw SerializationFailedException(s"unsupported app volume type $unsupported")
   }
 
-  implicit val volumeExternalReads: Reads[AppExternalVolume, state.Volume] = Reads { vol =>
-    val info = ExternalVolumeInfo(
-      size = vol.external.size,
-      name = vol.external.name.getOrElse(throw SerializationFailedException("external volume requires a name")),
-      provider = vol.external.provider.getOrElse(throw SerializationFailedException("external volume requires a provider")),
-      options = vol.external.options
-    )
-    state.ExternalVolume(containerPath = vol.containerPath, external = info, mode = vol.mode.fromRaml)
-  }
-
-  implicit val volumePersistentReads: Reads[AppPersistentVolume, state.Volume] = Reads { vol =>
-    val persistent = vol.persistent
-    val volType = persistent.`type` match {
-      case Some(definedType) => definedType match {
-        case PersistentVolumeType.Root => DiskType.Root
-        case PersistentVolumeType.Mount => DiskType.Mount
-        case PersistentVolumeType.Path => DiskType.Path
-      }
-      case None => DiskType.Root
-    }
-    val info = PersistentVolumeInfo(
-      size = persistent.size,
-      maxSize = persistent.maxSize,
-      `type` = volType,
-      constraints = persistent.constraints.map { constraint =>
-        (constraint.headOption, constraint.lift(1), constraint.lift(2)) match {
-          case (Some("path"), Some("LIKE"), Some(value)) =>
-            Protos.Constraint.newBuilder()
-              .setField("path")
-              .setOperator(Protos.Constraint.Operator.LIKE)
-              .setValue(value)
-              .build()
-          case _ =>
-            throw SerializationFailedException(s"illegal volume constraint ${constraint.mkString(",")}")
+  implicit val volumeExternalReads: Reads[AppExternalVolume, state.VolumeWithMount[Volume]] = Reads { volumeRaml =>
+    val info: state.ExternalVolumeInfo = volumeRaml.external match {
+      case external: raml.DVDIExternalVolumeInfo =>
+        state.DVDIExternalVolumeInfo(
+          size = external.size,
+          name = external.name.getOrElse(throw SerializationFailedException("external volume requires a name")),
+          provider = external.provider.getOrElse(throw SerializationFailedException("external volume requires a provider")),
+          options = external.options,
+          shared = external.shared
+        )
+      case csi: raml.CSIExternalVolumeInfo =>
+        val accessType = csi.options.capability.accessType match {
+          case "block" =>
+            state.CSIExternalVolumeInfo.BlockAccessType
+          case "mount" =>
+            state.CSIExternalVolumeInfo.MountAccessType(
+              fsType = csi.options.capability.fsType.getOrElse(
+                throw new IllegalStateException(
+                  "fsType must be specified with mount access type CSI volumes. This is a bug. Validation should have prevented this"
+                )
+              ),
+              mountFlags = csi.options.capability.mountFlags
+            )
         }
-      }(collection.breakOut)
+        state.CSIExternalVolumeInfo(
+          name = csi.name,
+          pluginName = csi.options.pluginName,
+          accessType = accessType,
+          accessMode = state.CSIExternalVolumeInfo.AccessMode
+            .fromString(csi.options.capability.accessMode)
+            .getOrElse(
+              throw new IllegalStateException("CSI options.access.mode is invalid. This is a bug. Validation should have prevented this.")
+            ),
+          nodeStageSecret = csi.options.nodeStageSecret,
+          nodePublishSecret = csi.options.nodePublishSecret,
+          volumeContext = csi.options.volumeContext
+        )
+    }
+    val volume = state.ExternalVolume(name = None, external = info)
+    val mount = state.VolumeMount(volumeName = None, mountPath = volumeRaml.containerPath, readOnly = volumeRaml.mode.fromRaml)
+    state.VolumeWithMount[Volume](volume = volume, mount = mount)
+  }
+
+  implicit val volumeTypeReads: Reads[Option[PersistentVolumeType], Option[DiskType]] = Reads { maybeType =>
+    maybeType.flatMap {
+      case PersistentVolumeType.Root => Some(DiskType.Root)
+      case PersistentVolumeType.Mount => Some(DiskType.Mount)
+      case PersistentVolumeType.Path => Some(DiskType.Path)
+    }
+  }
+
+  implicit val volumeConstraintsReads: Reads[Set[Seq[String]], Set[Protos.Constraint]] = Reads { constraints =>
+    constraints.map { constraint =>
+      (constraint.headOption, constraint.lift(1), constraint.lift(2)) match {
+        case (Some("path"), Some("LIKE"), Some(value)) =>
+          Protos.Constraint
+            .newBuilder()
+            .setField("path")
+            .setOperator(Protos.Constraint.Operator.LIKE)
+            .setValue(value)
+            .build()
+        case _ =>
+          throw SerializationFailedException(s"illegal volume constraint ${constraint.mkString(",")}")
+      }
+    }
+  }
+
+  implicit val volumePersistentReads: Reads[AppPersistentVolume, state.VolumeWithMount[Volume]] = Reads { volumeRaml =>
+    val diskType = volumeRaml.persistent.`type`.fromRaml.getOrElse(defaultDiskTypeForProfile(volumeRaml.persistent.profileName))
+    val info = state.PersistentVolumeInfo(
+      `type` = diskType,
+      size = volumeRaml.persistent.size,
+      maxSize = volumeRaml.persistent.maxSize,
+      profileName = volumeRaml.persistent.profileName,
+      constraints = volumeRaml.persistent.constraints.fromRaml
     )
-    state.PersistentVolume(containerPath = vol.containerPath, persistent = info, mode = vol.mode.fromRaml)
+    val volume = state.PersistentVolume(name = None, persistent = info)
+    val mount = state.VolumeMount(volumeName = None, mountPath = volumeRaml.containerPath, readOnly = volumeRaml.mode.fromRaml)
+    state.VolumeWithMount[Volume](volume = volume, mount = mount)
   }
 
-  implicit val volumeDockerReads: Reads[AppDockerVolume, state.Volume] = Reads { vol =>
-    state.DockerVolume(containerPath = vol.containerPath, hostPath = vol.hostPath, mode = vol.mode.fromRaml)
+  implicit val volumeHostReads: Reads[AppHostVolume, state.VolumeWithMount[Volume]] = Reads { volumeRaml =>
+    val volume = state.HostVolume(name = None, hostPath = volumeRaml.hostPath)
+    val mount = state.VolumeMount(volumeName = None, mountPath = volumeRaml.containerPath, readOnly = volumeRaml.mode.fromRaml)
+    state.VolumeWithMount[Volume](volume = volume, mount = mount)
   }
 
-  implicit val volumeSecretReads: Reads[AppSecretVolume, state.Volume] = Reads { vol =>
-    SecretVolume(vol.containerPath, vol.secret)
+  implicit val volumeSecretReads: Reads[AppSecretVolume, state.VolumeWithMount[Volume]] = Reads { volumeRaml =>
+    val volume = state.SecretVolume(name = None, secret = volumeRaml.secret)
+    val mount = state.VolumeMount(volumeName = None, mountPath = volumeRaml.containerPath, readOnly = true)
+    state.VolumeWithMount[Volume](volume = volume, mount = mount)
   }
 
-  implicit val appVolumeExternalProtoRamlWriter: Writes[Protos.Volume.ExternalVolumeInfo, ExternalVolume] = Writes { vol =>
-    ExternalVolume(
-      size = vol.when(_.hasSize, _.getSize).orElse(ExternalVolume.DefaultSize),
-      name = vol.when(_.hasName, _.getName).orElse(ExternalVolume.DefaultName),
-      provider = vol.when(_.hasProvider, _.getProvider).orElse(ExternalVolume.DefaultProvider),
-      options = vol.whenOrElse(_.getOptionsCount > 0, _.getOptionsList.map { x => x.getKey -> x.getValue }(collection.breakOut), ExternalVolume.DefaultOptions)
-    )
-  }
+  implicit val appVolumeExternalProtoRamlWriter: Writes[Protos.Volume.ExternalVolumeInfo, ExternalVolumeInfo] =
+    Writes { volume =>
+      // TODO add csi volume conversion here
+      DVDIExternalVolumeInfo(
+        size = volume.when(_.hasSize, _.getSize).orElse(DVDIExternalVolumeInfo.DefaultSize),
+        name = volume.when(_.hasName, _.getName).orElse(DVDIExternalVolumeInfo.DefaultName),
+        provider = volume.when(_.hasProvider, _.getProvider).orElse(DVDIExternalVolumeInfo.DefaultProvider),
+        options = volume.whenOrElse(
+          _.getOptionsCount > 0,
+          _.getOptionsList.asScala.iterator.map { x => x.getKey -> x.getValue }.toMap,
+          DVDIExternalVolumeInfo.DefaultOptions
+        ),
+        shared = volume.when(_.hasShared, _.getShared).getOrElse(DVDIExternalVolumeInfo.DefaultShared)
+      )
+    }
 
   implicit val appPersistentVolTypeProtoRamlWriter: Writes[Mesos.Resource.DiskInfo.Source.Type, PersistentVolumeType] = Writes { typ =>
     import Mesos.Resource.DiskInfo.Source.Type._
@@ -142,35 +271,46 @@ trait VolumeConversion extends ConstraintConversion with DefaultConversions {
     }
   }
 
-  implicit val appVolumePersistentProtoRamlWriter: Writes[Protos.Volume.PersistentVolumeInfo, PersistentVolume] = Writes { vol =>
-    PersistentVolume(
-      `type` = vol.when(_.hasType, _.getType.toRaml).orElse(PersistentVolume.DefaultType),
-      size = vol.getSize,
-      maxSize = vol.when(_.hasMaxSize, _.getMaxSize).orElse(PersistentVolume.DefaultMaxSize), // TODO(jdef) protobuf serialization is broken for this
-      constraints = vol.whenOrElse(_.getConstraintsCount > 0, _.getConstraintsList.map(_.toRaml[Seq[String]])(collection.breakOut), PersistentVolume.DefaultConstraints)
-    )
-  }
+  implicit val appVolumePersistentProtoRamlWriter: Writes[Protos.Volume.PersistentVolumeInfo, PersistentVolumeInfo] =
+    Writes { volume =>
+      PersistentVolumeInfo(
+        `type` = volume.when(_.hasType, _.getType.toRaml).orElse(PersistentVolumeInfo.DefaultType),
+        size = volume.getSize,
+        // TODO(jdef) protobuf serialization is broken for this
+        maxSize = volume.when(_.hasMaxSize, _.getMaxSize).orElse(PersistentVolumeInfo.DefaultMaxSize),
+        profileName = volume.when(_.hasProfileName, _.getProfileName).orElse(PersistentVolumeInfo.DefaultProfileName),
+        constraints = volume.whenOrElse(
+          _.getConstraintsCount > 0,
+          _.getConstraintsList.asScala.iterator.map(_.toRaml[Seq[String]]).toSet,
+          PersistentVolumeInfo.DefaultConstraints
+        )
+      )
+    }
 
   implicit val appVolumeProtoRamlWriter: Writes[Protos.Volume, AppVolume] = Writes {
-    case vol if vol.hasExternal => AppExternalVolume(
-      containerPath = vol.getContainerPath,
-      external = vol.getExternal.toRaml,
-      mode = vol.getMode.toRaml
-    )
-    case vol if vol.hasPersistent => AppPersistentVolume(
-      containerPath = vol.getContainerPath,
-      persistent = vol.getPersistent.toRaml,
-      mode = vol.getMode.toRaml
-    )
-    case vol if vol.hasSecret => AppSecretVolume(
-      containerPath = vol.getContainerPath,
-      secret = vol.getSecret.getSecret
-    )
-    case vol => AppDockerVolume(
-      containerPath = vol.getContainerPath,
-      hostPath = vol.getHostPath,
-      mode = vol.getMode.toRaml
-    )
+    case vol if vol.hasExternal =>
+      AppExternalVolume(
+        containerPath = vol.getContainerPath,
+        external = vol.getExternal.toRaml,
+        mode = vol.getMode.toRaml
+      )
+    case vol if vol.hasPersistent =>
+      AppPersistentVolume(
+        containerPath = vol.getContainerPath,
+        persistent = vol.getPersistent.toRaml,
+        mode = vol.getMode.toRaml
+      )
+    case vol if vol.hasSecret =>
+      AppSecretVolume(
+        containerPath = vol.getContainerPath,
+        secret = vol.getSecret.getSecret
+      )
+    case vol =>
+      AppHostVolume(
+        containerPath = vol.getContainerPath,
+        hostPath = vol.getHostPath,
+        mode = vol.getMode.toRaml
+      )
   }
 }
 

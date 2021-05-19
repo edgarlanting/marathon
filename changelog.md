@@ -1,4 +1,633 @@
-## Changes from 1.4.x to 1.5.0 (unreleased)
+## Changes from to 1.10.17 to 1.10.xxx
+
+### Fixed issues
+
+* [MARATHON-8762](https://jira.d2iq.com/browse/MARATHON-8762) - Marathon allows migrations to be re-applied if they did not previously complete.
+
+## Changes from 1.9.136 to 1.10.17
+
+### Vertical container bursting support and shared cgroups
+
+Marathon 1.10 brings support for Mesos resource-limits, allowing containers to formally allocate and consume more CPU or memory than are consumed from an offer. For example, the following app definition would allow a Marathon app to consume as many CPU cycles are available, and also consume more than the 4gb of memory requested.
+
+```
+{
+  "id": "/dev/bigbusiness",
+  "cpus": 1,
+  "mem": 4096,
+  "resourceLimits": {
+    "cpus": "unlimited",
+    "mem": 8192
+  },
+  ...
+}
+```
+
+Also, newly created pods will no longer allow containers to steal resources from eachother. Previously, if a container in a pod was configured with less memory than it actually needs, the pod would still run successfully if the container could borrow steal the amount needed from another container. Pods created prior to upgrading Marathon to 1.10 will automatically have the flag `legacySharedCgroups` set to allow them to continue to run with the same configuration as they were initially launched. Pods cannot specify resource limits when `legacySharedCgroups` is enabled.
+
+For more information, see [resource-limits.md](https://github.com/mesosphere/marathon/blob/master/docs/docs/resource-limits.md)
+
+## Changes from 1.9.100 to 1.9.136
+
+### Fixed issues
+
+* [MARATHON-8711](https://jira.mesosphere.com/browse/MARATHON-8711) - Fix pod status for `Scheduled` instances with a
+  goal `Stopped`, which was causing scaled-down, terminal resident instances to not show up anywhere in the list.
+* [MARATHON-8712](https://jira.mesosphere.com/browse/MARATHON-8712) - Fix an issue where the upgrade migration would
+  fail if there were any persisted instances in state "scheduled" (IE ongoing deployment) during the upgrade attempt.
+* [MARATHON-8713](https://jira.mesosphere.com/browse/MARATHON-8713) - Fixed issue where defaultRole for groups with
+  enforceRole: false did not match the documentation and defaulted to the group-role, regardless.
+* [MARATHON-8710](https://jira.mesosphere.com/browse/MARATHON-8710) - Marathon would not include failed and re-scheduled
+  instances in `/v2/pods/::status` calls. This has been fixed. Note: freshly scheduled instances won't be shown.
+* [MARATHON-8719](https://jira.mesosphere.com/browse/MARATHON-8719) - With UnreachableStrategy, setting
+  expungeAfterSeconds and inactiveAfterSeconds to the same value will cause the instance to be expunged immediately;
+  this helps with `GROUP_BY` or `UNIQUE` constraints.
+* [MARATHON-8719](https://jira.mesosphere.com/browse/MARATHON-8719) - Marathon `/v2/tasks` text formatted output no
+  longer includes endpoints without host-port mappings at the agent hostname and port 0.
+
+### `/v2/tasks` `text/plain` output
+
+#### Addition of `containerNetworks` parameter
+
+Marathon outputs a terse, text-formatted list of instances with corresponding port-mappings with a request to `/v2/tasks` with content-type: `text/plain`. Usage of this endpoint is generally discouraged, but some older tools continue to rely on it.
+
+As of Marathon 1.5, the output would include user container network endpoint without a host port mapping, but in a form that was completely unusable (the agent's hostname as the address, even though the endpoint is fundamentally unreachable at that address, and the port 0). This behavior has been removed, and such results are not included by `/v2/tasks` application/text output, by default.
+
+A parameter `containerNetworks` has been added to filter and include port mappings pertaining to a comma-delimited list of user container network names. Setting this flag does not affect the output for port mappings that are bound to a host port in some way (either directly, in the case of host networking, or through a bridge-network port mapping). To see all container ips and endpoints for all user container networks, pass `?containerNetworks=*`.
+
+#### Deprecation ####
+
+The `text/plain` output is deprecated. It will be soft removed with Marathon 1.10. Any request will
+result in an `HTTP 406 Not Accetable` if the accept header is `test/plain` unless `--deprecated_features text_plain_tasks`
+is enabled. It will be hard removed with Marathon 1.11.
+
+## Changes from 1.9.73 to 1.9.100
+
+### Faster serialization
+
+The serialization speed in Marathon has been dramatically improved by switching to a more efficient serialization library for Marathon's auto-generated code. Marathon can generate JSON 50% faster; further, GC allocation cycles are reduced by 50%. This will help to alleviate performance issues resulting from many services frequently querying the API of a large Marathon instance.
+
+[MARATHON-8567](https://jira.mesosphere.com/browse/MARATHON-8706)
+
+### Fixed issues
+
+- [MARATHON-8706](https://jira.mesosphere.com/browse/MARATHON-8706) - Fixed an issue where `--new_group_enforce_role top` was not abided when auto-creating groups for services posted in not-yet-existing groups.
+- [MARATHON-8697](https://jira.mesosphere.com/browse/MARATHON-8697) - Removed (another) external volume name validation that prevented the use of configuration parameters for some volume providers.
+
+## Changes from 1.8.212 to 1.9.73
+
+### Multi-role support
+
+Marathon 1.9 brings support for multi-role, enabling you to launch services for different roles (against different Mesos quotas) with the same Marathon instance. This feature is described in greater detail in the [Multi-role docs](https://mesosphere.github.io/marathon/docs/multirole.html).
+
+#### Role field added to services
+
+The role field can now be optionally specified for a service. However, the value of this field may only be sent to one of two values:
+
+* The default role as specified by `--mesos_role` command line parameter
+* The name of the top-level group (this is referred to as the group-role)
+
+#### Changes in `acceptedResourceRoles` behavior
+
+`acceptedResourceRole` field defines what *reserved* resources would be used by the service. Previously, a Marathon instance started with `--mesos_role *` would accept following service definition:
+```json
+{
+   "id": "/sleep",
+   "cmd": "sleep 3600"
+   "acceptedResourceRoles": ["foo"]
+}
+``` 
+
+... but wouldn't be able to start the task since it is not subscribed for the role `foo`.
+
+This behavior has been changed with the addition of multi-role support. In Marathon 1.9, Marathon will sanitize the `acceptedResourceRoles` value, removing all invalid roles and leaving `*` (unreserved) by default. Using the example above, the service definition will be still accepted, however, `foo` will be removed and `"acceptedResourceRoles": ["*"]` will be used instead so that the task *will start*.
+
+Starting with Marathon 1.10, Marathon will reject the above service definition as invalid. However, the `sanitize_accepted_resource_roles` feature can be enabled with `--deprecated_features sanitize_accepted_resource_roles`, causing Marathon to continue to auto-sanitize this field value for one more version.
+
+In Marathon 1.11, the `sanitize_accepted_resource_roles` deprecated feature will be removed.
+
+#### Command-line flag `--default_accepted_resource_roles` has been replaced with `--accepted_resource_roles_default_behavior`
+
+The command-line flag `--default_accepted_resource_roles` does not work in a multi-role context. A new command-line parameter, `--accepted_resource_roles_default_behavior`, has been introduced, to replace it. See the [command-line-flags](https://mesosphere.github.io/marathon/docs/command-line-flags.html) docs.
+
+The command-line flag `--default_accepted_resource_roles` is deprecated and will be removed in Marathon 1.10.0.
+
+### Introduce SharedMemory/IPC configuration to Marathon Apps and Pods
+
+When running Marathon Apps or Pods it is now possible to configure the IPC separation level and shared memory size.
+Each container or executor can have their IPC mode set to either private or share the parents namespace. If set to
+private, the shared memory size can also be configured.
+See [Mesos documentation](http://mesos.apache.org/documentation/latest/isolators/namespaces-ipc/) for shared memory configuration for details.
+
+```
+{
+  "id": "/mesos-shared-memory-app",
+  "cmd": "sleep 1000",
+  "cpus": 0.1,
+  "mem": 32,
+  "container": {
+    "type": "MESOS",
+    "linuxInfo": {
+      "ipcInfo": {
+        "mode": "PRIVATE",
+        "shmSize": 16
+      }
+    }
+  }
+}
+``` 
+
+### `undefined` is an Illegal `--gpu_scheduling_behavior` Parameter
+
+As described [in an earlies note](#--gpu_scheduling_behavior-default-is-now-restricted-undefined-is-deprecated-and-will-be-removed) `undefined`
+is removed with `1.9.x`.
+
+### Marathon will auto-reset backoff delays when agents are being drained
+
+When Marathon receives a `TASK_GONE_BY_OPERATOR` or `TASK_KILLED` status update with a reason indicating that the agent is being drained, any delay for the related run spec will be deleted. This is to speed up the process of replacing tasks from drained agents.
+
+### Deprecated features
+
+#### Deprecation and eventual removal of the command line flags `--revive_offer_repetitions` and `--revive_offers_for_new_apps`
+
+The command line options `--revive_offers_port_new_apps` and `--revive_offers_repetitions` have been deprecated in Marathon 1.9. Specifying these command-line arguments no longer has any effect. These command-line options will be completely removed in Marathon 1.10, where specifying them will be considered an error.
+
+Instead of specifying `--revive_offers_port_new_apps`, one can achieve similar effects by specifying a larger `--min_revive_offers_interval`, which will reduce the burden and offer starvation in clusters with lots of frameworks.
+
+Revive offers repetitions functionality no longer optional; after the duration specified by ```min_revive_offers_interval` since the last revive for role, offers are still wanted, a revive is repeated once (and only once).
+
+For more detailed information, see the JIRA ticket [MARATHON-8663](https://jira.mesosphere.com/browse/MARATHON-8663)
+
+### Fixed issues
+- [MARATHON-8711](https://jira.mesosphere.com/browse/MARATHON-8711) - Fixed a rare issue where Marathon would fail to render a status for a resident scheduled pod instance with a goal `Stopped` 
+
+## Changes from 1.8.218 to 1.8.222
+
+### External Volume Validation changes
+
+#### Relaxed name validation
+
+As there are some external volume providers which require options in the volume name, the strict validation of the name on the external volume is now removed.
+
+As the uniqueness check is based on the volume name, this may lead to some inconsistencies, for the sake of uniqueness, the following volumes are distinct:
+
+```json
+"volumes": [
+      {
+        "external": {
+          "name": "name=volumename,option1=value",
+        },
+      }
+    ],
+```
+
+```json
+"volumes": [
+      {
+        "external": {
+          "name": "option1=value,name=volumename",
+        },
+      }
+    ],
+```
+
+#### Optional uniqueness check
+
+Previously, Marathon would validate that an external volume with the same name is only used once across all apps. This was due to the initial implementation being focused on Rexray+EBS. However, multiple external volume providers now
+allow shared access to mounted volumes, so we introduced a way to disable the uniqueness check:
+
+A new field, `container.volumes[n].external.shared` which defaults to `false`. If set to true, the same volume name can be used
+by multiple containers. The `shared` flag has to be set to `true` on all external volumes with the same name, otherwise a conflict is reported on the volume without the `shared=true` flag.
+
+```json
+  "container": {
+    "type": "MESOS",
+    "volumes": [
+      {
+        "external": {
+          "size": 5,
+          "name": "volumename",
+          "provider": "dvdi",
+          "shared": "true",
+          "options": {
+            "dvdi/driver": "pxd",
+            "dvdi/shared": "true"
+          }
+        },
+        "mode": "RW",
+        "containerPath": "/mnt/nginx"
+      }
+    ],
+  }
+```
+
+## Changes from 1.8.194 to 1.8.218
+
+### Revive and Suppress Refactoring
+
+The [revive](http://mesos.apache.org/documentation/latest/scheduler-http-api/#revive) and [suppress](http://mesos.apache.org/documentation/latest/scheduler-http-api/#suppress) logic was unified. In the past Marathon would keep reviving when
+an instance with a reservation was expunged (case 1) or it would revive when instance should be started (case 2). When
+no instance should be started Marathon would suppress offers which could conflict with case 1. With the refactoring
+only one logic decides whether to revive or suppress and thus avoids the conflict. The change also required changing
+the default `--min_revive_offers_interval` to thirty seconds. This should avoid overriding revive calls with a suppress
+too quickly. The `--[disable]_suppress_offers` flag can switch off suppress calls all together. This should be used
+when Marathon fails to clean up reservation which requires offers being sent.
+
+### Fixed issues
+
+- [DCOS-54927](https://jira.mesosphere.com/browse/DCOS-54927) - Fixed an issue where two independent deployments could interfere with each other resulting in too many tasks launched and/or possibly a stuck deployment.
+
+## Changes from 1.8.180 to 1.8.194
+
+### Fixed issues
+
+- [DCOS_OSS-5212](https://jira.mesosphere.com/browse/DCOS_OSS-5212) - Fixed an issue that prevented reserved instances created by older Marathon versions from being restarted
+
+- [MARATHON-8623](https://jira.mesosphere.com/browse/MARATHON-8623) - Fixed an issue that could cause /v2/deployments to become stale
+
+- [MARATHON-8624](https://jira.mesosphere.com/browse/MARATHON-8624) - Fixed issue where the presence of a TASK_UNKNOWN status could cause an API failure
+
+- [DCOS-51375](https://jira.mesosphere.com/browse/DCOS-51375) - Fixed an issue where deployment cancellation could leak instances.
+
+- [DCOS_OSS-5211](https://jira.mesosphere.com/browse/DCOS_OSS-5211) - The initial support for volume profiles would match disk resources with a profile, even if no profile was required. This behavior has been adjusted so that disk resources with profiles are only used when those profiles are required, and are not used if the service for which we are matching offers does not require a disk with that profile.
+
+- [MARATHON-8631](https://jira.mesosphere.com/browse/MARATHON-8631) - In order to prepare for the general availability of the [DC/OS Storage Service](https://docs.mesosphere.com/services/beta-storage/) (DSS), Marathon will now default to disk type `Mount`, if a persistent volume `profileName` is configured by the user without specifying the wanted disk `type`. Services like DSS will populate this field to allow users selecting the volumes they previously created. Mesos `Root` disks will not have a `profileName` set, so the default for persistent volumes that do not specify a `profileName` is still `Root`.
+
+- [MARATHON-8422](https://jira.mesosphere.com/browse/MARATHON-8422) - Kill unreachable tasks that came back. Marathon could get stuck waiting for terminal events but not issue a kill.
+
+## Changes from 1.7.xxx to 1.8.180
+
+### Aligning Ephemeral with Stateful Task Handling
+
+Marathon 1.8 introduces handling ephemeral instances similar to how it handled stateful instances since version 1.0. Until now, Marathon expunged ephemeral instances once all of their tasks ended up in a terminal state, and eventually launched replacements as a result of those instances being expunged. Instances will now only be expunged from the state once their goal is set to `Decommissioned` and all their tasks are in a terminal state. If their goal is still `Running`, they will be considered for scheduling and used to launch replacement tasks. This change not only merges two previously different code paths; this also simplifies debugging since users will be able to follow the task incarnations for a given instance throughout Marathons logs.
+
+This means that instance Ids are now stable for as long as an instance shall be kept running. New instances will be created only when replacing unreachable instances, and when replacing instances with new versions. Similar to the way we handle task Ids for stateful services, tasks of stateless services will now also provide an incarnation count, appended to the task Id. The first task created for an instance will be the .1, and subsequent replacements will increment that incarnation counter, e.g.
+
+```
+service-name.instance-c0caec0a-863a-11e9-915b-c610fee06dff._app.42
+```
+
+The above example denotes the 42nd incaration of instance `c0caec0a-863a-11e9-915b-c610fee06dff`.
+
+When killing an instance using the `wipe=true` flag, its goal will be set to `Decommission` and it will eventually be expunged when all tasks are terminal. Note that as long as its tasks are e.g. unreachable, it will not be expunged until they are reported terminal (in case they stay unreachable: `GONE`, `GONE_BY_OPERATOR`, or `UNKNOWN`). When killing instances without the `wipe=true` flag, Marathon will only issue kill requests to Mesos, but keep the current goal and will, therefore, launch replacements that are still associated with the existing instance.
+
+### AppC is now deprecated
+AppC is now deprecated and will be removed in Marathon 1.9
+
+### Introducing Seccomp capabilities to Marathon Apps and Pods
+
+When running Marathon Apps or Pods it is possible now to configure the `LinuxInfo` in order to define [seccomp](http://man7.org/linux/man-pages/man2/seccomp.2.html) which provides the ability to define container execution in a secure computing state as defined by the profiles at the agent.
+Key considerations is that Seccomp only works with UCR and Mesos containerizers.   Prior to this feature all containers were run in a `unconfined` security model.   Not defining a `Seccomp` for a container will result in the same behavior.   You can also be explict about it by defining `Seccomp` with an `unconfided` is `true`.
+If you want to run in a specific seccomp profile.   That profile needs to be configured at the agent Marathon will launch a task on and the `profileName` that matches the agent profile will need to be provided to the `Seccomp` object in the `LinuxInfo` object associated with the container.  In this case the `unconfined` will need to be `false`  A simple example is:
+
+```
+{
+  "id": "/mesos-seccomp-app",
+  "cmd": "sleep 1000",
+  "cpus": 0.5,
+  "mem": 32,
+  "container": {
+    "type": "MESOS",
+    "linuxInfo": {
+      "seccomp": {
+        "profileName" : "default.json",
+        "unconfined" : false
+      }
+    }
+  }
+}
+```     
+
+### Introduce global throttling to Marathon health checks
+Marathon health checks is a deprecated feature and customers are strongly recommended to switch to Mesos health checks for scalability reasons. However, we've seen a number of issues when excessive number of Marathon health checks (HTTP and TCP) would overload parts of Marathon. Hence we introduced a new parameter `--max_concurrent_marathon_health_checks` that defines maximum number (256 by default) of *Marathon* health checks (HTTP/S and TCP) that can be executed concurrently in the given moment. Note that setting a big value here and using many services with Marathon health checks will overload Marathon leading to internal timeouts and unstable behavior.  
+
+### `--gpu_scheduling_behavior` default is now `restricted`; `undefined` is deprecated and will be removed
+
+The default GPU Scheduling Behavior has been changed to `restricted`, and `undefined` has been deprecated and will be removed in `1.9.x`. Operators with GPU clusters that are upgrading to Marathon 1.8.x should think carefully about their desired policy and set accordingly; as a general rule:
+
+* You only need to configure `--gpu_scheduling_behavior` if Marathon is GPU enabled (`--enable_features gpu_resources`).
+* If you are using GPUs, and most nodes have GPUs, set the `unrestricted`.
+* If you are using GPUs, and most nodes do not have GPUs, set to `restricted` (the default).
+
+For more information on `gpu_scheduling_behavior`, please see [the docs](https://mesosphere.github.io/marathon/docs/preferential-gpu-scheduling.html)
+
+### Marathon is now suppressing offers by default
+The default for suppress offers changed in this release and it is now enabled by default. You can still disable suppressing via `--disable_suppress_offers` command line flag.
+
+### Upgrades only from Marathon 1.6+
+
+You can only upgrade to Marathon 1.8 from 1.6.x and 1.7.x. If you'd like to upgrade from an earlier version you should
+upgrade to Marathon 1.6 or 1.7 first.
+
+### /v2/events
+The default (and only) response format of the `/v2/events` is always "light". This is in accordance with the previously published deprecation plan. If `--deprecated_features=api_heavy_events` is still specified, Marathon will refuse to launch, with an error.
+
+### Removed deprecated metrics
+We removed deprecated Kamon based metrics from the code base (see the 1.7.xxx changelog for details on new metrics). This led to removal of deprecated command line arguments e.g. old reporters like `--reporter_graphite`, `--reporter_datadog`, `--reporter_datadog` and `--metrics_averaging_window`.
+
+### Apps names restrictions (breaking change)
+From now on, apps which uses ids which ends with "restart", "tasks", "versions" won't be valid anymore. Such apps already had broken behavior (for example it wasn't possible to use a `GET /v2/apps` endpoint with them), so we made that constraint more explicit. Existing apps with such names will continue working, however all operations on them (except deletion) will result in an error. Please take care of renaming them before upgrading Marathon.
+### Standby marathon instances no longer proxy events
+We no longer allow a standby Marathon instance to proxy `/v2/events` from Marathon master. Previously it was possible to use `proxy_events` flag to force Marathon
+to proxy the response from `/v2/events`, now it's deprecated.
+
+### save_tasks_to_launch_timeout was removed
+This option was deprecated since 1.5 and using that have no effect on Marathon. Marathon will no longer start with that option provided.
+
+### Fixed issues
+
+- [MARATHON-8482](https://jira.mesosphere.com/browse/MARATHON-8482) - We fixed a possibly incorrect behavior around killing overdue tasks: `--task_launch_confirm_timeout` parameter properly controls the time the task spends in `Provisioned` stage (between being launched and receiving `TASK_STAGING` status update).
+
+- [MARATHON-8566](https://jira.mesosphere.com/browse/MARATHON-8566) - We fixed a race condition causing `v2/deployments` not containing a confirmed deployment after HTTP 200/201 response was returned.
+
+- [MARATHON-8625](https://jira.mesosphere.com/browse/MARATHON-8625) - We fixed stuck rollbacks of persistent apps.
+
+### Closing connection on slow event consumers
+
+Prior to 1.8 Marathon would drop events from the event stream for slow consumers. Starting with 1.8 Marathon will close
+the connection instead to raise awareness of problematic consumers. A consumer is considered slow when it fails to read
+`event_stream_max_outstanding_messages` events in time, ie Marathon buffered so many events. Consumers can and should
+reconnect when the connection was dropped by Marathon.
+
+## Changes to 1.7.xxx
+
+### New metrics names (breaking change)
+
+To help make it easier for operators to monitor Marathon, substantial semantic improvements to metrics have been made. Old metric names were often unintuitive and unhelpfully exposed internal details of Marathon's code layout. A new naming convention has been adopted and consistently applied.
+
+This is a breaking change. Operators that were using metric data from Marathon before will need to update their visualizations and alerts to reference the new metric names. The new metric names and descriptions can be found in [our metrics documentation page](https://mesosphere.github.io/marathon/docs/metrics.html).
+
+The old metrics can be re-enabled if needed by passing the command-line argument `--deprecated_features=kamon_metrics` in Marathon 1.7.x. In Marathon 1.8.x, the old metrics will be completey removed.
+
+### Default for "kill_retry_timeout" was increased to 30 seconds
+
+Sending frequent kill requests to an agent can in certain cases lead to overloading the Docker daemon (if the tasks are docker containers run by the Docker containerizer). Thirty seconds seems to be a more sensible default here.
+
+### Marathon framework ID generation is now very conservative
+
+Previously, Marathon would automatically request a new framework ID from Mesos if the old one was marked as torn down in Mesos, or if the framework ID record was removed from Zookeeper. This has led to more trouble than it has helped. The new behavior is:
+
+* If Marathon's framework ID has been torn down in Mesos, or if the failover timeout has been exceeded, Marathon will crash, on launch, with a clear message.
+
+* If Marathon's framework ID record was deleted from Zookeeper or is otherwise inaccessible, and there are instances defined, Marathon will refuse to create a new Framework ID and crash.
+
+For more information, refer to the [framework id docs page](https://mesosphere.github.io/marathon/docs/framework-id.html).
+
+### Minimum Mesos version requirement has been increased to 1.5.0
+
+In previous Marathon versions, we monitored offers as a surrogate terminal task status signal for resident tasks in order to work around a Mesos issue in which we would not receive terminal task status updates for agents that restarted. As of Mesos 1.4.0, this is been resolved, and we have removed this workaround.
+
+There are still some edge cases where Mesos agent metadata is wiped (manually, by an operator) in a way that the agent ID will change, but reservations will be preserved. In these cases, Mesos will report a resident tasks as perpetually unreachable. Operators should use the [MARK_AGENT_GONE](http://mesos.apache.org/documentation/latest/operator-http-api/#mark_agent_gone) call in such cases to get Mesos to mark the associated resident tasks as terminal, and therefore signal to Marathon that it should try to relaunch the resident task. This call was introduced in Mesos 1.5.0.
+
+### Native Packages
+
+We have stopped publishing native packages for operating system versions that are past their end-of-life:
+
+- Ubuntu Yakkety
+- Ubuntu Wily
+- Ubuntu Vivid
+
+Additionally, we have added support for Debian Stretch.
+
+### Docker image now allows user `nobody`; default user has been changed
+
+Previously, the Marathon Docker container would only run as user root. The packaging has been updated so that the container is now run, by default, as the user `nobody`.
+
+When launching new Marathon-on-Marathon instances, note that this means that the default framework user will be `nobody`, rather than `root`, unless it is specified. When installing via the DC/OS Universe, the value is explicitly set. Note that it is not possible to change the framework user after the initial framework registration.
+
+### Non-leader/standby Marathon instances respond to /v2/events with a redirect, rather than proxy
+
+Previously, Marathon standby instances would proxy the event stream. This causes an unnecessary increase in event stream drops, as the connection will terminate if either the master or the standby restarts. Further, there have been occasional buffering issues.
+
+Now, when a standby Marathon instance is asked for /v2/events, it responds with a 302, with a redirect response directing the client to /v2/events resource for the current leader. Clients that consume the event stream should be updated to follow redirect responses.
+
+Event-proxying has the following deprecation schedule:
+
+- 1.7.x - Standby Marathon instances return redirect responses. The old behavior of proxying event streams can be brought back with the command-line argument `--deprecated_features=proxy_events`.
+- 1.8.x - Event stream proxying logic will be completely removed. If `--deprecated_features=proxy_events` is still specified, Marathon will refuse to launch, with an error.
+
+### Default for "max-open-connections" increased for asynchronous standby proxy, now configurable
+
+In some clusters with heavy standby-proxy usage, a limit of 32 max-open-connections was too small. This default has been increased to 64. In addition, the flag `--leader_proxy_max_open_connections` has been introduced to tune the value further, if needed.
+
+### Maintenance Mode Support Production Ready, Now Default
+
+Marathon now declines offers for agents with scheduled maintenance.
+
+Previously, this behavior was enabled by `--enable_features maintenance_mode`. Operators should remove `maintenance_mode` from the `--enable_features` value list, as it now has no effect. In Marathon 1.8.x, including the term `maintenance_mode` in the `--enable_features` list will be considered an error.
+
+The flag `--disable_maintenance_mode` has been introduced. To revert back to the default maintenance mode behavior in Marathon 1.6.x and earlier (ignore), operators can specify `--disable_maintenance_mode`.
+
+### Fixed Issues
+
+- [MARATHON-8409](https://jira.mesosphere.com/browse/MARATHON-8409) - You can now launch marathon in Docker as non-root user.
+- [MARATHON-8017](https://jira.mesosphere.com/browse/MARATHON-8017) - Fixed various issues when posting groups with relative ids.
+- [MARATHON-7568](https://jira.mesosphere.com/browse/MARATHON-7568) - We now redact any Zookeeper credentials from the /v2/info response endpoint.
+- [MARATHON-8326](https://jira.mesosphere.com/browse/MARATHON-8326) - Pods can be deleted together with persistent volumes, using a new wipe=true query parameter.
+- Updated version of [Marathon UI to 1.3.1](https://github.com/mesosphere/marathon-ui/blob/master/CHANGELOG.md#131---2018-06-07):
+    - [MARATHON-8255](https://jira.mesosphere.com/browse/MARATHON-8255) - Marathon UI properly shows fetch URLs in the edit dialog, now.
+
+### New Exit Codes
+
+Marathon will indicate with an exit code why it stopped itself. See the [docs page](https://mesosphere.github.io/marathon/docs/exit-codes.html) for a list of all codes and their meanings.
+
+## Change from 1.6.352 to 1.6.xxx
+
+### Limit maximum number of running deployments
+New command line flag `--max_running_deployments` was added to limit the max number of concurrently running deployments. The default value is set to 100. Should the user try to submit more updates than set by this flag a HTTP 403 Error is returned with an explanatory error message. We introduced this flag because having lots of running deployments can lead to a significant performance decrease in the failover scenario during marathon initialization phase. Note that if you reach the maximum deployment number, you will have to use `?force=true` parameter to cancel an existing deployment.
+
+### Zookeeper storage compaction interval
+New command line flag `--storage_compaction_interval` was added to set zookeeper storage compaction interval in seconds. The default value is set to 30 seconds.
+
+### Deprecation Mechanism
+
+Marathon has gained a new feature flag: `--deprecated_features`. For more information, see the [docs](https://mesosphere.github.io/marathon/docs/deprecation.html).
+
+### Non-blocking API and Leader Proxying
+
+Previously, when under substantial load, Marathon would time out a deployment initiating request (such as modifying an app) after some time, with "futures timed out". The timeout was not very helpful because Marathon would perform the work requested, regardless. This timeout has been removed. However, note that the client will time out if configured to do so.
+
+To handle the potential increase in concurrent connections, deployment operations and leader request proxying now use nonblocking I/O. The nonblocking I/O proxying logic may have some subtle differences in how responses are handled, including more aggressive rejection of malformed HTTP requests. In the off-chance that this causes an issue in your cluster, the old behavior can be restored with the command line flag `--deprecated_features=sync_proxy`. `sync_proxy` is scheduled to be removed in Marathon `1.8.0`.
+
+### Improved environment variable to command line argument mapping
+
+As part of the fix for [MARATHON-8254](https://jira.mesosphere.com/browse/MARATHON-8254), the logic for receiving command-line options from environment variables has been reworked. "*" is properly propagated (previously, the glob-expanded result was getting passed), and spaces and new-lines are now preserved.
+
+There's a small change in behavior for environments in which the launcher script is sourced, rather than executed. Unexported environment variables will not be converted in to parameters.
+
+### Deprecated Features
+
+#### /v2/schemas
+
+The route `/v2/schemas` has been deprecated in favor of the RAML specifications. Clients that need to perform local validation of requests can access the RAML specifications with the prefix the `/public/api`. For example, to get the RAML definition for the apps resource, `GET http://marathon:8080/public/api/v2/apps.raml`.
+
+The route `/v2/schemas` has the following deprecation schedule:
+
+- 1.6.x - `/v2/schemas` will continue to function as normal.
+- 1.7.x - The API will stop responding to `/v2/schemas`; requests to it will be met with a 404 response. The route can
+  be re-enabled with the command-line argument `--deprecated_features=json_schemas_resource`.
+- 1.8.x - `/v2/schemas` is scheduled to be completely removed. If `--deprecated_features=json_schemas_resource` is
+  still specified, Marathon will refuse to launch, with an error.
+
+### /v2/events
+
+The default response format of the `/v2/events` is marked as deprecated and will be switched to the `/v2/events?plan-format=light` in the first 1.7.x release. The following deprecation schedule is planned for this endpoint:
+
+* 1.6.x - `/v2/events`  will continue to function as normal
+* 1.7.x - The default `/v2/events` format will be switched to "light". You will still have the ability to use the command-line argument `--deprecated_features=api_heavy_events` to re-enable the heavy event response.
+* 1.8.x - The `/v2/events` format will be permanently switched to "light". If `--deprecated_features=api_heavy_events` is still specified, Marathon will refuse to launch, with an error.
+
+#### Deprecation Details
+
+The "lightweight" plan format can be already seen using the `?plan-format=light` argument. In summary, this format drops the following fields from the deployment-related events in the event stream accessed via /v2/events:
+
+* `plan.original` - The current state of the root group
+* `plan.target` - The target state of the root group
+
+## Change from 1.6.322 to 1.6.352
+
+### GPU Scheduling
+
+This change introduces the Marathon command line flag `gpu_scheduling_behavior`
+to define how offered GPU resource should be treated.
+
+Valid values are
+- `undefined` indicating the old behaviour, ie apps and pods without GPU
+  requirement might launch on a node with GPU resources. A warning message
+  will be logged in such cases.
+- `restricted` indicating that resources on GPU containing nodes should only be
+  used for applications that require them.
+- `unrestricted` indicating that resources on GPU containing nodes can be used
+  whether or not applications require them.
+
+The default is `undefined`.
+
+### Fixed Issues
+
+- [MARATHON-8089](https://jira.mesosphere.com/browse/MARATHON-8089), [MARATHON-8088](https://jira.mesosphere.com/browse/MARATHON-8088) Provide `restricted` and `unrestricted` GPU scheduling behavior (#6052)
+- [MARAHTON-8112](https://jira.mesosphere.com/browse/MARATHON-8112) Open the persistence store before taking a backup using CLI (#6055)
+- [MARATHON-7751](https://jira.mesosphere.com/browse/MARATHON-7751) Do not overscale pods with persistent volumes (#6038)
+- Fixed a typo in the metrics conversion code where the `end` field of the `/metrics` endpoint was not properly populated (#6035)
+- [MARATHON-8063](https://jira.mesosphere.com/browse/MARATHON-8063) Enhance App API to reflect resources for executor (#5986)
+- Add deployment failure reason to event. (#6011)
+- [Vastly improved documentation](https://github.com/mesosphere/marathon/blob/master/docs/docs/unreachable.md) on Unreachable Strategy
+
+## Changes from 1.5.x to 1.6.322
+
+Recommended Mesos version is 1.5.0 or later.
+
+### New versioning strategy
+As of 1.6 version, Marathon switched to the new versioning strategy. We mostly follow [SemVer](https://semver.org/) but we needed to have a unique version number for every master build. For that reason, first 1.6 public release is 1.6.322. It does not mean there were 321 releases prior to this one that we did not share with the community, the number actually is number of commits on the master branch since the last minor release (so 1.5). As for all future releases, the fix version will be increasing but don't expect the numbers to be consequential.
+
+### New Behavior
+
+#### Performance improvements
+We have improved the overall performance of serialization in our API by 10x, leading to a substantial reduction in load for requests to `/v2/apps`, and `/v2/groups`. [#5973](https://github.com/mesosphere/marathon/pull/5973)
+
+#### Maintenance mode support
+Marathon has simple built-in support for [Mesos Maintenance Primitives](http://mesos.apache.org/documentation/latest/maintenance/). For more information please see our [docs](https://mesosphere.github.io/marathon/docs/maintenance-mode.html).
+
+#### Persistent volumes for pods
+It is now possible to run stateful applications inside pods. For more information, please see [docs](https://mesosphere.github.io/marathon/docs/maintenance-mode.html).
+
+#### And many more...
+
+* Enhance App API to reflect resources for executor [MARATHON-8063](https://jira.mesosphere.com/browse/MARATHON-8063)
+* Add deployment failure to the event (#6011)(https://github.com/mesosphere/marathon/pull/6011)
+* Support for IPv6 healthchecks [MARATHON-7807](https://jira.mesosphere.com/browse/MARATHON-7807)
+* IS constraint operator [#5587](https://github.com/mesosphere/marathon/pull/5587)
+
+### Fixed issues
+
+*  `portMappings` are exposed as `$PORT_NAME` variable [#5888](https://github.com/mesosphere/marathon/pull/5888)
+
+### Breaking changes
+
+#### SentryAppender
+
+The Sentry Raven log appender has been updated to version 8.0.x. Users that have enabled the Sentry Raven appender will need to update their configuration according to the [sentry migration guide](https://docs.sentry.io/clients/java/migration/).
+
+#### Scala 2.12
+
+Marathon 1.6.0 is compiled using Scala 2.12. This means that plugins which were compiled using Scala 2.11 will make Marathon fail during startup due to binary incompatibility between Scala 2.11 and 2.12.
+
+### Deprecations
+
+#### /v2/schema route is Deprecated
+
+The /v2/schema route, and JSON Schema definitions, are deprecated in favor of RAML. They will not be kept up-to-date. The endpoint will be disabled in Marathon 1.7.0 (can be re-enabled via an extended grace-period deprecation flag), and then completely removed in Marathon 1.8.0. The extended grace-deprecation flag will be documented in 1.7.0 and mentioned in the release notes. You can watch [MARATHON-7981](https://jira.mesosphere.com/browse/MARATHON-7981) for more details.
+
+#### Marathon Health Checks Deprecation Schedule Update
+
+[Marathon Health Checks](https://mesosphere.github.io/marathon/docs/health-checks.html#marathon-level-health-checks) will continue functioning, but are not actively supported. You should migrate to [Mesos Health checks](https://mesosphere.github.io/marathon/docs/health-checks.html#mesos-level-health-checks) as soon as possible.
+
+In Marathon 1.8.0, we will start logging warning each time an app/pod references a Marathon health check.
+
+In Marathon 1.9.0, if you upgrade and have app definitions with Marathon Health Checks, then Marathon will refuse to start. You will be able to temporarily re-enable them via an extended grace-period flag.
+
+Marathon Health Checks will be completely removed in Marathon 1.10.0, and Marathon will refuse to start if the extended grace-period deprecation flag is specified.
+
+## Changes from 1.5.1 to 1.5.2
+Bugfix release
+
+### Fixed issues
+- [MARATHON-7790](https://jira.mesosphere.com/browse/MARATHON-7790) Migrate UnreachableStrategy Saved in Instances
+- Change `Int.MaxValue` to 8 for maximum concurrency during migration (#5676) (#5701)
+- [MARATHON-7848](https://jira.mesosphere.com/browse/MARATHON-7848) Allow underscore for network names (#5687)
+- [MARATHON-7788](https://jira.mesosphere.com/browse/MARATHON-7788) Store a flag node in ZK to indicate that Marathon performs data migration (#5662)
+- [MARATHON-7852](https://jira.mesosphere.com/browse/MARATHON-7852) Switch to use Debian Slim base image (#5668)
+- Extend the set of command-line flags returned by /v2/info (#5612)
+- [MARATHON-7784](https://jira.mesosphere.com/browse/MARATHON-7784) Do not ignore exceptions when resolving apps and pods in GroupRepository (#5607)
+- Update Mesos version to 1.4.0 which is used for building packages and Docker images (#5606)
+- [MARATHON-7763](https://jira.mesosphere.com/browse/MARATHON-7763) Do sync before reading from or writing to ZooKeeper (#5566)
+- Fixes bug in which some Condition values were improperly read (#5555) (#5557)
+- Added an option to disable a plugin (#5524)
+
+### 1.5.1 New Behavior
+#### Migrating unreachableStrategy - running instances
+
+If you already migrated your apps and pods to the new default behavior for `UnreachableStrategy`, you also should consider to migrate the running instances as well.
+
+To change the `unreachableStrategy` of all running instances, set the environment variable `MIGRATION_1_4_6_UNREACHABLE_STRATEGY` to `true`, which leads to the following behavior during migration:
+
+When opting in to the unreachable migration step
+1) all instances that had a config of `UnreachableStrategy(300 seconds, 600 seconds)` (previous default) are migrated to have `UnreachableStrategy(0 seconds, 0 seconds)`
+2) all instances that had a config of `UnreachableStrategy(1 second, x seconds)` are migrated to have `UnreachableStrategy(0 seconds, x seconds)`
+3) all instances that had a config of `UnreachableStrategy(1 second, 2 seconds)` are migrated to have `UnreachableStrategy(0 seconds, 0 seconds)`
+
+**Note**: If you set this variable after upgrading to 1.4.9, it will have no effect.
+
+## Changes from 1.5.0 to 1.5.1
+Bugfix release
+
+### Fixed issues
+- [MARATHON-7576](https://jira.mesosphere.com/browse/MARATHON-7576) Changed default of UnreachableEnabled to (0,0)
+- [D907](https://phabricator.mesosphere.com/D907) TaskLauncherActor doesn't wait for in-flight tasks on stop
+- [MARATHON-7765](https://jira.mesosphere.com/browse/MARATHON-7765) Fixes issue in which /v2/info endpoint always returned 1.5.0-snapshot1, regardless of the actual endpoint.
+- [PR 5421](https://github.com/mesosphere/marathon/pull/5421) Added SchedulerPlugin to enable the ability to customize the rejection of offers. (see below)
+- [MARATHON-2520](https://jira.mesosphere.com/browse/MARATHON-2520) Improved logging around migration
+- [D1044](https://phabricator.mesosphere.com/D1044) EventStream implementation moved to Akka eventStream
+- [MARATHON-7545](https://jira.mesosphere.com/browse/MARATHON-7545) Initialize RunSpecTaskProcessor and RunSpecValidator at startup to early detect misconfiguration.
+- [D974](https://phabricator.mesosphere.com/D974) Plugin configuration or initialization issues are made more obvious, potentially causing Marathon to not launch.
+- [MARATHON-7707](https://jira.mesosphere.com/browse/MARATHON-7707)  Resident tasks now have an up-to-date agentInfo (agentId) when they are re-launched, rather than preserving the agentInfo as received during initial launch.
+- [MARATHON-7724](https://jira.mesosphere.com/browse/MARATHON-7724) Better socket error handling leader proxy.
+-  [MARATHON-7711](https://jira.mesosphere.com/browse/MARATHON-7711), [MARATHON-7338](https://jira.mesosphere.com/browse/MARATHON-7338) Under certain circumstances, resident tasks wouldn't relaunch when resources were available, and reservations wouldn't be freed. In order to address this, Marathon no longer suppresses offers from Mesos.
+- [PR 5432](https://github.com/mesosphere/marathon/pull/5432) App and pod validation errors for missing network name.
+- [MARATHON-1703](https://jira.mesosphere.com/browse/MARATHON-1703) Fixed issue in which constraints would not be properly evaluated when launching multiple resident tasks at a time.
+
+### 1.5.1 New Behavior
+
+#### mesosphere.marathon.plugin.scheduler.SchedulerPlugin
+
+This plugin allows to reject offers. Possible use-cases are:
+  * Maintenance. Mark agent as going to maintenance and reject new offers from it.
+  * Analytics. If task fails, for example, 5 times for 5 minutes, we can assume that it will fail again and reject new offers for it.
+  * Binding to agents. For example, agents can be marked as included into primary or secondary group. Task can be marked with group name.  Plugin can schedule task deployment to primary agents. If all primary agents are busy, task can be scheduled to secondary agents
+
+
+## Changes from 1.4.x to 1.5.0
+
+Recommended Mesos version is 1.3.0 or later. Upgrade to Marathon 1.5.x can be performed only from 1.4.x.
 
 ### Breaking Changes
 
@@ -76,7 +705,7 @@ Please move to the `/v2/events` endpoint instead.
 #### Deprecated command line parameters
 - The command line flag `save_tasks_to_launch_timeout` is deprecated and has no effect any longer.
 
-### New Features
+### Overview
 
 #### Networking Improvements Involving Multiple Container Networks
 
@@ -108,17 +737,48 @@ All validation specified in the RAML is now programatically enforced, leading to
 
 Marathon is in better compliance with various security best-practices. An example of this is that Marathon no longer responds to the directory listing request.
 
-### Fixed issues
-- [MARATHON-7320](https://jira.mesosphere.com/browse/MARATHON-7320) Fix MAX_PER constraint for attributes.
+#### File-based secrets
 
-### Overview
-
-#### File based secrets
 Marathon has a pluggable interface for secret store providers.
 Previous versions of Marathon allowed secrets to be passed as environment variables.
 With this version it is also possible to provide secrets as volumes, mounted under a specified path.
 See [file based secret documentation](http://mesosphere.github.io/marathon/docs/secrets.html)
 
+#### Changes around unreachableStrategy
+
+Recent changes in Apache Mesos introduced the ability to handle intermittent connectivity to an agent which may be running a Marathon task. This change introduced the `TASK_UNREACHABLE`. This allows for the ability for a node to disconnect and reconnect to the cluster without having a task replaced. This resulted in (based on default configurations) of a delay of 75 seconds before Marathon would be notified by Mesos to replace the task. The previous behavior of Marathon was usually sub-second replacement of a lost task.
+
+It is now possible to configure `unreachableStrategy` for apps and pods to instantly replace unreachable apps or pods. To enable this behavior, you need to configure your app or pod as shown below:
+
+```
+{
+  ...
+  "unreachableStrategy": {
+    "inactiveAfterSeconds": 0,
+    "expungeAfterSeconds": 0
+  },
+  ...
+}
+```
+
+**Note**: Instantly means as soon as marathon becomes aware of the unreachable task. By default, Marathon is notified after 75 seconds by Mesos
+  that an agent is disconnected. You can change this duration in Mesos by configuring `agent_ping_timeout` and `max_agent_ping_timeouts`.
+
+#### Migrating unreachableStrategy
+
+If you want all of your apps and pods to adopt a `UnreachableStrategy` that retains the previous behavior where instance were immediately replaced so that you does not have to update every single app definition.
+
+To change the `unreachableStrategy` of all apps and pods, set the environment variable `MIGRATION_1_4_6_UNREACHABLE_STRATEGY` to `true`, which leads to the following behavior during migration:
+
+When opting in to the unreachable migration step
+1) all app and pod definitions that had a config of `UnreachableStrategy(300 seconds, 600 seconds)` (previous default) are migrated to have `UnreachableStrategy(0 seconds, 0 seconds)`
+2) all app and pod definitions that had a config of `UnreachableStrategy(1 second, x seconds)` are migrated to have `UnreachableStrategy(0 seconds, x seconds)`
+3) all app and pod definitions that had a config of `UnreachableStrategy(1 second, 2 seconds)` are migrated to have `UnreachableStrategy(0 seconds, 0 seconds)`
+
+**Note**: If you set this variable after upgrading to 1.4.6, it will have no effect. Also, the `UnreachableStrategy` default has not been changed, so in order for apps and pods created in the future to have the replace-instantly behavior, `unreachableStrategy`'s `inactiveAfterSeconds` and `expungeAfterSeconds` must be set to 0 as seen in the JSON above.
+
+### Fixed issues
+- [MARATHON-7320](https://jira.mesosphere.com/browse/MARATHON-7320) Fix MAX_PER constraint for attributes.
 
 ## Changes from 1.4.1 to 1.4.2
 Bugfix release
@@ -163,7 +823,7 @@ Bugfix release
 
 ## Changes from 1.3.10 to 1.4.0
 
-### Recommended Mesos version is 1.1.0
+Recommended Mesos version is 1.1.0 or later.
 
 ### Breaking Changes
 

@@ -1,7 +1,7 @@
 package mesosphere.marathon
 package core.event
 
-import org.rogach.scallop.{ ScallopConf, ScallopOption }
+import org.rogach.scallop.{ScallopConf, ScallopOption}
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -13,6 +13,5 @@ trait EventConf extends ScallopConf {
     noshort = true,
     default = Some(1024)
   )
-
   def zkTimeoutDuration: FiniteDuration
 }

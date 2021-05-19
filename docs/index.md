@@ -8,18 +8,19 @@ title: A container orchestration platform for Mesos and DC/OS
     A container orchestration platform for Mesos and DC/OS
   </p>
   <p>
-    <a href="http://downloads.mesosphere.com/marathon/v1.3.6/marathon-1.3.6.tgz"
+
+    <a href="https://downloads.mesosphere.io/marathon/builds/1.8.222-86475ddac/marathon-1.8.222-86475ddac.tgz"
         class="btn btn-lg btn-primary">
-      Download Marathon v1.3.6
+      Download Marathon v1.8.222
     </a>
   </p>
   <a class="btn btn-link"
-      href="http://downloads.mesosphere.com/marathon/v1.3.6/marathon-1.3.6.tgz.sha256">
-    v1.3.6 SHA-256 Checksum
+      href="https://downloads.mesosphere.io/marathon/builds/1.8.222-86475ddac/marathon-1.8.222-86475ddac.tgz.sha1">
+    v1.8.222 SHA Checksum
   </a> &middot;
   <a class="btn btn-link"
-      href="https://github.com/mesosphere/marathon/releases/tag/v1.3.6">
-    v1.3.6 Release Notes
+      href="https://github.com/mesosphere/marathon/releases/tag/v1.8.222">
+    v1.8.222 Release Notes
   </a>
 </div>
 
@@ -33,16 +34,17 @@ Marathon is a production-grade container orchestration platform for Mesosphere's
 - Multiple container runtimes. Marathon has first-class support for both [Mesos containers](https://mesosphere.github.io/marathon/docs/application-basics.html) (using cgroups) and [Docker](https://mesosphere.github.io/marathon/docs/native-docker.html).
 - [Stateful apps](https://mesosphere.github.io/marathon/docs/persistent-volumes.html). Marathon can bind persistent storage volumes to your application. You can run databases like MySQL and Postgres, and have storage accounted for by Mesos.
 - [Beautiful and powerful UI](https://mesosphere.github.io/marathon/docs/marathon-ui.html).
-- [Constraints](https://mesosphere.github.io/marathon/docs/constraints.html). e.g. Only one instance of an application per rack, node, etc.
+- [Constraints](https://mesosphere.github.io/marathon/docs/constraints.html). These allow to e.g. place only one instance of an application per rack, node, etc.
 - [Service Discovery & Load Balancing](https://mesosphere.github.io/marathon/docs/service-discovery-load-balancing.html). Several methods available.
 - [Health Checks](https://mesosphere.github.io/marathon/docs/health-checks.html). Evaluate your application's health using HTTP or TCP checks.
-- [Event Subscription](https://mesosphere.github.io/marathon/docs/rest-api.html#event-subscriptions). Supply an HTTP endpoint to receive notifications - for example to integrate with an external load balancer.
-- [Metrics](https://mesosphere.github.io/marathon/docs/metrics.html). Query them at /metrics in JSON format or push them to systems like graphite, statsd and Datadog.
-- [Complete REST API](https://mesosphere.github.io/marathon/docs/rest-api.html) for easy integration and scriptability.
+- [Event Subscription](https://mesosphere.github.io/marathon/docs/event-bus.html#subscription-to-events-via-the-event-stream). Supply an HTTP endpoint to receive notifications - for example to integrate with an external load balancer.
+- [Metrics](https://mesosphere.github.io/marathon/docs/metrics.html). Query them at `/metrics` in JSON format, push them to systems like Graphite, StatsD and DataDog, or scrape them using Prometheus.
+- [Deprecated Metrics](https://mesosphere.github.io/marathon/docs/deprecated-metrics.html). Query them at `/metrics` in JSON format, or push them to systems like Graphite, StatsD and DataDog.
+- [Complete REST API](https://mesosphere.github.io/marathon/api-console/index.html) for easy integration and scriptability.
 
 ## DC/OS features
 
-Running on DC/OS, Marathon gains the following additional features:
+Running on [DC/OS](https://dcos.io/), Marathon gains the following additional features:
 
 - Virtual IP routing. Allocate a dedicated, virtual address to your app. Your app is now reachable anywhere in the cluster, wherever it might be scheduled. Load balancing and rerouting around failures are done automatically.
 - Authorization (DC/OS Enterprise Edition only). True multitenancy with each user or group having access to their own applications and groups.
@@ -57,7 +59,7 @@ Marathon is the first framework to be launched, running directly alongside Mesos
 
 Marathon is a powerful way to run other Mesos frameworks: in this case, [Chronos](https://github.com/mesos/chronos). Marathon launches two instances of the Chronos scheduler using the Docker image `mesosphere/chronos`. The Chronos instances appear in orange on the top row.
 
-If either of the two Chronos containers fails for any reason, then Marathon will restart them on another slave. This approach ensures that two Chronos processes are always running.
+If either of the two Chronos containers fails for any reason, then Marathon will restart them on another agent. This approach ensures that two Chronos processes are always running.
 
 Since Chronos itself is a framework and receives resource offers, it can start tasks on Mesos.
 In the use case below, Chronos is running two scheduled jobs, shown in blue. One dumps a production MySQL database to S3, while another sends an email newsletter to all customers via Rake.

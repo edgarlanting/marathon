@@ -2,12 +2,13 @@ package mesosphere.marathon
 package state
 
 import mesosphere.UnitTest
+import mesosphere.marathon.raml.{Raml, TaskConversion}
 import mesosphere.mesos.protos.Implicits.slaveIDToProto
 import mesosphere.mesos.protos.SlaveID
 import play.api.libs.json.Json
 
 class TaskFailureTest extends UnitTest {
-  import TaskFailureTestHelper.taskFailure
+  import TaskFailureTestHelper.{taskFailure, taskFailureId}
 
   "TaskFailure" should {
     "ToProto" in {
@@ -55,17 +56,15 @@ class TaskFailureTest extends UnitTest {
     }
 
     "Json serialization" in {
-      import mesosphere.marathon.api.v2.json.Formats._
-
-      val json = Json.toJson(taskFailure.copy(slaveId = Some(slaveIDToProto(SlaveID("slave id")))))
-      val expectedJson = Json.parse(
-        """
+      val json =
+        Json.toJson(Raml.toRaml(taskFailure.copy(slaveId = Some(slaveIDToProto(SlaveID("slave id")))))(TaskConversion.taskFailureRamlWrite))
+      val expectedJson = Json.parse(s"""
         |{
         |  "appId":"/group/app",
         |  "host":"slave5.mega.co",
         |  "message":"Process exited with status [1]",
         |  "state":"TASK_FAILED",
-        |  "taskId":"group_app-12345",
+        |  "taskId":"$taskFailureId",
         |  "timestamp":"1970-01-01T00:00:02.000Z",
         |  "version":"1970-01-01T00:00:01.000Z",
         |  "slaveId":"slave id"

@@ -8,18 +8,21 @@ import mesosphere.marathon.core.event._
 import mesosphere.marathon.core.launcher.OfferProcessor
 import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.core.task.update.TaskStatusUpdateProcessor
-import mesosphere.marathon.storage.repository.{ AppRepository, FrameworkIdRepository }
-import mesosphere.marathon.test.MarathonTestHelper
-import mesosphere.util.state.{ FrameworkId, MutableMesosLeaderInfo }
+import mesosphere.marathon.state.Region
+import mesosphere.marathon.storage.repository.{AppRepository, FrameworkIdRepository}
+import mesosphere.marathon.test.{MarathonTestHelper, TestCrashStrategy}
+import mesosphere.mesos.LibMesos
+import mesosphere.util.state.{FrameworkId, MutableMesosLeaderInfo}
+import org.apache.mesos.Protos.DomainInfo.FaultDomain
+import org.apache.mesos.Protos.DomainInfo.FaultDomain.{RegionInfo, ZoneInfo}
 import org.apache.mesos.Protos._
 import org.apache.mesos.SchedulerDriver
+import org.mockito.ArgumentCaptor
 
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 
 class MarathonSchedulerTest extends AkkaUnitTest {
   class Fixture {
-    var suicideCalled: Option[Boolean] = None
-
     val repo: AppRepository = mock[AppRepository]
     val queue: LaunchQueue = mock[LaunchQueue]
     val frameworkIdRepository: FrameworkIdRepository = mock[FrameworkIdRepository]
@@ -30,17 +33,17 @@ class MarathonSchedulerTest extends AkkaUnitTest {
     val eventBus: EventStream = system.eventStream
     val taskStatusProcessor: TaskStatusUpdateProcessor = mock[TaskStatusUpdateProcessor]
     val offerProcessor: OfferProcessor = mock[OfferProcessor]
+    val crashStrategy = new TestCrashStrategy
     val marathonScheduler: MarathonScheduler = new MarathonScheduler(
       eventBus,
       offerProcessor = offerProcessor,
       taskStatusProcessor = taskStatusProcessor,
       frameworkIdRepository,
       mesosLeaderInfo,
-      config) {
-      override protected def suicide(removeFrameworkId: Boolean): Unit = {
-        suicideCalled = Some(removeFrameworkId)
-      }
-    }
+      config,
+      crashStrategy,
+      Promise[FrameworkID]
+    ) {}
   }
 
   "MarathonScheduler" should {
@@ -50,7 +53,9 @@ class MarathonSchedulerTest extends AkkaUnitTest {
         .setValue("some_id")
         .build()
 
-      val masterInfo = MasterInfo.newBuilder()
+      val masterInfo = MasterInfo
+        .newBuilder()
+        .setVersion(LibMesos.MesosMasterMinimumVersion.toString)
         .setId("")
         .setIp(0)
         .setPort(5050)
@@ -79,7 +84,9 @@ class MarathonSchedulerTest extends AkkaUnitTest {
 
     "Publishes event when reregistered" in new Fixture {
       val driver = mock[SchedulerDriver]
-      val masterInfo = MasterInfo.newBuilder()
+      val masterInfo = MasterInfo
+        .newBuilder()
+        .setVersion(LibMesos.MesosMasterMinimumVersion.toString)
         .setId("")
         .setIp(0)
         .setPort(5050)
@@ -131,9 +138,8 @@ class MarathonSchedulerTest extends AkkaUnitTest {
       When("An error is reported")
       marathonScheduler.error(driver, "some weird mesos message")
 
-      Then("Suicide is called without removing the framework id")
-      suicideCalled should be(defined)
-      suicideCalled.get should be (false)
+      Then("Marathon crashes")
+      crashStrategy.crashed shouldBe true
     }
 
     "Suicide with a framework error will remove the framework id" in new Fixture {
@@ -143,10 +149,124 @@ class MarathonSchedulerTest extends AkkaUnitTest {
       When("An error is reported")
       marathonScheduler.error(driver, "Framework has been removed")
 
-      Then("Suicide is called with removing the framework id")
-      suicideCalled should be(defined)
-      suicideCalled.get should be (true)
+      Then("Marathon crashes")
+      crashStrategy.crashed shouldBe true
+    }
+
+    "Restrict status update message length" in new Fixture {
+      Given(s"A status update larger than ${MarathonScheduler.MAX_STATUS_MESSAGE_LENGTH} characters")
+      val driver = mock[SchedulerDriver]
+      val message = "X" * (MarathonScheduler.MAX_STATUS_MESSAGE_LENGTH + 100)
+
+      val status = TaskStatus
+        .newBuilder()
+        .setTaskId(TaskID.newBuilder().setValue("taskId"))
+        .setState(TaskState.TASK_FAILED)
+        .setMessage(message)
+        .build()
+
+      val captor = ArgumentCaptor.forClass(classOf[TaskStatus])
+
+      taskStatusProcessor.publish(captor.capture()) returns Future.successful(())
+
+      When("The TaskStatus is delivered")
+      marathonScheduler.statusUpdate(driver, status)
+
+      Then("The forwarded status should have a restricted message size")
+      captor.getValue.getMessage should have length (MarathonScheduler.MAX_STATUS_MESSAGE_LENGTH)
+    }
+
+    "Not restrict status update message length if it's under the limit" in new Fixture {
+      Given(s"A status update smaller than ${MarathonScheduler.MAX_STATUS_MESSAGE_LENGTH} characters")
+      val driver = mock[SchedulerDriver]
+      val message = "X" * 200
+
+      val status = TaskStatus
+        .newBuilder()
+        .setTaskId(TaskID.newBuilder().setValue("taskId"))
+        .setState(TaskState.TASK_FAILED)
+        .setMessage(message)
+        .build()
+
+      val captor = ArgumentCaptor.forClass(classOf[TaskStatus])
+
+      taskStatusProcessor.publish(captor.capture()) returns Future.successful(())
+
+      When("The TaskStatus is delivered")
+      marathonScheduler.statusUpdate(driver, status)
+
+      Then("The forwarded status should have the original message size")
+      captor.getValue.getMessage should have length (message.length)
+    }
+
+    "Store default region when registered" in new Fixture {
+      val driver = mock[SchedulerDriver]
+      val frameworkId = FrameworkID.newBuilder
+        .setValue("some_id")
+        .build()
+
+      val regionName = "some_region"
+      val zoneName = "some_zone"
+
+      val masterInfo = MasterInfo
+        .newBuilder()
+        .setVersion(LibMesos.MesosMasterMinimumVersion.toString)
+        .setId("")
+        .setIp(0)
+        .setPort(5050)
+        .setHostname("some_host")
+        .setDomain(
+          DomainInfo
+            .newBuilder()
+            .setFaultDomain(
+              FaultDomain
+                .newBuilder()
+                .setRegion(RegionInfo.newBuilder().setName(regionName).build())
+                .setZone(ZoneInfo.newBuilder().setName(zoneName).build())
+                .build()
+            )
+            .build()
+        )
+        .build()
+
+      frameworkIdRepository.store(any) returns Future.successful(Done)
+
+      marathonScheduler.registered(driver, frameworkId, masterInfo)
+
+      marathonScheduler.getLocalRegion shouldEqual Some(Region(regionName))
+    }
+
+    "Store default region when reregistered" in new Fixture {
+      val driver = mock[SchedulerDriver]
+
+      val regionName = "some_region"
+      val zoneName = "some_zone"
+
+      val masterInfo = MasterInfo
+        .newBuilder()
+        .setVersion(LibMesos.MesosMasterMinimumVersion.toString)
+        .setId("")
+        .setIp(0)
+        .setPort(5050)
+        .setHostname("some_host")
+        .setDomain(
+          DomainInfo
+            .newBuilder()
+            .setFaultDomain(
+              FaultDomain
+                .newBuilder()
+                .setRegion(RegionInfo.newBuilder().setName(regionName).build())
+                .setZone(ZoneInfo.newBuilder().setName(zoneName).build())
+                .build()
+            )
+            .build()
+        )
+        .build()
+
+      marathonScheduler.reregistered(driver, masterInfo)
+
+      marathonScheduler.getLocalRegion shouldEqual Some(Region(regionName))
+
     }
   }
 }
-

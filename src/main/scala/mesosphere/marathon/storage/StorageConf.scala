@@ -28,6 +28,24 @@ trait StorageConf extends ZookeeperConf with BackupConf {
     default = Some(50)
   )
 
+  lazy val storageCompactionInterval = opt[Int](
+    "storage_compaction_interval",
+    descr = "ZK storage compaction interval in seconds",
+    default = Some(30)
+  )
+
+  lazy val storageCompactionScanBatchSize = opt[Int](
+    "storage_compaction_scan_batch_size",
+    descr = "Size of the storage compaction scan batches.",
+    default = Some(32)
+  )
+
+  lazy val groupVersionsCacheSize = opt[Int](
+    "group_versions_cache_size",
+    descr = "Size of the groups repository versions cache.",
+    default = Some(1000)
+  )
+
   lazy val zkMaxConcurrency = opt[Int](
     "zk_max_concurrency",
     default = Some(32),
@@ -42,6 +60,13 @@ trait StorageConf extends ZookeeperConf with BackupConf {
     hidden = true,
     descrYes = "(Default) Enable an additional layer of caching for object versions when store_cache is enabled.",
     prefix = "disable_"
+  )
+
+  lazy val storageExecutionContextSize = opt[Int](
+    "storage_execution_context_size",
+    default = Some(Runtime.getRuntime().availableProcessors()),
+    hidden = true,
+    descr = "INTERNAL TUNING PARAMETER: Storage module's execution context thread pool size"
   )
 
   def defaultNetworkName: ScallopOption[String]

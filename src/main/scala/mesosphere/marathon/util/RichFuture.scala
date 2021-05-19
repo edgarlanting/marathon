@@ -1,12 +1,13 @@
 package mesosphere.marathon
 package util
 
-import mesosphere.util.CallerThreadExecutionContext
+import com.mesosphere.usi.async.ExecutionContexts
 
-import scala.concurrent.{ Future, Promise }
+import scala.concurrent.{Future, Promise}
 import scala.util.Try
 
 class RichFuture[T](val future: Future[T]) extends AnyVal {
+
   /**
     * Change this Future from T to Try[T] (never failing).
     * This is particularly useful for async/await
@@ -14,9 +15,9 @@ class RichFuture[T](val future: Future[T]) extends AnyVal {
     */
   def asTry: Future[Try[T]] = {
     val promise = Promise[Try[T]]()
-    future.onComplete {
-      x: Try[T] => promise.success(x)
-    }(CallerThreadExecutionContext.callerThreadExecutionContext)
+    future.onComplete { x: Try[T] =>
+      promise.success(x)
+    }(ExecutionContexts.callerThread)
     promise.future
   }
 }

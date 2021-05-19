@@ -1,11 +1,11 @@
 package mesosphere.marathon
 package metrics
 
-import com.google.inject.matcher.{ AbstractMatcher, Matchers }
-import com.google.inject.{ AbstractModule, Guice }
+import com.google.inject.matcher.{AbstractMatcher, Matchers}
+import com.google.inject.AbstractModule
 import mesosphere.UnitTest
-import mesosphere.marathon.core.task.tracker.InstanceTracker
-import org.aopalliance.intercept.{ MethodInterceptor, MethodInvocation }
+import mesosphere.marathon.metrics.current.{DropwizardMetrics, UnitOfMeasurement}
+import org.aopalliance.intercept.{MethodInterceptor, MethodInvocation}
 
 class FooBar {
   def dummy(): Unit = {}
@@ -29,27 +29,37 @@ class MetricsTest extends UnitTest {
     }
   }
 
-  "Metrics" should {
-    "Metrics#className should strip 'EnhancerByGuice' from the metric names" in {
-      val instance = Guice.createInjector(new TestModule).getInstance(classOf[FooBar])
-      assert(instance.getClass.getName.contains("EnhancerByGuice"))
-
-      assert(metrics.className(instance.getClass) == "mesosphere.marathon.metrics.FooBar")
+  "DropwizardMetrics.constructName" should {
+    "not append a unit of measurement suffix, when none is given" in {
+      val name =
+        DropwizardMetrics.constructName("marathon", "metric", "counter", UnitOfMeasurement.None)
+      name shouldBe "marathon.metric.counter"
     }
 
-    "Metrics#name should replace $ with ." in {
-      val instance = new Serializable {}
-      assert(instance.getClass.getName.contains('$'))
-
-      assert(metrics.name(ServiceMetric, instance.getClass, "test$method") ==
-        s"${ServiceMetric.name}.mesosphere.marathon.metrics.MetricsTest.anonfun.1.anonfun.apply.mcV.sp.2.anon.1.test.method")
+    "append the memory unit of measurement suffix, when it is given" in {
+      val name =
+        DropwizardMetrics.constructName("marathon", "metric", "counter", UnitOfMeasurement.Memory)
+      name shouldBe "marathon.metric.counter.bytes"
     }
 
-    "Metrics#name should use a dot to separate the class name and the method name" in {
-      val expectedName = "service.mesosphere.marathon.core.task.tracker.InstanceTracker.write-request-time"
-      val actualName = metrics.name(ServiceMetric, classOf[InstanceTracker], "write-request-time")
-
-      assert(expectedName.equals(actualName))
+    "append the time unit of measurement suffix, when it is given" in {
+      val name =
+        DropwizardMetrics.constructName("marathon", "metric", "counter", UnitOfMeasurement.Time)
+      name shouldBe "marathon.metric.counter.seconds"
     }
+
+    "throw an exception if metric name components contain a disallowed character" in {
+      assertThrows[IllegalArgumentException] {
+        DropwizardMetrics.constructName("marathon#", "metric", "counter", UnitOfMeasurement.None)
+      }
+      assertThrows[IllegalArgumentException] {
+        DropwizardMetrics.constructName("marathon", "metric$", "counter", UnitOfMeasurement.None)
+      }
+      assertThrows[IllegalArgumentException] {
+        DropwizardMetrics.constructName("marathon", "metric", "counter%", UnitOfMeasurement.None)
+      }
+    }
+
   }
+
 }

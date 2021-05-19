@@ -19,21 +19,23 @@ object RunSpecValidator {
       override def apply(seq: Iterable[T]): Result = {
 
         val violations = seq.view.map(item => (item, validator(item))).zipWithIndex.collect {
-          case ((item, f: Failure), pos: Int) => GroupViolation(item, "not valid", Some(s"($pos)"), f.violations)
+          case ((item, f: Failure), pos: Int) =>
+            GroupViolation(item, "not valid", f.violations, Descriptions.Path(Descriptions.Indexed(pos.toLong)))
         }
 
         if (violations.isEmpty) Success
-        else Failure(Set(GroupViolation(seq, "Seq contains elements, which are not valid.", None, violations.toSet)))
+        else Failure(Set(GroupViolation(seq, "Seq contains elements, which are not valid.", violations.toSet)))
       }
     }
   }
 
-  def isTrue[T](constraint: T => String)(test: T => Boolean): Validator[T] = new Validator[T] {
-    // TODO(jdef) copied this func from marathon api/Validation.scala; would be nice to extract that
-    // into a shared validations subproject.
-    import ViolationBuilder._
-    override def apply(value: T): Result = {
-      if (test(value)) Success else RuleViolation(value, constraint(value), None)
+  def isTrue[T](constraint: T => String)(test: T => Boolean): Validator[T] =
+    new Validator[T] {
+      // TODO(jdef) copied this func from marathon api/Validation.scala; would be nice to extract that
+      // into a shared validations subproject.
+      import ViolationBuilder._
+      override def apply(value: T): Result = {
+        if (test(value)) Success else RuleViolation(value, constraint(value))
+      }
     }
-  }
 }

@@ -6,21 +6,22 @@ import java.time.OffsetDateTime
 import akka.http.scaladsl.marshalling.Marshaller
 import akka.http.scaladsl.unmarshalling.Unmarshaller
 import akka.stream.Materializer
-import akka.stream.scaladsl.{ Source, Sink => ScalaSink }
-import akka.{ Done, NotUsed }
+import akka.stream.scaladsl.{Source, Sink}
+import akka.{Done, NotUsed}
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon.Protos.StorageVersion
 import mesosphere.marathon.core.storage.backup.BackupItem
 import mesosphere.marathon.core.storage.store.impl.BasePersistenceStore
-import mesosphere.marathon.core.storage.store.{ IdResolver, PersistenceStore }
+import mesosphere.marathon.core.storage.store.{IdResolver, PersistenceStore}
+import mesosphere.marathon.metrics.{Counter, Metrics}
 import mesosphere.marathon.storage.VersionCacheConfig
-import mesosphere.marathon.stream.Sink
+import mesosphere.marathon.stream.EnrichedSink
 import mesosphere.marathon.util.KeyedLock
 
-import scala.async.Async.{ async, await }
+import scala.async.Async.{async, await}
 import scala.collection.concurrent.TrieMap
 import scala.collection.immutable.Set
-import scala.concurrent.{ ExecutionContext, Future }
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
 
 /**
@@ -32,29 +33,38 @@ import scala.util.Random
   * @tparam K The persistence store's primary key type
   * @tparam Serialized The serialized format for the persistence store.
   */
-case class LazyCachingPersistenceStore[K, Category, Serialized](
-    store: BasePersistenceStore[K, Category, Serialized])(implicit
-  mat: Materializer,
-    ctx: ExecutionContext) extends PersistenceStore[K, Category, Serialized] with StrictLogging {
+case class LazyCachingPersistenceStore[K, Category, Serialized](metrics: Metrics, store: BasePersistenceStore[K, Category, Serialized])(
+    implicit
+    mat: Materializer,
+    ctx: ExecutionContext
+) extends PersistenceStore[K, Category, Serialized]
+    with StrictLogging {
 
   private val lock = KeyedLock[String]("LazyCachingStore", Int.MaxValue)
   private[store] val idCache = TrieMap.empty[Category, Set[Any]]
   private[store] val valueCache = TrieMap.empty[K, Option[Any]]
+  private[this] val getHitCounters = TrieMap.empty[Category, Counter]
+  private[this] val idsHitCounters = TrieMap.empty[Category, Counter]
+
+  override def markOpen(): Unit = store.markOpen()
+  override def markClosed(): Unit = store.markClosed()
+  override def isOpen: Boolean = store.isOpen
 
   override def storageVersion(): Future[Option[StorageVersion]] = store.storageVersion()
 
   override def setStorageVersion(storageVersion: StorageVersion): Future[Done] =
     store.setStorageVersion(storageVersion)
 
-  @SuppressWarnings(Array("all")) // async/await
   override def ids[Id, V]()(implicit ir: IdResolver[Id, V, Category, K]): Source[Id, NotUsed] = {
     val category = ir.category
     val idsFuture = lock(category.toString) {
       if (idCache.contains(category)) {
+        // TODO - remove special name when MARATHON-7618 is addressed
+        idsHitCounters.getOrElseUpdate(ir.category, metrics.counter(s"debug.persistence.cache.ids.${ir.category}.hit")).increment()
         Future.successful(idCache(category).asInstanceOf[Set[Id]])
       } else {
         async {
-          val children = await(store.ids.runWith(Sink.set[Any])) // linter:ignore UndesirableTypeInference
+          val children = await(store.ids.runWith(EnrichedSink.set[Any])) // linter:ignore UndesirableTypeInference
           idCache(category) = children
           children
         }
@@ -63,10 +73,7 @@ case class LazyCachingPersistenceStore[K, Category, Serialized](
     Source.fromFuture(idsFuture).mapConcat(_.asInstanceOf[Set[Id]])
   }
 
-  @SuppressWarnings(Array("all")) // async/await
-  private def deleteCurrentOrAll[Id, V](
-    k: Id,
-    delete: () => Future[Done])(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] = {
+  private def deleteCurrentOrAll[Id, V](k: Id, delete: () => Future[Done])(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] = {
     val category = ir.category
     val storageId = ir.toStorageId(k, None)
     lock(category.toString) {
@@ -95,15 +102,14 @@ case class LazyCachingPersistenceStore[K, Category, Serialized](
     deleteCurrentOrAll(k, () => store.deleteAll(k))
   }
 
-  @SuppressWarnings(Array("all")) // async/await
-  override def get[Id, V](id: Id)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]] = {
+  override def get[Id, V](id: Id)(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Future[Option[V]] = {
     val storageId = ir.toStorageId(id, None)
     lock(storageId.toString) {
       val cached = valueCache.get(storageId) // linter:ignore OptionOfOption
       cached match {
         case Some(v: Option[V] @unchecked) =>
+          // TODO - remove special name when MARATHON-7618 is addressed
+          getHitCounters.getOrElseUpdate(ir.category, metrics.counter(s"debug.persistence.cache.get.${ir.category}.hit")).increment()
           Future.successful(v)
         case _ =>
           async { // linter:ignore UnnecessaryElseBranch
@@ -116,19 +122,17 @@ case class LazyCachingPersistenceStore[K, Category, Serialized](
   }
 
   override def get[Id, V](id: Id, version: OffsetDateTime)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]] =
+      ir: IdResolver[Id, V, Category, K],
+      um: Unmarshaller[Serialized, V]
+  ): Future[Option[V]] =
     store.get(id, version)
 
-  override def getVersions[Id, V](list: Seq[(Id, OffsetDateTime)])(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Source[V, NotUsed] =
+  override def getVersions[Id, V](
+      list: Seq[(Id, OffsetDateTime)]
+  )(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Source[V, NotUsed] =
     store.getVersions(list)
 
-  @SuppressWarnings(Array("all")) // async/await
-  override def store[Id, V](id: Id, v: V)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done] = {
+  override def store[Id, V](id: Id, v: V)(implicit ir: IdResolver[Id, V, Category, K], m: Marshaller[V, Serialized]): Future[Done] = {
     val category = ir.category
     val storageId = ir.toStorageId(id, None)
     lock(category.toString) {
@@ -144,12 +148,11 @@ case class LazyCachingPersistenceStore[K, Category, Serialized](
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
   override def store[Id, V](id: Id, v: V, version: OffsetDateTime)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done] = {
+      ir: IdResolver[Id, V, Category, K],
+      m: Marshaller[V, Serialized]
+  ): Future[Done] = {
     val category = ir.category
-    val storageId = ir.toStorageId(id, None)
     lock(category.toString) {
       async {
         await(store.store(id, v, version))
@@ -163,32 +166,48 @@ case class LazyCachingPersistenceStore[K, Category, Serialized](
   override def versions[Id, V](id: Id)(implicit ir: IdResolver[Id, V, Category, K]): Source[OffsetDateTime, NotUsed] =
     store.versions(id)
 
-  override def deleteVersion[Id, V](
-    k: Id,
-    version: OffsetDateTime)(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] =
+  override def deleteVersion[Id, V](k: Id, version: OffsetDateTime)(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] =
     store.deleteVersion(k, version)
 
   override def backup(): Source[BackupItem, NotUsed] = store.backup()
 
-  override def restore(): ScalaSink[BackupItem, Future[Done]] = store.restore()
+  override def restore(): Sink[BackupItem, Future[Done]] = store.restore()
+
+  override def sync(): Future[Done] = store.sync()
+
+  override def startMigration(): Future[Done] = store.startMigration()
+
+  override def endMigration(): Future[Done] = {
+    // Clear caches after a migration, some migrations might act on the store directly
+    valueCache.clear()
+    idCache.clear()
+    store.endMigration()
+  }
 
   override def toString: String = s"LazyCachingPersistenceStore($store)"
 }
 
 case class LazyVersionCachingPersistentStore[K, Category, Serialized](
+    metrics: Metrics,
     store: PersistenceStore[K, Category, Serialized],
-    config: VersionCacheConfig = VersionCacheConfig.Default)(implicit
-  mat: Materializer,
-    ctx: ExecutionContext) extends PersistenceStore[K, Category, Serialized] with StrictLogging {
+    config: VersionCacheConfig = VersionCacheConfig.Default
+)(implicit mat: Materializer, ctx: ExecutionContext)
+    extends PersistenceStore[K, Category, Serialized]
+    with StrictLogging {
+
+  override def markOpen(): Unit = store.markOpen()
+  override def markClosed(): Unit = store.markClosed()
+  override def isOpen: Boolean = store.isOpen
 
   private[store] val versionCache = TrieMap.empty[(Category, K), Set[OffsetDateTime]]
   private[store] val versionedValueCache = TrieMap.empty[(K, OffsetDateTime), Option[Any]]
+  private[this] val hitCounters = TrieMap.empty[Category, Counter]
 
   private[cache] def maybePurgeCachedVersions(
-    maxEntries: Int = config.maxEntries,
-    purgeCount: Int = config.purgeCount,
-    pRemove: Double = config.pRemove): Unit =
-
+      maxEntries: Int = config.maxEntries,
+      purgeCount: Int = config.purgeCount,
+      pRemove: Double = config.pRemove
+  ): Unit =
     while (versionedValueCache.size > maxEntries) {
       // randomly GC the versions
       var counter = 0
@@ -198,10 +217,9 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
       }
     }
 
-  private[this] def updateCachedVersions[Id, V](
-    id: Id,
-    version: OffsetDateTime,
-    v: Option[V])(implicit ir: IdResolver[Id, V, Category, K]): Unit = {
+  private[this] def updateCachedVersions[Id, V](id: Id, version: OffsetDateTime, v: Option[V])(implicit
+      ir: IdResolver[Id, V, Category, K]
+  ): Unit = {
 
     val category = ir.category
     val unversionedId = ir.toStorageId(id, None)
@@ -214,9 +232,7 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
-  private def deleteCurrentOrAll[Id, V](
-    id: Id, delete: () => Future[Done])(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] = {
+  private def deleteCurrentOrAll[Id, V](id: Id, delete: () => Future[Done])(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] = {
 
     if (!ir.hasVersions) {
       delete()
@@ -233,10 +249,7 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
-  override def get[Id, V](id: Id)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]] = {
+  override def get[Id, V](id: Id)(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Future[Option[V]] = {
 
     if (!ir.hasVersions) {
       store.get(id)
@@ -252,15 +265,17 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
   override def get[Id, V](id: Id, version: OffsetDateTime)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Future[Option[V]] = {
+      ir: IdResolver[Id, V, Category, K],
+      um: Unmarshaller[Serialized, V]
+  ): Future[Option[V]] = {
 
     val storageId = ir.toStorageId(id, None)
     val cached = versionedValueCache.get((storageId, version)) // linter:ignore OptionOfOption
     cached match {
       case Some(v: Option[V] @unchecked) =>
+        // TODO - remove special name when MARATHON-7618 is addressed
+        hitCounters.getOrElseUpdate(ir.category, metrics.counter(s"debug.persistence.cache.get.${ir.category}.hit")).increment()
         Future.successful(v)
       case _ =>
         async {
@@ -274,15 +289,12 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
   /**
     * TODO: no caching here yet, intended only for migration (for now)
     */
-  override def getVersions[Id, V](list: Seq[(Id, OffsetDateTime)])(implicit
-    ir: IdResolver[Id, V, Category, K],
-    um: Unmarshaller[Serialized, V]): Source[V, NotUsed] =
+  override def getVersions[Id, V](
+      list: Seq[(Id, OffsetDateTime)]
+  )(implicit ir: IdResolver[Id, V, Category, K], um: Unmarshaller[Serialized, V]): Source[V, NotUsed] =
     store.getVersions(list)
 
-  @SuppressWarnings(Array("all")) // async/await
-  override def store[Id, V](id: Id, v: V)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done] = {
+  override def store[Id, V](id: Id, v: V)(implicit ir: IdResolver[Id, V, Category, K], m: Marshaller[V, Serialized]): Future[Done] = {
 
     if (!ir.hasVersions) {
       store.store(id, v)
@@ -296,10 +308,10 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
   override def store[Id, V](id: Id, v: V, version: OffsetDateTime)(implicit
-    ir: IdResolver[Id, V, Category, K],
-    m: Marshaller[V, Serialized]): Future[Done] = {
+      ir: IdResolver[Id, V, Category, K],
+      m: Marshaller[V, Serialized]
+  ): Future[Done] = {
 
     async {
       await(store.store(id, v, version))
@@ -314,12 +326,9 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
   override def deleteAll[Id, V](k: Id)(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] =
     deleteCurrentOrAll(k, () => store.deleteAll(k))
 
-  override def deleteVersion[Id, V](
-    k: Id,
-    version: OffsetDateTime)(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] =
+  override def deleteVersion[Id, V](k: Id, version: OffsetDateTime)(implicit ir: IdResolver[Id, V, Category, K]): Future[Done] =
     deleteCurrentOrAll(k, () => store.deleteVersion(k, version))
 
-  @SuppressWarnings(Array("all")) // async/await
   override def versions[Id, V](id: Id)(implicit ir: IdResolver[Id, V, Category, K]): Source[OffsetDateTime, NotUsed] = {
     val versionsFuture = {
       val category = ir.category
@@ -328,7 +337,7 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
         Future.successful(versionCache((category, storageId)))
       } else {
         async {
-          val children = await(store.versions(id).runWith(Sink.set))
+          val children = await(store.versions(id).runWith(EnrichedSink.set))
           versionCache((category, storageId)) = children
           children
         }
@@ -346,7 +355,18 @@ case class LazyVersionCachingPersistentStore[K, Category, Serialized](
 
   override def backup(): Source[BackupItem, NotUsed] = store.backup()
 
-  override def restore(): ScalaSink[BackupItem, Future[Done]] = store.restore()
+  override def restore(): Sink[BackupItem, Future[Done]] = store.restore()
+
+  override def sync(): Future[Done] = store.sync()
+
+  override def startMigration(): Future[Done] = store.startMigration()
+
+  override def endMigration(): Future[Done] = {
+    // Clear caches after a migration, some migrations might act on the store directly
+    versionCache.clear()
+    versionedValueCache.clear()
+    store.endMigration()
+  }
 
   override def toString: String = s"LazyVersionCachingPersistenceStore($store)"
 }

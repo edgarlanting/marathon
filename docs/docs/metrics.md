@@ -4,126 +4,403 @@ title: Metrics
 
 # Metrics
 
-Marathon currently uses [Codahale/Dropwizard Metrics](https://github.com/dropwizard/metrics). You can query
-the current metrics via the `/metrics` HTTP endpoint or configure the metrics to report periodically to:
-
-* graphite via `--reporter_graphite`.
-* datadog via `--reporter_datadog`.
-* statsd via `--reporter_datadog` (datadog reports supports statsd).
+Marathon uses [Dropwizard Metrics](https://github.com/dropwizard/metrics)
+for its metrics. You can query the current metric values via the
+`/metrics` HTTP endpoint.
 
 For the specific syntax see the
-[command line flag metrics]({{ site.baseurl }}/docs/command-line-flags.html#metrics-flags) section.
+[metrics command-line flags]({{ site.baseurl }}/docs/command-line-flags.html#metrics-flags)
+section.
 
 ## Stability of metric names
 
-Although we try to prevent unnecessary disruptions, we do not provide stability guarantees for metric names between major and minor releases.
+Although we try to prevent unnecessary disruptions, we do not provide
+stability guarantees for metric names between major and minor releases.
 
-We will not change the name of a metric non-method-call (see below) metric in a patch release if this is not required to fix a production issue, which is very unusual.
+## Metric types
+
+Marathon has the following metric types:
+
+* a `counter` is a monotonically increasing integer, for instance, the
+  number of Mesos `revive` calls performed since Marathon became
+  a leader.
+* a `gauge` is a current measurement, for instance, the number of apps
+  currently known to Marathon.
+* a `histogram` is a distribution of values in a stream of measurements,
+  for instance, the number of apps in group deployments.
+* a `meter` measures the rate at which a set of events occur.
+* a `timer` is a combination of a meter and a histogram, which measure
+  the duration of events and the rate of their occurrence.
+
+Histograms and timers are backed with reservoirs leveraging
+[HdrHistogram](http://hdrhistogram.org/).
+
+## Units of measurement
+
+A metric measures something either in abstract quantities, or in the
+following units:
+
+* `bytes`
+* `seconds`
 
 ## Metric names
 
-All metric names have to prefixed by a prefix that you specify and are subject to modification by graphite, datadog, or statsd. For example, if we write that the name of a metric is `service.mesosphere.marathon.uptime`, it might be available under `stats.gauges.marathon_test.service.mesosphere.marathon.uptime` in your configuration.
+All metric names are prefixed with `marathon` by default. The prefix can
+be changed using `--metrics_name_prefix` command-line flag.
+
+Metric name components are joined with dots. Components may have dashes
+in them.
+
+A metric type and a unit of measurement (if any) are appended to
+a metric name. A couple of examples:
+
+* `marathon.apps.active.gauge`
+* `marathon.http.event-streams.responses.size.counter.bytes`
+
+## Prometheus reporter
+
+The Prometheus reporter is enabled by default, and it can be disabled
+with `--disable_metrics_prometheus` command-line flag. Metrics in the
+Prometheus format are available at `/metrics/prometheus`.
+
+Dots and dashes in metric names are replaced with underscores.
+
+## StatsD reporter
+
+The StatsD reporter can be enabled with `--metrics_statsd` command-line
+flag. It sends metrics over UDP to the host and port specified with
+`--metrics_statsd_host` and `--metrics_statsd_port` respectively.
+
+Counters are forwarded as gauges.
+
+## DataDog reporter
+
+The DataDog reporter can be enabled with `--metrics_datadog`
+command-line flag. It sends metrics over UDP to the host and port
+specified with `--metrics_datadog_host` and `--metrics_datadog_port`
+respectively.
+
+Marathon can send metrics to a DataDog agent over UDP, or directly to
+the DataDog cloud over HTTP. It is specified using
+`--metrics_datadog_protocol`. Its possible values are `udp` (default)
+and `api`. If `api` is chosen, your DataDog API key can be supplied with
+`--metrics_datadog_api_key`.
+
+Dashes in metric names are replaced with underscores. Counters are
+forwarded as gauges.
 
 ## Important metrics
 
-`service.mesosphere.marathon.uptime` (gauge) - The uptime of the reporting Marathon process in milliseconds. This is helpful to diagnose stability problems that cause Marathon to restart.
+* `marathon.apps.active.gauge` — the number of active apps.
+* `marathon.deployments.active.gauge` — the number of active
+  deployments.
+* `marathon.deployments.counter` — the count of deployments received
+  since the current Marathon instance became a leader.
+* `marathon.deployments.dismissed.counter` — the count of deployments
+  dismissed since the current Marathon instance became a leader;
+  a deployment might be dismissed by Marathon, when there are too many
+  concurrent deployments.
+* `marathon.groups.active.gauge` — the number of active groups.
+* `marathon.instances.running.gauge` — the number of running instances
+  at the moment.
+* `marathon.instances.staged.gauge` — the number of instances staged at
+  the moment.
+* `marathon.leadership.duration.gauge.seconds` — the duration of
+  current leadership.
+* `marathon.persistence.gc.runs.counter` — the count of Marathon GC runs
+  since it became a leader.
+* `marathon.persistence.gc.compaction.duration.timer.seconds` —
+  a histogram of Marathon GC compaction phase durations, and a meter for
+  compaction durations.
+* `marathon.persistence.gc.scan.duration.timer.seconds` — a histogram of
+  Marathon GC scan phase durations, and a meter for scan durations.
+* `marathon.pods.active.gauge` — the number of active pods.
+* `marathon.tasks.launched.counter` — the count of tasks launched by
+  the current Marathon instance since it became a leader.
+* `marathon.uptime.gauge.seconds` — uptime of the current Marathon
+  instance.
+* `marathon.instances.launch-overdue.gauge` - the number of overdue instances. Overdue 
+  instances are those that has been either launched or staged but hasn't 
+  become running within the `task_launch_timeout` or `task_launch_confirmation_timeout` 
+  respectively.
+* `marathon.instances.inflight-kills.gauge` - the current number of instances for which 
+  Marathon has sent a kill request but hasn't received a confirmation from 
+  Mesos yet.
+* `marathon.instances.inflight-kill-attempts.gauge` - the total number of kill attempts that
+  Marathon has sent for all currently existing doomed instances.
+  
 
-### App, group, and task counts
-`service.mesosphere.marathon.leaderDuration` (gauge) - The duration since the last leader election happened
-in milliseconds. This is helpful to diagnose stability problems and how often leader election happens.
+### Mesos-specific metrics
 
-`service.mesosphere.marathon.app.count` (gauge) - The number of defined apps. This number influences the performance of Marathon: if you have
-a high number of apps, your performance will be lower than for a low number of
-apps.
+* `marathon.tasks.launched.counter` — the count of Mesos tasks
+  launched by the current Marathon instance since it became a leader.
+* `marathon.mesos.calls.revive.counter` — the count of Mesos `revive`
+  calls made since the current Marathon instance became a leader.
+* `marathon.mesos.calls.suppress.counter` — the count of Mesos
+  `suppress` calls made since the current Marathon instance became
+  a leader.
+* `marathon.mesos.offer-operations.launch-group.counter` — the count of
+  `LaunchGroup` offer operations made since the current Marathon
+  instance became a leader.
+* `marathon.mesos.offer-operations.launch.counter` — the count of
+  `Launch` offer operations made since the current Marathon instance
+  became a leader.
+* `marathon.mesos.offer-operations.reserve.counter` — the count of
+  `Reserve` offer operations made since the current Marathon instance
+  became a leader.
+* `marathon.mesos.offers.declined.counter` — the count of offers
+  declined since the current Marathon instance became a leader.
+* `marathon.mesos.offers.incoming.counter` — the count of offers
+  received since the current Marathon instance became a leader.
+* `marathon.mesos.offers.used.counter` — the count of offers used since
+  the current Marathon instance became a leader.
+* `marathon.mesos.task-updates.<task-state>.counter` — the count of task
+  status updates received per each task state (`task-running`,
+  `task-failed` and so on).
+* `marathon.mesos.task.oom.memory-limit-unfulfillable` - The count of
+  tasks OOM-killed because, while the container stayed within its
+  specified memory limit, the agent was too memory constrained to
+  support it.
+* `marathon.mesos.task.oom.memory-limit-exceeded` - The count of tasks
+  OOM-killed because it exceeded the specified memory limit (or,
+  request, if limit was not specified).
 
-`service.mesosphere.marathon.group.count` (gauge) - The number of defined groups. This number influences the performance of Marathon: if you have a high number of groups, your performance will be lower than for a low number of groups. Note that each term between the slashes in your an ID corresponds to a group. The app `/shop/frontend` is in the `frontend` group, which is in the `shop` group, which is in the root group.
+### HTTP-specific metrics
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.task.running.count` (gauge) - The number of tasks that are
-currently running.
+* `marathon.http.responses.event-stream.size.counter.bytes` — the size
+  of data sent to clients over event streams since the current Marathon
+  instance became a leader.
+* `marathon.http.requests.size.counter.bytes` — the total size of
+  all requests since the current Marathon instance became a leader.
+* `marathon.http.responses.size.counter.bytes` — the total size of all
+  responses since the current Marathon instance became a leader.
+* `marathon.http.responses.size.gzipped.counter.bytes` — the total size
+  of all gzipped responses since the current Marathon instance became
+  a leader.
+* `marathon.http.requests.active.gauge` — the number of active requests.
+* `marathon.http.responses.1xx.rate.meter` — the rate of `1xx` responses.
+* `marathon.http.responses.2xx.rate.meter` — the rate of `2xx` responses.
+* `marathon.http.responses.3xx.rate.meter` — the rate of `3xx` responses.
+* `marathon.http.responses.4xx.rate.meter` — the rate of `4xx` responses.
+* `marathon.http.responses.5xx.rate.meter` — the rate of `5xx` responses.
+* `marathon.http.requests.duration.timer.seconds` — a histogram of
+  request durations, and a meter for request durations.
+* `marathon.http.requests.get.duration.timer.seconds` — the same but for
+  `GET` requests only.
+* `marathon.http.requests.post.duration.timer.seconds` — the same but
+  for `POST` requests only.
+* `marathon.http.requests.put.duration.timer.seconds` — the same but for
+  `PUT` requests only.
+* `marathon.http.requests.delete.duration.timer.seconds` — the same but
+  for `DELETE` requests only.
 
-<span class="label label-default">v0.15</span> 
-`service.mesosphere.marathon.task.staged.count` (gauge) - The number of tasks that are
-currently staged. Tasks enter staging state after they are launched. A consistently high number of staged tasks indicates that a lot of tasks are stopping and being restarted. Either you have many app updates/manual restarts or some of your apps have stability problems and are automatically restarted frequently.
+### JVM-specific metrics
 
-### Task update processing
+#### JVM buffer pools
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.core.task.update.impl.ThrottlingTaskStatusUpdateProcessor.queued` (gauge) - The number of queued status updates.
+* `marathon.jvm.buffers.mapped.gauge` — an estimate of the number of
+  mapped buffers.
+* `marathon.jvm.buffers.mapped.capacity.gauge.bytes` — an estimate of
+  the total capacity of the mapped buffers in bytes.
+* `marathon.jvm.buffers.mapped.memory.used.gauge.bytes` an estimate of
+  the memory that the JVM is using for mapped buffers in bytes, or `-1L`
+  if an estimate of the memory usage is not available.
+* `marathon.jvm.buffers.direct.gauge` — an estimate of the number of
+  direct buffers.
+* `marathon.jvm.buffers.direct.capacity.gauge.bytes` — an estimate of
+  the total capacity of the direct buffers in bytes.
+* `marathon.jvm.buffers.direct.memory.used.gauge.bytes` an estimate of
+  the memory that the JVM is using for direct buffers in bytes, or `-1L`
+  if an estimate of the memory usage is not available.
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.core.task.update.impl.ThrottlingTaskStatusUpdateProcessor.processing` (gauge) - The number of status updates currently being processed.
- 
- <span class="label label-default">v0.15</span>
- `service.mesosphere.marathon.core.task.update.impl.TaskStatusUpdateProcessorImpl.publishFuture` (timer) - This metric calculates how long it takes Marathon to process status updates.
+#### JVM garbage collection
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.core.task.update.impl.TaskStatusUpdateProcessorImpl.publishFuture` (timer) - This metric calculates how long it takes Marathon to process status updates.
+* `marathon.jvm.gc.<gc>.collections.gauge` — the total number
+  of collections that have occurred
+* `marathon.jvm.gc.<gc>.collections.duraration.gauge.seconds` — the
+  approximate accumulated collection elapsed time, or `-1` if the
+  collection elapsed time is undefined for the given collector.
 
-### Configuration update processing
+#### JVM memory
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.state.GroupManager.queued` (gauge) - The number of app configuration updates in the queue. Use `--max_queued_root_group_updates` to configure the maximum.
+* `marathon.jvm.memory.total.init.gauge.bytes` - the amount of memory
+  in bytes that the JVM initially requests from the operating system
+  for memory management, or `-1` if the initial memory size is
+  undefined.
+* `marathon.jvm.memory.total.used.gauge.bytes` - the amount of used
+  memory in bytes.
+* `marathon.jvm.memory.total.max.gauge.bytes` - the maximum amount of
+  memory in bytes that can be used for memory management, `-1` if the
+  maximum memory size is undefined.
+* `marathon.jvm.memory.total.committed.gauge.bytes` - the amount of
+  memory in bytes that is committed for the JVM to use.
+* `marathon.jvm.memory.heap.init.gauge.bytes` - the amount of heap
+  memory in bytes that the JVM initially requests from the operating
+  system for memory management, or `-1` if the initial memory size is
+  undefined.
+* `marathon.jvm.memory.heap.used.gauge.bytes` - the amount of used heap
+  memory in bytes.
+* `marathon.jvm.memory.heap.max.gauge.bytes` - the maximum amount of
+  heap memory in bytes that can be used for memory management, `-1` if
+  the maximum memory size is undefined.
+* `marathon.jvm.memory.heap.committed.gauge.bytes` - the amount of heap
+  memory in bytes that is committed for the JVM to use.
+* `marathon.jvm.memory.heap.usage.gauge` - the ratio of
+  `marathon.jvm.memory.heap.used.gauge.bytes` and
+  `marathon.jvm.memory.heap.max.gauge.bytes`.
+* `marathon.jvm.memory.non-heap.init.gauge.bytes` - the amount of
+  non-heap memory in bytes that the JVM initially requests from the
+  operating system for memory management, or `-1` if the initial memory
+  size is undefined.
+* `marathon.jvm.memory.non-heap.used.gauge.bytes` - the amount of used
+  non-heap memory in bytes.
+* `marathon.jvm.memory.non-heap.max.gauge.bytes` - the maximum amount of
+  non-heap memory in bytes that can be used for memory management, `-1`
+  if the maximum memory size is undefined.
+* `marathon.jvm.memory.non-heap.committed.gauge.bytes` - the amount of
+  non-heap memory in bytes that is committed for the JVM to use.
+* `marathon.jvm.memory.non-heap.usage.gauge` - the ratio of
+  `marathon.jvm.memory.non-heap.used.gauge.bytes` and
+  `marathon.jvm.memory.non-heap.max.gauge.bytes`.
 
-<span class="label label-default">v0.15</span>
-`service.mesosphere.marathon.state.GroupManager.processing` (gauge) - The number of currently processed app configuration updates. Since we serialize these updates, this is either 0 or 1.
+#### JVM threads
 
-### Repositories
+* `marathon.jvm.threads.active.gauge` — the number of active threads.
+* `marathon.jvm.threads.daemon.gauge` — the number of daemon threads.
+* `marathon.jvm.threads.deadlocked.gauge` — the number of deadlocked
+  threads.
+* `marathon.jvm.threads.new.gauge` — the number of threads in `NEW`
+   state.
+* `marathon.jvm.threads.runnable.gauge` — the number of threads in
+  `RUNNABLE` state.
+* `marathon.jvm.threads.blocked.gauge` — the number of threads in
+  `BLOCKED` state.
+* `marathon.jvm.threads.timed-waiting.gauge` — the number of threads in
+  `TIMED_WAITING` state.
+* `marathon.jvm.threads.waiting.gauge` — the number of threads in
+  `WAITING` state.
+* `marathon.jvm.threads.terminated.gauge` — the number of threads in
+  `TERMINATED` state.
 
-Marathon stores its permanent state in "repositories." The important ones are:
+## Alerting
 
-* `GroupRepository` for app configurations and groups.
-* `TaskRepository` for the last known task state. This is the repository with the largest data churn.
+Let's consider a few examples of alerting rules. We will use Prometheus
+as our alerting tool, but please keep in mind that any alerting service
+of your choice can be used instead.
 
-Other repositories include:
+Please note that particular threshold values are dependent on many
+variables like the number of applications, a cluster size and so on.
 
-* `AppRepository` for versioned app configuration.
-* `DeploymentRepository` for currently running deployments.
-* `TaskFailureRepository` for the last failure for every application.
+For the syntax of Prometheus alerting rules please refer to
+[its official documentation](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/).
 
-We have statistics about read and write requests for each repository. To access them, substitute `*` with the name of a repository:
+Alert whenever a Marathon instance goes down or restarts:
 
-`service.mesosphere.marathon.state.*.read-request-time.count` - The number of read requests.
+```yaml
+  - alert: Marathon Uptime
+    expr: up{job="marathon"} == 0
+    for: 30s
+    labels:
+      severity: warning
+    annotations:
+      summary: It fires when a Marathon instance stops or restarts.
+```
 
-`service.mesosphere.marathon.state.*.read-request-time.mean` - The exponential weighted average of the read request times.
+Alert when there are less than 2 out of 3 Marathon instances that are
+up and running:
 
-`service.mesosphere.marathon.state.*.write-request-time.count` - The number of write requests.
+```yaml
+  - alert: Marathon Too Few Instances
+    expr: sum(up{job="marathon"}) < 2
+    for: 30s
+    labels:
+      severity: critical
+      annotations:
+      summary: It fires when there are fewer Marathon instances up and running than expected (< 2 instances).
+```
 
-`service.mesosphere.marathon.state.*.write-request-time.mean` - The [exponential weighted average](https://dropwizard.github.io/metrics/3.1.0/manual/core/#exponentially-decaying-reservoirs) of the write request times.
+Alert if Marathon's heap usage is too high:
 
-**Note:** Many of the repository metrics were not measured correctly prior to <span class="label label-default">v0.15</span>.
+```yaml
+  - alert: Marathon Heap Usage
+    expr: avg_over_time(marathon_jvm_memory_heap_used_gauge_bytes[10s]) > (2 * 1024 * 1024 * 1024)
+    for: 10s
+    labels:
+      severity: critical
+    annotations:
+      summary: It fires when Marathon's heap is too big (> 2GB).
+```
 
-### Requests
+Alert if Marathon has too many threads:
 
-`org.eclipse.jetty.servlet.ServletContextHandler.dispatches` (timer) - The
-number of HTTP requests received by Marathon is available under `.count`.
-There are more metrics around HTTP requests under the
-`org.eclipse.jetty.servlet.ServletContextHandler` prefix.
-For more information, consult [the code](https://github.com/dropwizard/metrics/blob/796663609f310888240cc8afb58f75396f8391d2/metrics-jetty9/src/main/java/io/dropwizard/metrics/jetty9/InstrumentedHandler.java#L41-L42).
+```yaml
+  - alert: Marathon Threads
+    expr: avg_over_time(marathon_jvm_threads_active_gauge[10s]) > 100
+    for: 10s
+    labels:
+      severity: critical
+    annotations:
+      summary: It fires when Marathon has too many threads (> 100 threads).
+```
 
-### JVM
+Alert if Marathon dismisses deployments way too often:
 
-`jvm.threads.count` (meter) - The total number of threads. This number should be below 500.
+```yaml
+  - alert: Marathon Dismissed Deployments
+    expr: rate(marathon_deployments_dismissed_counter[1m]) > 3
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: It fires if there are too many deployments dismissed by Marathon (> 3 deployments over the last minute).
+```
 
-`jvm.memory.total.used` (meter) - The total number of bytes used by the Marathon JVM.
+Alert if Marathon receives offers, but is unable to use them for some
+reason, i.e. insufficient resources:
 
-## Instrumented method calls
+```yaml
+  - alert: Marathon Given No Suitable Offer
+    expr: rate(marathon_mesos_offers_used_counter[10m]) == 0 and rate(marathon_mesos_offers_incoming_counter[10m]) > 0
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: It fires if there are incoming Mesos offers, but none can be used by Marathon (for the last 10 minutes).
+```
 
-These metrics are created automatically by instrumenting certain classes in our code base.
+Alert if there are too many concurrent HTTP requests to Marathon:
 
-You can disable these instrumented metrics with `--disable_metrics`. This flag will only disable this code instrumentation, not all metrics.
+```yaml
+  - alert: Marathon HTTP Requests
+    expr: avg_over_time(marathon_http_requests_active_gauge[10s]) > 100
+    for: 10s
+    labels:
+      severity: critical
+    annotations:
+      summary: It fires if there are too many concurrent HTTP requests to Marathon (> 100 concurrent connections).
+```
 
-These timers can be very valuable in diagnosing problems, but they require detailed knowledge of the inner workings of Marathon. They can also degrade performance noticeably.
+Alert if Marathon responds with a 5xx status code:
 
-Since these metric names directly correspond to class and method names in our code base,
-expect the names of these metrics to change if the affected code changes.
+```yaml
+  - alert: Marathon HTTP 5xx Responses
+    expr: marathon_http_responses_5xx_rate_m1_rate_meter > 0
+    for: 10s
+    labels:
+      severity: critical
+    annotations:
+      summary: It fires if Marathon responds with a 5xx status codes.
+```
 
-## Potential pitfalls
+Alert if Marathon has too many staged instances, which might indicate
+that Marathon does not receive offers with enough resources or
 
-### Derived metrics (mean, p99, ...)
-
-Our metrics library calculates derived metrics like "mean" and "p99." However, Marathon provides these metrics for the entire life of of the app and applies an exponential weighting algorithm as a heuristic. For more precise metrics, build your dashboard around "counts" rather than "rates" where possible.
-
-### Statsd and derived statistics
-
-Statsd typically creates derived statistics (mean, p99) from mean values Marathon reports. Our codahale metrics package also reports derived statistics. To avoid accidentally aggregating statistics multiple times, be sure you know where you are reporting and computing mean values.
+```yaml
+  - alert: Marathon Too Many Staged Instances
+    expr: marathon_instances_staged_gauge > 10
+    for: 10s
+    labels:
+      severity: warning
+    annotations:
+      summary: It fires if Marathon has too many staged instances (> 10 staged instances).
+```

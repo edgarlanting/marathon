@@ -1,23 +1,21 @@
 package mesosphere.marathon
 package state
 
-import mesosphere.marathon.Protos
-import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.event.{ InstanceChanged, UnhealthyInstanceKillEvent }
+import mesosphere.marathon.core.event.UnhealthyInstanceKillEvent
 import mesosphere.mesos.protos.Implicits.slaveIDToProto
 import mesosphere.mesos.protos.SlaveID
-import org.apache.mesos.{ Protos => mesos }
+import org.apache.mesos.{Protos => mesos}
 
 case class TaskFailure(
-  appId: PathId,
-  taskId: mesos.TaskID,
-  state: mesos.TaskState,
-  message: String = "",
-  host: String = "",
-  version: Timestamp = Timestamp.now(),
-  timestamp: Timestamp = Timestamp.now(),
-  slaveId: Option[mesos.SlaveID] = None)
-    extends MarathonState[Protos.TaskFailure, TaskFailure] {
+    appId: AbsolutePathId,
+    taskId: mesos.TaskID,
+    state: mesos.TaskState,
+    message: String = "",
+    host: String = "",
+    version: Timestamp = Timestamp.now(),
+    timestamp: Timestamp = Timestamp.now(),
+    slaveId: Option[mesos.SlaveID] = None
+) extends MarathonState[Protos.TaskFailure, TaskFailure] {
 
   override def mergeFromProto(proto: Protos.TaskFailure): TaskFailure =
     TaskFailure(proto)
@@ -47,7 +45,7 @@ object TaskFailure {
 
   def empty: TaskFailure = {
     TaskFailure(
-      PathId.empty,
+      PathId.root,
       mesos.TaskID.newBuilder().setValue("").build,
       mesos.TaskState.TASK_STAGING
     )
@@ -55,7 +53,7 @@ object TaskFailure {
 
   def apply(proto: Protos.TaskFailure): TaskFailure =
     TaskFailure(
-      appId = PathId(proto.getAppId),
+      appId = AbsolutePathId(proto.getAppId),
       taskId = proto.getTaskId,
       state = proto.getState,
       message = proto.getMessage,
@@ -91,52 +89,33 @@ object TaskFailure {
 
     def apply(statusUpdate: MesosStatusUpdateEvent): Option[TaskFailure] = {
       val MesosStatusUpdateEvent(
-        slaveId, taskId, state, message,
-        appId, host, _, _, version, _, ts
-        ) = statusUpdate
+        slaveId,
+        taskId,
+        state,
+        message,
+        appId,
+        host,
+        _,
+        _,
+        version,
+        _,
+        ts
+      ) = statusUpdate
 
       if (isFailureState(state))
-        Some(TaskFailure(
-          appId,
-          taskId.mesosTaskId,
-          state,
-          message,
-          host,
-          Timestamp(version),
-          Timestamp(ts),
-          Option(slaveIDToProto(SlaveID(slaveId)))
-        ))
-      else None
-    }
-  }
-  object FromInstanceChangedEvent {
-    def unapply(instanceChange: InstanceChanged): Option[TaskFailure] =
-      apply(instanceChange)
-
-    def apply(instanceChange: InstanceChanged): Option[TaskFailure] = {
-      val InstanceChanged(_, runSpecVersion, runSpecId, condition, instance) = instanceChange
-
-      val (taskId, task) = instance.tasksMap.headOption.getOrElse(throw new RuntimeException("no task in instance"))
-      val mesosTaskId = taskId.mesosTaskId
-      val message = task.status.mesosStatus.fold("") { status =>
-        if (status.hasMessage) status.getMessage else ""
-      }
-
-      Condition.toMesosTaskState(condition) match {
-        case Some(state) if isFailureState(state) =>
-          Some(TaskFailure(
-            runSpecId,
-            mesosTaskId,
+        Some(
+          TaskFailure(
+            appId,
+            taskId.mesosTaskId,
             state,
             message,
-            instance.agentInfo.host,
-            version = runSpecVersion,
-            instance.state.since,
-            instance.agentInfo.agentId.map(SlaveID(_))
-          ))
-        case _ =>
-          None
-      }
+            host,
+            Timestamp(version),
+            Timestamp(ts),
+            Option(slaveIDToProto(SlaveID(slaveId)))
+          )
+        )
+      else None
     }
   }
 
@@ -148,8 +127,7 @@ object TaskFailure {
   private[this] def isFailureState(state: mesos.TaskState): Boolean = {
     import mesos.TaskState._
     state match {
-      case TASK_FAILED | TASK_ERROR |
-        TASK_LOST | TASK_DROPPED | TASK_GONE | TASK_GONE_BY_OPERATOR | TASK_UNKNOWN => true
+      case TASK_FAILED | TASK_ERROR | TASK_LOST | TASK_DROPPED | TASK_GONE | TASK_GONE_BY_OPERATOR | TASK_UNKNOWN => true
       case _ => false
     }
   }

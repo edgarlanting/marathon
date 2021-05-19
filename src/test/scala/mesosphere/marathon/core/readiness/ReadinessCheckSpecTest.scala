@@ -5,7 +5,7 @@ import mesosphere.UnitTest
 import mesosphere.marathon.core.instance.TestTaskBuilder
 import mesosphere.marathon.core.task.Task
 import mesosphere.marathon.core.task.state.NetworkInfo
-import mesosphere.marathon.state.{ AppDefinition, PathId, PortDefinition }
+import mesosphere.marathon.state.{AbsolutePathId, AppDefinition, PortDefinition}
 
 class ReadinessCheckSpecTest extends UnitTest {
   "ReadinessCheckSpec" should {
@@ -96,11 +96,12 @@ class ReadinessCheckSpecTest extends UnitTest {
   }
 
   class Fixture {
-    val appId: PathId = PathId("/test")
+    val appId: AbsolutePathId = AbsolutePathId("/test")
     val hostName = "some.host"
 
     val appWithOneReadinessCheck = AppDefinition(
       id = appId,
+      role = "*",
       readinessChecks = Seq(ReadinessCheckTestHelper.defaultHttp),
       portDefinitions = Seq(
         PortDefinition(
@@ -112,6 +113,7 @@ class ReadinessCheckSpecTest extends UnitTest {
 
     val appWithOneReadinessCheckWithRequiredPorts = AppDefinition(
       id = appId,
+      role = "*",
       readinessChecks = Seq(ReadinessCheckTestHelper.defaultHttp),
       requirePorts = true,
       portDefinitions = Seq(
@@ -128,6 +130,7 @@ class ReadinessCheckSpecTest extends UnitTest {
 
     val appWithMultipleReadinessChecks = AppDefinition(
       id = appId,
+      role = "*",
       readinessChecks = Seq(
         ReadinessCheckTestHelper.defaultHttp,
         ReadinessCheckTestHelper.alternativeHttps
@@ -145,7 +148,7 @@ class ReadinessCheckSpecTest extends UnitTest {
     )
 
     def taskWithPorts = {
-      val task: Task.LaunchedEphemeral = TestTaskBuilder.Helper.runningTaskForApp(appId)
+      val task: Task = TestTaskBuilder.Helper.runningTaskForApp(appId)
       task.copy(status = task.status.copy(networkInfo = NetworkInfo(hostName, hostPorts = Seq(80, 81), ipAddresses = Nil)))
     }
   }

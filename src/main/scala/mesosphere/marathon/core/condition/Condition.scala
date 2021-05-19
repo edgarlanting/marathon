@@ -1,8 +1,8 @@
 package mesosphere.marathon
 package core.condition
 
-import play.api.libs.json.Json
-import org.apache.mesos.Protos.{ TaskState => MesosTaskState }
+import play.api.libs.json._
+import org.apache.mesos.Protos.{TaskState => MesosTaskState}
 
 /**
   * To define the status of an Instance, this trait is used and stored for each Task in Task.Status.
@@ -12,6 +12,7 @@ import org.apache.mesos.Protos.{ TaskState => MesosTaskState }
   * - mapping of existing (soon-to-be deprecated) mesos.Protos.TaskStatus.TASK_LOST to the new representations
   */
 sealed trait Condition extends Product with Serializable {
+
   /**
     * @return whether condition is considered a lost state.
     *
@@ -28,18 +29,20 @@ sealed trait Condition extends Product with Serializable {
   /**
     * @return whether condition is a terminal state.
     */
-  def isTerminal: Boolean = this match {
-    case _: Condition.Terminal => true
-    case _ => false
-  }
+  def isTerminal: Boolean =
+    this match {
+      case _: Condition.Terminal => true
+      case _ => false
+    }
 
   /**
     * @return whether considered is considered active.
     */
-  def isActive: Boolean = this match {
-    case _: Condition.Active => true
-    case _ => false
-  }
+  def isActive: Boolean =
+    this match {
+      case _: Condition.Active => true
+      case _ => false
+    }
 }
 
 object Condition {
@@ -48,11 +51,11 @@ object Condition {
   sealed trait Failure extends Terminal
   sealed trait Active extends Condition
 
-  /** Reserved: Task with persistent volume has reservation, but is not launched yet */
-  case object Reserved extends Condition
+  /** Scheduled: Task should be launched by matching offers. Mesos does not know anything about it. */
+  case object Scheduled extends Condition
 
-  /** Created: Task is known in marathon and sent to mesos, but not staged yet */
-  case object Created extends Active
+  /** Provisioned: An offer for task has been accepted but Mesos did not start the task yet. */
+  case object Provisioned extends Active
 
   /** Error: indicates that a task launch attempt failed because of an error in the task specification */
   case object Error extends Failure
@@ -113,8 +116,31 @@ object Condition {
       UnreachableInactive -> MesosTaskState.TASK_UNREACHABLE,
       Gone -> MesosTaskState.TASK_GONE,
       Dropped -> MesosTaskState.TASK_DROPPED,
-      Unknown -> MesosTaskState.TASK_UNKNOWN)
+      Unknown -> MesosTaskState.TASK_UNKNOWN
+    )
   }
+
+  val all = Seq(
+    Error,
+    Failed,
+    Finished,
+    Killed,
+    Killing,
+    Running,
+    Staging,
+    Starting,
+    Unreachable,
+    UnreachableInactive,
+    Gone,
+    Dropped,
+    Unknown,
+    Scheduled,
+    Provisioned
+  )
+
+  private val lowerCaseStringToCondition: Map[String, Condition] = all.iterator.map { c =>
+    c.toString.toLowerCase -> c
+  }.toMap
 
   /** Converts the Condition to a mesos task state where such a conversion is possible */
   def toMesosTaskState(condition: Condition): Option[MesosTaskState] =
@@ -127,25 +153,18 @@ object Condition {
   def toMesosTaskStateOrStaging(condition: Condition): MesosTaskState =
     conditionToMesosTaskState.getOrElse(condition, MesosTaskState.TASK_STAGING)
 
-  // scalastyle:off
-  def apply(str: String): Condition = str.toLowerCase match {
-    case "reserved" => Reserved
-    case "created" => Created
-    case "error" => Error
-    case "failed" => Failed
-    case "killed" => Killed
-    case "killing" => Killing
-    case "running" => Running
-    case "staging" => Staging
-    case "starting" => Starting
-    case "unreachable" => Unreachable
-    case "gone" => Gone
-    case "dropped" => Dropped
-    case _ => Unknown
-  }
-  // scalastyle:on
+  def apply(str: String): Condition =
+    lowerCaseStringToCondition.getOrElse(str.toLowerCase, Unknown)
 
   def unapply(condition: Condition): Option[String] = Some(condition.toString.toLowerCase)
 
-  implicit val conditionFormat = Json.format[Condition]
+  val conditionReader = new Reads[Condition] {
+    private def readString(j: JsReadable) = j.validate[String].map(Condition(_))
+    override def reads(json: JsValue): JsResult[Condition] =
+      readString(json).orElse {
+        json.validate[JsObject].flatMap { obj => readString(obj \ "str") }
+      }
+  }
+
+  implicit val conditionFormat = Format[Condition](conditionReader, Writes(condition => JsString(condition.toString)))
 }

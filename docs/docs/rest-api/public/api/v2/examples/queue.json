@@ -40,6 +40,7 @@
         }
       },
       "count": 1,
+      "role": "*",
       "delay": {
         "timeLeftSeconds": 0,
         "overdue": true
@@ -98,6 +99,7 @@
         }
       },
       "count": 2,
+      "role": "*",
       "delay": {
         "timeLeftSeconds": 0,
         "overdue": true
@@ -145,9 +147,9 @@
             "processed": 23
           },
           {
-            "reason": "InsufficientGpus",
+            "reason": "DeclinedScarceResources",
             "declined": 0,
-            "processed": 23
+            "processed": 11
           }
         ],
         "rejectSummaryLaunchAttempt": [
@@ -163,6 +165,11 @@
           },
           {
             "reason": "NoCorrespondingReservationFound",
+            "declined": 0,
+            "processed": 246
+          },
+          {
+            "reason": "AgentMaintenance",
             "declined": 0,
             "processed": 246
           },
@@ -187,9 +194,9 @@
             "processed": 46
           },
           {
-            "reason": "InsufficientGpus",
+            "reason": "DeclinedScarceResources",
             "declined": 0,
-            "processed": 46
+            "processed": 31
           }
         ]
       },

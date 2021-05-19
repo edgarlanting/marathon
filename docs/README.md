@@ -1,73 +1,54 @@
 # Marathon Docs and Website
 
-## Run it locally
-
 Ensure you have installed everything listed in the dependencies section before
 following the instructions.
 
-### Dependencies
+**Important:** `gh-pages` branch is auto generated. Please do not edit it manually, otherwise your changes will be lost.
 
-* [Bundler](http://bundler.io/)
-* [Node.js](http://nodejs.org/) (for compiling assets)
-* Python
-* Ruby
-* [RubyGems](https://rubygems.org/)
+## Dependencies
 
-### Instructions
+* Docker
+* Ammonite
 
-1. Install packages needed to generate the site
+## Instructions
 
-    * On Linux:
+### Previewing a single branch (with incremental rebuild)
 
-            $ apt-get install ruby-dev make autoconf nodejs nodejs-legacy python-dev npm
+1. Install Docker (if not already installed)
 
-    * On Mac OS X:
+2. Build the docker image:
 
-            $ brew install node
+        docker build . -t jekyll
 
-2. Clone the Marathon repository
+3. Run it (from this folder)
 
-3. Change into the "docs" directory where docs live
+        docker run --rm -it -v $(pwd):/site-docs -p 4000:4000 jekyll watch
 
-        $ cd docs/
+4. Visit the site at [http://localhost:4000/marathon/](http://localhost:4000/marathon/) (note the trailing slash)
+
+###  Rendering the complete documentation (no incremental rebuild, the end result of what will be published)
+
+1. Install [Ammonite-REPL](http://ammonite.io/#Ammonite-REPL) if you don't have it.
+
+2. Install Docker
+
+3. Run the script:
+
+        $ cd ci
+        $ ./generate_docs.sc
+
+4. Enjoy your docs at
+   [http://localhost:8080/](http://localhost:8080/)
+
+### Pushing the documentation to the github pages
+
+1. Run the script with a publish flag:
+
+        $ ./generate_docs.sc --publish true --preview false
         
-4. Install Bundler
+### Additional options
 
-        $ gem install bundler
-
-5. Install the bundle's dependencies
-
-        $ bundle install --path vendor/bundle
-
-6. Start the web server
-
-        $ bundle exec jekyll serve --watch
-
-7. Visit the site at
-   [http://localhost:4000/marathon/](http://localhost:4000/marathon/)
-
-## Deploying the site
-
-1. Clone a separate copy of the Marathon repo as a sibling of your normal
-   Marathon project directory and name it "marathon-gh-pages".
-
-        $ git clone git@github.com:mesosphere/marathon.git marathon-gh-pages
-
-2. Check out the "gh-pages" branch.
-
-        $ cd /path/to/marathon-gh-pages
-        $ git checkout gh-pages
-
-3. Check out the appropriate release branch, then copy the contents of the "docs" directory in master to the root of your
-   marathon-gh-pages directory.
-        
-        $ cd /path/to/marathon
-        $ git checkout releases/1.x
-        $ cp -r docs/** ../marathon-gh-pages
-
-4. Change to the marathon-gh-pages directory, commit, and push the changes
-
-        $ cd /path/to/marathon-gh-pages
-        $ git commit . -m "Syncing docs with release branch"
-        $ git push
-
+1. `--remote <git remote>` specifies a git remote where docs will be published (useful for testing)
+2. `--preview false` disables preview
+3. `--release_commits_override 1.6=hash1,1.5=hash2` allows to use a specific commits instead of latest tags for each respective branch
+4. `--ignored_versions 1.7` ignores provided minor version when generating/publishing docs.

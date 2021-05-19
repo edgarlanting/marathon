@@ -1,42 +1,38 @@
 package mesosphere.marathon
 package core.launchqueue.impl
 
-import akka.actor.{ Actor, ActorRef, Cancellable, Props }
+import akka.actor.{Actor, ActorRef, Cancellable, Props}
 import akka.event.LoggingReceive
 import com.typesafe.scalalogging.StrictLogging
-import mesosphere.marathon.core.launchqueue.impl.RateLimiterActor.{ AddDelay, DecreaseDelay, DelayUpdate, GetDelay, ResetDelay, ResetDelayResponse, ResetViableTasksDelays }
-import mesosphere.marathon.state.{ RunSpec, Timestamp }
+import mesosphere.marathon.core.launchqueue.impl.RateLimiterActor._
+import mesosphere.marathon.core.leadership.LeaderDeferrable
+import mesosphere.marathon.state.{RunSpec, RunSpecConfigRef}
 
 import scala.concurrent.duration._
 
 private[launchqueue] object RateLimiterActor {
-  def props(
-    rateLimiter: RateLimiter,
-    launchQueueRef: ActorRef): Props =
-    Props(new RateLimiterActor(
-      rateLimiter, launchQueueRef
-    ))
+  def props(rateLimiter: RateLimiter): Props =
+    Props(new RateLimiterActor(rateLimiter))
 
-  case class DelayUpdate(runSpec: RunSpec, delayUntil: Timestamp)
-
-  case class ResetDelay(runSpec: RunSpec)
-  case object ResetDelayResponse
-
-  case class GetDelay(runSpec: RunSpec)
   private[impl] case class AddDelay(runSpec: RunSpec)
   private[impl] case class DecreaseDelay(runSpec: RunSpec)
+  private[impl] case class AdvanceDelay(runSpec: RunSpec)
+  private[impl] case class ResetDelay(runSpec: RunSpec)
+  private[impl] case class GetDelay(ref: RunSpecConfigRef)
+  @LeaderDeferrable private[launchqueue] case object Subscribe
+  private[launchqueue] case object Unsubscribe
 
-  private case object ResetViableTasksDelays
+  private case object CleanupOverdueDelays
 }
 
-private class RateLimiterActor private (
-    rateLimiter: RateLimiter,
-    launchQueueRef: ActorRef) extends Actor with StrictLogging {
+private class RateLimiterActor private (rateLimiter: RateLimiter) extends Actor with StrictLogging {
   var cleanup: Cancellable = _
+  var subscribers: Set[ActorRef] = Set.empty
 
   override def preStart(): Unit = {
     import context.dispatcher
-    cleanup = context.system.scheduler.schedule(10.seconds, 10.seconds, self, ResetViableTasksDelays)
+    val overdueDelayCleanupInterval = 10.seconds
+    cleanup = context.system.scheduler.schedule(overdueDelayCleanupInterval, overdueDelayCleanupInterval, self, CleanupOverdueDelays)
     logger.info("started RateLimiterActor")
   }
 
@@ -44,36 +40,56 @@ private class RateLimiterActor private (
     cleanup.cancel()
   }
 
-  override def receive: Receive = LoggingReceive {
-    Seq[Receive](
-      receiveCleanup,
-      receiveDelayOps
-    ).reduceLeft(_.orElse[Any, Unit](_))
-  }
+  override def receive: Receive =
+    LoggingReceive {
+      Seq[Receive](
+        receiveCleanup,
+        receiveDelayOps
+      ).reduceLeft(_.orElse[Any, Unit](_))
+    }
 
-  /**
-    * If an app gets removed or updated, the delay should be reset. If
-    * an app is considered viable, the delay should be reset too. We
-    * check and reset viable tasks' delays periodically.
-    */
   private[this] def receiveCleanup: Receive = {
-    case ResetViableTasksDelays =>
-      rateLimiter.resetDelaysOfViableTasks()
+    case CleanupOverdueDelays =>
+      // If a run spec gets removed or updated, the delay should be reset.
+      // In addition to that we remove overdue delays to ensure there are no leaks,
+      // by calling this periodically.
+      rateLimiter.cleanUpOverdueDelays().foreach { configRef =>
+        notify(RateLimiter.DelayUpdate(configRef, None))
+      }
   }
 
   private[this] def receiveDelayOps: Receive = {
-    case GetDelay(runSpec) =>
-      sender() ! DelayUpdate(runSpec, rateLimiter.getDeadline(runSpec))
+    case Subscribe =>
+      if (!subscribers.contains(sender)) {
+        subscribers += sender
+        rateLimiter.currentDelays.foreach { delay: RateLimiter.DelayUpdate =>
+          sender ! delay
+        }
+      }
+
+    case Unsubscribe =>
+      subscribers -= sender
+
+    case GetDelay(ref) =>
+      sender() ! RateLimiter.DelayUpdate(ref, rateLimiter.getDelay(ref))
 
     case AddDelay(runSpec) =>
       rateLimiter.addDelay(runSpec)
-      launchQueueRef ! DelayUpdate(runSpec, rateLimiter.getDeadline(runSpec))
+      notify(RateLimiter.DelayUpdate(runSpec.configRef, rateLimiter.getDelay(runSpec.configRef)))
 
-    case DecreaseDelay(runSpec) => // ignore for now
+    case DecreaseDelay(_) => // ignore for now
+
+    case AdvanceDelay(runSpec) =>
+      rateLimiter.advanceDelay(runSpec)
+      notify(RateLimiter.DelayUpdate(runSpec.configRef, rateLimiter.getDelay(runSpec.configRef)))
 
     case ResetDelay(runSpec) =>
       rateLimiter.resetDelay(runSpec)
-      launchQueueRef ! DelayUpdate(runSpec, rateLimiter.getDeadline(runSpec))
-      sender() ! ResetDelayResponse
+      notify(RateLimiter.DelayUpdate(runSpec.configRef, None))
+  }
+
+  private def notify(update: RateLimiter.DelayUpdate): Unit = {
+    // Have launchQueue subscribe the same way?
+    subscribers.foreach { _ ! update }
   }
 }

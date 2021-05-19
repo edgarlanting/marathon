@@ -6,7 +6,19 @@ import java.util.regex.Pattern
 import com.wix.accord._
 import com.wix.accord.dsl._
 import mesosphere.marathon.api.v2.Validation
-import mesosphere.marathon.raml.{ App, Apps, Constraint, ConstraintOperator, PodPlacementPolicy, PodSchedulingBackoffStrategy, PodSchedulingPolicy, PodUpgradeStrategy, UpgradeStrategy }
+import mesosphere.marathon.raml.{
+  App,
+  Apps,
+  Constraint,
+  ConstraintOperator,
+  Pod,
+  PodPersistentVolume,
+  PodPlacementPolicy,
+  PodSchedulingBackoffStrategy,
+  PodSchedulingPolicy,
+  PodUpgradeStrategy,
+  UpgradeStrategy
+}
 import mesosphere.marathon.state.ResourceRole
 
 import scala.util.Try
@@ -40,21 +52,38 @@ trait SchedulingValidation {
     app.upgradeStrategy is optional(implied(app.residency.nonEmpty)(validForResidentTasks))
   }
 
+  def podUpgradeStrategy(pod: Pod): Option[PodUpgradeStrategy] = {
+    pod.scheduling.flatMap(_.upgrade)
+  }
+
+  def podHasPersistentVolumes(pod: Pod): Boolean = {
+    pod.volumes.exists(_.isInstanceOf[PodPersistentVolume])
+  }
+  val complyWithPodUpgradeStrategyRules: Validator[Pod] = validator[Pod] { pod =>
+    (podUpgradeStrategy(pod) as "upgrade"
+      is optional(implied(podHasPersistentVolumes(pod))(validForResidentPods)))
+  }
+
   lazy val validForResidentTasks: Validator[UpgradeStrategy] = validator[UpgradeStrategy] { strategy =>
     strategy.minimumHealthCapacity is between(0.0, 1.0)
-    strategy.maximumOverCapacity should valid(be == 0.0)
+    strategy.maximumOverCapacity should be == 0.0
+  }
+
+  lazy val validForResidentPods: Validator[PodUpgradeStrategy] = validator[PodUpgradeStrategy] { strategy =>
+    strategy.minimumHealthCapacity is between(0.0, 1.0)
+    strategy.maximumOverCapacity should be == 0.0
   }
 
   lazy val validForSingleInstanceApps: Validator[UpgradeStrategy] = validator[UpgradeStrategy] { strategy =>
-    strategy.minimumHealthCapacity should valid(be == 0.0)
-    strategy.maximumOverCapacity should valid(be == 0.0)
+    strategy.minimumHealthCapacity should be == 0.0
+    strategy.maximumOverCapacity should be == 0.0
   }
 
   val complyWithConstraintRules: Validator[Constraint] = new Validator[Constraint] {
     import mesosphere.marathon.raml.ConstraintOperator._
     override def apply(c: Constraint): Result = {
-      def failure(constraintViolation: String, description: Option[String] = None) =
-        Failure(Set(RuleViolation(c, constraintViolation, description)))
+      def failure(constraintViolation: String) =
+        Failure(Set(RuleViolation(c, constraintViolation)))
       if (c.fieldName.isEmpty) {
         failure(ConstraintRequiresField)
       } else {
@@ -82,8 +111,15 @@ trait SchedulingValidation {
             } { p =>
               Try(Pattern.compile(p)) match {
                 case util.Success(_) => Success
-                case util.Failure(e) => failure(InvalidRegularExpression, Option(e.getMessage))
+                case util.Failure(e) => failure(InvalidRegularExpression)
               }
+            }
+          case Is =>
+            c.value.getOrElse("") match {
+              case MesosLiteralOrFloatValue() =>
+                Success
+              case _ =>
+                failure(IsOnlySupportsText)
             }
         }
       }
@@ -91,7 +127,10 @@ trait SchedulingValidation {
   }
 
   val placementStrategyValidator = validator[PodPlacementPolicy] { ppp =>
-    ppp.acceptedResourceRoles.toSet is empty or ResourceRole.validAcceptedResourceRoles(false) // TODO(jdef) assumes pods!! change this to properly support apps
+    ppp.acceptedResourceRoles.toSet is empty or ResourceRole.validAcceptedResourceRoles(
+      "pod",
+      false
+    ) // TODO(jdef) assumes pods!! change this to properly support apps
     ppp.constraints is empty or every(complyWithConstraintRules)
   }
 
@@ -102,26 +141,27 @@ trait SchedulingValidation {
   }
 
   val complyWithAppConstraintRules: Validator[Seq[String]] = new Validator[Seq[String]] {
-    def failureIllegalOperator(c: Any) = Failure(Set(RuleViolation(c, ConstraintOperatorInvalid, None)))
+    def failureIllegalOperator(c: Any) = Failure(Set(RuleViolation(c, ConstraintOperatorInvalid)))
 
     override def apply(c: Seq[String]): Result = {
-      def badConstraint(reason: String, desc: Option[String] = None): Result =
-        Failure(Set(RuleViolation(c, reason, desc)))
+      def badConstraint(reason: String): Result =
+        Failure(Set(RuleViolation(c, reason)))
       if (c.length < 2 || c.length > 3) badConstraint("Each constraint must have either 2 or 3 fields")
-      else (c.headOption, c.lift(1), c.lift(2)) match {
-        case (None, None, _) =>
-          badConstraint("Missing field and operator")
-        case (Some(field), Some(op), value) if field.nonEmpty =>
-          ConstraintOperator.fromString(op.toUpperCase) match {
-            case Some(operator) =>
-              // reuse the rules from pod constraint validation so that we're not maintaining redundant rule sets
-              complyWithConstraintRules(Constraint(fieldName = field, operator = operator, value = value))
-            case _ =>
-              failureIllegalOperator(c)
-          }
-        case _ =>
-          badConstraint(IllegalConstraintSpecification)
-      }
+      else
+        (c.headOption, c.lift(1), c.lift(2)) match {
+          case (None, None, _) =>
+            badConstraint("Missing field and operator")
+          case (Some(field), Some(op), value) if field.nonEmpty =>
+            ConstraintOperator.fromString(op.toUpperCase) match {
+              case Some(operator) =>
+                // reuse the rules from pod constraint validation so that we're not maintaining redundant rule sets
+                complyWithConstraintRules(Constraint(fieldName = field, operator = operator, value = value))
+              case _ =>
+                failureIllegalOperator(c)
+            }
+          case _ =>
+            badConstraint(IllegalConstraintSpecification)
+        }
     }
   }
 }
@@ -129,6 +169,14 @@ trait SchedulingValidation {
 object SchedulingValidation extends SchedulingValidation
 
 object SchedulingValidationMessages {
+  /* IS currently supports text and scalar values. By disallowing ranges / sets, we can add support for them later
+   * without breaking the API. */
+  val MesosLiteralOrFloatValue = "^[a-zA-Z0-9_/.-]*$".r
+
+  val IsOnlySupportsText =
+    "IS only supports Mesos text and float values (see http://mesos.apache.org/documentation/latest/attributes-resources/)"
+  val InOnlySupportsSets = "IN value expects a Mesos set value (see http://mesos.apache.org/documentation/latest/attributes-resources/)"
+
   val ConstraintRequiresField = "missing field for constraint declaration"
   val InvalidRegularExpression = "is not a valid regular expression"
   val ConstraintLikeAnUnlikeRequireRegexp = "LIKE and UNLIKE require a non-empty, regular expression value"
@@ -136,5 +184,6 @@ object SchedulingValidationMessages {
   val ConstraintGroupByMustBeEmptyOrInt = "GROUP BY must define an integer value or else no value at all"
   val ConstraintUniqueDoesNotAcceptValue = "UNIQUE does not accept a value"
   val IllegalConstraintSpecification = "illegal constraint specification"
-  val ConstraintOperatorInvalid = "operator must be one of the following UNIQUE, CLUSTER, GROUP_BY, LIKE, MAX_PER or UNLIKE"
+  val ConstraintOperatorInvalid = "operator must be one of the following UNIQUE, CLUSTER, GROUP_BY, LIKE, MAX_PER, UNLIKE or IS"
+  val UpgradeStrategyMustBeDefinedWithPersistentVolumes = "upgrade strategy must be defined"
 }

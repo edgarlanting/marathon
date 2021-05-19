@@ -1,7 +1,7 @@
 package mesosphere.marathon
 package api.v2
 
-import mesosphere.marathon.raml.{ Network, NetworkMode }
+import mesosphere.marathon.raml.{Network, NetworkMode}
 
 object NetworkNormalization {
 
@@ -13,7 +13,7 @@ object NetworkNormalization {
   }
 
   case class Configure(
-    override val defaultNetworkName: Option[String]
+      override val defaultNetworkName: Option[String]
   ) extends Config
 
   case class Networks(config: Config, networks: Option[Seq[Network]])
@@ -21,7 +21,7 @@ object NetworkNormalization {
   object Networks {
     implicit val normalizedNetworks: Normalization[Networks] = Normalization { n =>
       // IMPORTANT: only evaluate config.defaultNetworkName if we actually need it
-      n.copy(networks = n.networks.map{ networks =>
+      n.copy(networks = n.networks.map { networks =>
         networks.map {
           case x: Network if x.name.isEmpty && x.mode == NetworkMode.Container => x.copy(name = n.config.defaultNetworkName)
           case x => x

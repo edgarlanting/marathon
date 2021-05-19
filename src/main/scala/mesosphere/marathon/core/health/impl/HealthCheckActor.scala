@@ -1,113 +1,100 @@
 package mesosphere.marathon
 package core.health.impl
 
-import akka.actor.{ Actor, ActorLogging, ActorRef, Cancellable, Props }
+import akka.NotUsed
+import akka.actor.{Actor, ActorRef, Props}
 import akka.event.EventStream
-import akka.stream.Materializer
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.{Sink, Source}
+import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon.core.event._
 import mesosphere.marathon.core.health._
+import mesosphere.marathon.core.health.impl.AppHealthCheckActor.{
+  ApplicationKey,
+  HealthCheckStatusChanged,
+  InstanceKey,
+  PurgeHealthCheckStatuses
+}
 import mesosphere.marathon.core.health.impl.HealthCheckActor._
 import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.task.termination.{ KillReason, KillService }
+import mesosphere.marathon.core.task.termination.{KillReason, KillService}
 import mesosphere.marathon.core.task.tracker.InstanceTracker
-import mesosphere.marathon.state.{ AppDefinition, Timestamp }
+import mesosphere.marathon.state.{AppDefinition, Timestamp}
 
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.Future
 import scala.concurrent.duration._
-import scala.util.{ Failure, Success }
+import scala.util.{Failure, Success}
 
 private[health] class HealthCheckActor(
     app: AppDefinition,
+    appHealthCheckActor: ActorRef,
     killService: KillService,
     healthCheck: HealthCheck,
     instanceTracker: InstanceTracker,
-    eventBus: EventStream)(implicit mat: Materializer) extends Actor with ActorLogging {
+    eventBus: EventStream,
+    healthCheckHub: Sink[(AppDefinition, Instance, MarathonHealthCheck, ActorRef), NotUsed]
+) extends Actor
+    with StrictLogging {
 
-  import HealthCheckWorker.HealthCheckJob
+  implicit val mat = ActorMaterializer()
   import context.dispatcher
 
-  var nextScheduledCheck: Option[Cancellable] = None
-  var healthByInstanceId = Map.empty[Instance.Id, Health]
+  val healthByInstanceId = TrieMap.empty[Instance.Id, Health]
 
-  val workerProps: Props = Props(classOf[HealthCheckWorkerActor], mat)
+  private case class HealthCheckStreamStopped(thisInstance: this.type)
 
   override def preStart(): Unit = {
-    log.info(
-      "Starting health check actor for app [{}] version [{}] and healthCheck [{}]",
-      app.id,
-      app.version,
-      healthCheck
-    )
-    //Start health checking not after the default first health check
-    val start = math.min(healthCheck.interval.toMillis, HealthCheck.DefaultFirstHealthCheckAfter.toMillis).millis
-    scheduleNextHealthCheck(Some(start))
-  }
+    healthCheck match {
+      case marathonHealthCheck: MarathonHealthCheck =>
+        //Start health checking not after the default first health check
+        val startAfter = math.min(marathonHealthCheck.interval.toMillis, HealthCheck.DefaultFirstHealthCheckAfter.toMillis).millis
 
-  override def preRestart(reason: Throwable, message: Option[Any]): Unit =
-    log.info(
-      "Restarting health check actor for app [{}] version [{}] and healthCheck [{}]",
-      app.id,
-      app.version,
-      healthCheck
-    )
+        logger.info(s"Starting health check for ${app.id} version ${app.version} and healthCheck $marathonHealthCheck in $startAfter ms")
 
-  override def postStop(): Unit = {
-    nextScheduledCheck.forall { _.cancel() }
-    log.info(
-      "Stopped health check actor for app [{}] version [{}] and healthCheck [{}]",
-      app.id,
-      app.version,
-      healthCheck
-    )
-  }
+        Source
+          .tick(startAfter, marathonHealthCheck.interval, Tick)
+          .mapAsync(1)(_ => instanceTracker.specInstances(app.id))
+          .map { instances =>
+            purgeStatusOfDoneInstances(instances)
+            instances.collect {
+              case instance if instance.runSpecVersion == app.version && instance.isRunning =>
+                logger.debug("Making a health check request for {}", instance.instanceId)
+                (app, instance, marathonHealthCheck, self)
+            }
+          }
+          .mapConcat(identity)
+          .watchTermination() { (_, done) =>
+            done.onComplete {
+              case Success(_) =>
+                logger.info(s"HealthCheck stream for app ${app.id} version ${app.version} and healthCheck $healthCheck was stopped")
+                self ! HealthCheckStreamStopped(this)
 
-  def updateInstances(): Unit = {
-    instanceTracker.specInstances(app.id).onComplete {
-      case Success(instances) => self ! InstancesUpdate(version = app.version, instances = instances)
-      case Failure(t) => log.error("An error has occurred: " + t.getMessage, t)
+              case Failure(ex) =>
+                logger.warn(s"HealthCheck stream for app ${app.id} version ${app.version} and healthCheck $healthCheck crashed due to:", ex)
+                self ! HealthCheckStreamStopped(this)
+            }
+          }
+          .runWith(healthCheckHub)
+      case _ => // Don't do anything for Mesos health checks
     }
   }
 
   def purgeStatusOfDoneInstances(instances: Seq[Instance]): Unit = {
-    log.debug(
-      "Purging health status of inactive instances for app [{}] version [{}] and healthCheck [{}]",
-      app.id,
-      app.version,
-      healthCheck
-    )
-    val activeInstanceIds: Set[Instance.Id] = instances.withFilter(_.isLaunched).map(_.instanceId)(collection.breakOut)
-    // The Map built with filterKeys wraps the original map and contains a reference to activeInstanceIds.
-    // Therefore we materialize it into a new map.
-    healthByInstanceId = healthByInstanceId.filterKeys(activeInstanceIds).iterator.toMap
-  }
+    logger.debug(s"Purging health status of inactive instances for app ${app.id} version ${app.version} and healthCheck ${healthCheck}")
 
-  def scheduleNextHealthCheck(interval: Option[FiniteDuration] = None): Unit = healthCheck match {
-    case hc: MarathonHealthCheck =>
-      log.debug(
-        "Scheduling next health check for app [{}] version [{}] and healthCheck [{}]",
-        app.id,
-        app.version,
-        hc
-      )
-      nextScheduledCheck = Some(
-        context.system.scheduler.scheduleOnce(interval.getOrElse(hc.interval)) {
-          self ! Tick
-        }
-      )
-    case _ => // Don't do anything for Mesos health checks
-  }
+    val inactiveInstanceIds: Set[Instance.Id] = instances.filterNot(_.isActive).iterator.map(_.instanceId).toSet
+    inactiveInstanceIds.foreach { inactiveId =>
+      healthByInstanceId.remove(inactiveId)
+    }
 
-  def dispatchJobs(instances: Seq[Instance]): Unit = healthCheck match {
-    case hc: MarathonHealthCheck =>
-      log.debug("Dispatching health check jobs to workers")
-      instances.foreach { instance =>
-        if (instance.runSpecVersion == app.version && instance.isRunning) {
-          log.debug("Dispatching health check job for {}", instance.instanceId)
-          val worker: ActorRef = context.actorOf(workerProps)
-          worker ! HealthCheckJob(app, instance, hc)
-        }
-      }
-    case _ => // Don't do anything for Mesos health checks
+    val checksToPurge = instances
+      .withFilter(!_.isActive)
+      .map(instance => {
+        val instanceKey = InstanceKey(ApplicationKey(instance.runSpecId, instance.runSpecVersion), instance.instanceId)
+        (instanceKey, healthCheck)
+      })
+    appHealthCheckActor ! PurgeHealthCheckStatuses(checksToPurge)
   }
 
   def checkConsecutiveFailures(instance: Instance, health: Health): Unit = {
@@ -117,15 +104,15 @@ private[health] class HealthCheckActor(
     // ignore failures if maxFailures == 0
     if (consecutiveFailures >= maxFailures && maxFailures > 0) {
       val instanceId = instance.instanceId
-      log.info(
-        s"Detected unhealthy $instanceId of app [${app.id}] version [${app.version}] on host ${instance.agentInfo.host}"
+      logger.info(
+        s"Detected unhealthy $instanceId of app [${app.id}] version [${app.version}] on host ${instance.hostname}"
       )
 
       // kill the instance, if it is reachable
       if (instance.isUnreachable) {
-        log.info(s"Instance $instanceId on host ${instance.agentInfo.host} is temporarily unreachable. Performing no kill.")
+        logger.info(s"Instance $instanceId on host ${instance.hostname} is temporarily unreachable. Performing no kill.")
       } else {
-        log.info(s"Send kill request for $instanceId on host ${instance.agentInfo.host} to driver")
+        logger.info(s"Send kill request for $instanceId on host ${instance.hostname.getOrElse("unknown")} to driver")
         require(instance.tasksMap.size == 1, "Unexpected pod instance in HealthCheckActor")
         val taskId = instance.appTask.taskId
         eventBus.publish(
@@ -135,12 +122,12 @@ private[health] class HealthCheckActor(
             instanceId = instanceId,
             version = app.version,
             reason = health.lastFailureCause.getOrElse("unknown"),
-            host = instance.agentInfo.host,
-            slaveId = instance.agentInfo.agentId,
+            host = instance.hostname.getOrElse("unknown"),
+            slaveId = instance.agentInfo.flatMap(_.agentId),
             timestamp = health.lastFailure.getOrElse(Timestamp.now()).toString
           )
         )
-        killService.killInstance(instance, KillReason.FailedHealthChecks)
+        killService.killInstancesAndForget(Seq(instance), KillReason.FailedHealthChecks)
       }
     }
   }
@@ -161,15 +148,15 @@ private[health] class HealthCheckActor(
 
     val updatedHealth = result match {
       case Healthy(_, _, _, _) =>
-        Future(health.update(result))
+        Future.successful(health.update(result))
       case Unhealthy(_, _, _, _, _) =>
-        instanceTracker.instance(instanceId).map({
+        instanceTracker.instance(instanceId).map {
           case Some(instance) =>
             if (ignoreFailures(instance, health)) {
               // Don't update health
               health
             } else {
-              log.debug("{} is {}", instance.instanceId, result)
+              logger.debug("{} is {}", instanceId, result)
               if (result.publishEvent) {
                 eventBus.publish(FailedHealthCheck(app.id, instanceId, healthCheck))
               }
@@ -177,13 +164,15 @@ private[health] class HealthCheckActor(
               health.update(result)
             }
           case None =>
-            log.error(s"Couldn't find instance $instanceId")
+            logger.error(s"Couldn't find instance $instanceId")
             health.update(result)
-        })
+        }
+      case _: Ignored =>
+        Future.successful(health) // Ignore and keep the old health
     }
     updatedHealth.onComplete {
       case Success(newHealth) => self ! InstanceHealth(result, health, newHealth)
-      case Failure(t) => log.error("An error has occurred: " + t.getMessage, t)
+      case Failure(t) => logger.error(s"An error has occurred: ${t.getMessage}", t)
     }
   }
 
@@ -193,15 +182,12 @@ private[health] class HealthCheckActor(
     val health = instanceHealth.health
     val newHealth = instanceHealth.newHealth
 
-    log.info("Received health result for app [{}] version [{}]: [{}]", app.id, app.version, result)
+    logger.info(s"Received health result for app [${app.id}] version [${app.version}]: [$result]")
     healthByInstanceId += (instanceId -> instanceHealth.newHealth)
+    appHealthCheckActor ! HealthCheckStatusChanged(ApplicationKey(app.id, app.version), healthCheck, newHealth)
 
     if (health.alive != newHealth.alive && result.publishEvent) {
       eventBus.publish(HealthStatusChanged(app.id, instanceId, result.version, alive = newHealth.alive))
-      // We moved to InstanceHealthChanged Events everywhere
-      // Since we perform marathon based health checks only for apps, (every task is an instance)
-      // every health result is translated to an instance health changed event
-      eventBus.publish(InstanceHealthChanged(instanceId, result.version, app.id, Some(newHealth.alive)))
     }
   }
 
@@ -209,15 +195,7 @@ private[health] class HealthCheckActor(
     case GetInstanceHealth(instanceId) => sender() ! healthByInstanceId.getOrElse(instanceId, Health(instanceId))
 
     case GetAppHealth =>
-      sender() ! AppHealth(healthByInstanceId.values.to[Seq])
-
-    case Tick =>
-      updateInstances()
-      scheduleNextHealthCheck()
-
-    case InstancesUpdate(version, instances) if version == app.version =>
-      purgeStatusOfDoneInstances(instances)
-      dispatchJobs(instances)
+      sender() ! AppHealth(healthByInstanceId.values.to(Seq))
 
     case result: HealthResult if result.version == app.version =>
       handleHealthResult(result)
@@ -225,26 +203,26 @@ private[health] class HealthCheckActor(
     case instanceHealth: InstanceHealth =>
       updateInstanceHealth(instanceHealth)
 
-    case result: HealthResult =>
-      log.warning(s"Ignoring health result [$result] due to version mismatch.")
-
+    case HealthCheckStreamStopped(thisInstance) =>
+      if (thisInstance == this)
+        throw new RuntimeException("HealthCheckActor stream stopped, restarting")
+      else
+        logger.info("Stream pertaining to previous instance of actor stopped; ignoring.")
   }
 }
 
 object HealthCheckActor {
   def props(
-    app: AppDefinition,
-    killService: KillService,
-    healthCheck: HealthCheck,
-    instanceTracker: InstanceTracker,
-    eventBus: EventStream)(implicit mat: Materializer): Props = {
+      app: AppDefinition,
+      appHealthCheckActor: ActorRef,
+      killService: KillService,
+      healthCheck: HealthCheck,
+      instanceTracker: InstanceTracker,
+      eventBus: EventStream,
+      healthCheckHub: Sink[(AppDefinition, Instance, MarathonHealthCheck, ActorRef), NotUsed]
+  ): Props = {
 
-    Props(new HealthCheckActor(
-      app,
-      killService,
-      healthCheck,
-      instanceTracker,
-      eventBus))
+    Props(new HealthCheckActor(app, appHealthCheckActor, killService, healthCheck, instanceTracker, eventBus, healthCheckHub))
   }
 
   // self-sent every healthCheck.intervalSeconds
@@ -256,5 +234,4 @@ object HealthCheckActor {
 
   case class InstanceHealth(result: HealthResult, health: Health, newHealth: Health)
   case class InstancesUpdate(version: Timestamp, instances: Seq[Instance])
-
 }

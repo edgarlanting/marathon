@@ -1,41 +1,37 @@
 package mesosphere.marathon
 package api
 
-import javax.inject.Inject
-
 import akka.Done
-import mesosphere.marathon.core.async.ExecutionContexts.global
+import akka.stream.Materializer
+import akka.stream.scaladsl.Sink
+import com.typesafe.scalalogging.StrictLogging
+import javax.inject.Inject
 import mesosphere.marathon.core.deployment.DeploymentPlan
 import mesosphere.marathon.core.group.GroupManager
-import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.instance.update.InstanceUpdateOperation
-import mesosphere.marathon.core.task.termination.{ KillReason, KillService }
-import mesosphere.marathon.core.task.tracker.{ InstanceTracker, TaskStateOpProcessor }
-import mesosphere.marathon.plugin.auth.{ Authenticator, Authorizer, Identity, UpdateRunSpec }
+import mesosphere.marathon.core.instance.{Goal, GoalChangeReason, Instance}
+import mesosphere.marathon.core.task.termination.impl.KillStreamWatcher
+import mesosphere.marathon.core.task.termination.{KillReason, KillService}
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.plugin.auth.{Authenticator, Authorizer, Identity, UpdateRunSpec}
 import mesosphere.marathon.state._
-import org.slf4j.LoggerFactory
 
-import scala.async.Async.{ async, await }
-import scala.concurrent.Future
+import scala.async.Async.{async, await}
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.control.NonFatal
 
 class TaskKiller @Inject() (
     instanceTracker: InstanceTracker,
-    stateOpProcessor: TaskStateOpProcessor,
     groupManager: GroupManager,
-    service: MarathonSchedulerService,
-    val config: MarathonConf,
     val authenticator: Authenticator,
     val authorizer: Authorizer,
-    killService: KillService) extends AuthResource {
+    killService: KillService
+)(implicit val executionContext: ExecutionContext, implicit val materializer: Materializer)
+    extends AuthResource
+    with StrictLogging {
 
-  private[this] val log = LoggerFactory.getLogger(getClass)
-
-  @SuppressWarnings(Array("all")) // async/await
-  def kill(
-    runSpecId: PathId,
-    findToKill: (Seq[Instance] => Seq[Instance]),
-    wipe: Boolean = false)(implicit identity: Identity): Future[Seq[Instance]] = {
+  def kill(runSpecId: AbsolutePathId, findToKill: (Seq[Instance] => Seq[Instance]), wipe: Boolean = false)(implicit
+      identity: Identity
+  ): Future[Seq[Instance]] = {
 
     groupManager.runSpec(runSpecId) match {
       case Some(runSpec) =>
@@ -43,14 +39,25 @@ class TaskKiller @Inject() (
         async { // linter:ignore:UnnecessaryElseBranch
           val allInstances = await(instanceTracker.specInstances(runSpecId))
           val foundInstances = findToKill(allInstances)
-          val launchedInstances = foundInstances.filter(_.isLaunched)
+          val activeInstances = foundInstances.filter(_.isActive)
 
           if (wipe) {
-            val done1 = await(expunge(foundInstances))
-            val done2 = await(killService.killInstances(launchedInstances, KillReason.KillingTasksViaApi))
+            val instancesAreTerminal: Future[Done] = KillStreamWatcher
+              .watchForDecommissionedInstances(instanceTracker.instanceUpdates, activeInstances)
+              .runWith(Sink.ignore)
+            await(
+              Future
+                .sequence(foundInstances.map(i => instanceTracker.setGoal(i.instanceId, Goal.Decommissioned, GoalChangeReason.UserRequest)))
+            ): @silent
+            await(doForceExpunge(foundInstances.map(_.instanceId))): @silent
+            await(instancesAreTerminal): @silent
           } else {
-            if (launchedInstances.nonEmpty) service.killInstances(runSpecId, launchedInstances)
-          }
+            if (activeInstances.nonEmpty) {
+              // This is legit. We don't adjust the goal, since that should stay whatever it is.
+              // However we kill the tasks associated with these instances directly via the killService.
+              killService.killInstancesAndForget(activeInstances, KillReason.KillingTasksViaApi)
+            }
+          }: @silent
           // Return killed *and* expunged instances.
           // The user only cares that all instances won't exist eventually. That's why we send all instances back and
           // not just the killed instances.
@@ -61,39 +68,40 @@ class TaskKiller @Inject() (
     }
   }
 
-  private[this] def expunge(instances: Seq[Instance]): Future[Done] = {
+  private[this] def doForceExpunge(instances: Iterable[Instance.Id]): Future[Done] = {
     // Note: We process all instances sequentially.
 
-    instances.foldLeft(Future.successful(Done)) { (resultSoFar, nextInstance) =>
+    instances.foldLeft(Future.successful(Done)) { (resultSoFar, nextInstanceId) =>
       resultSoFar.flatMap { _ =>
-        log.info("Expunging {}", nextInstance.instanceId)
-        stateOpProcessor.process(InstanceUpdateOperation.ForceExpunge(nextInstance.instanceId)).map(_ => Done).recover {
-          case NonFatal(cause) =>
-            log.info("Failed to expunge {}, got: {}", Array[Object](nextInstance.instanceId, cause): _*)
-            Done
-        }
+        logger.info(s"Expunging ${nextInstanceId}")
+        instanceTracker
+          .forceExpunge(nextInstanceId)
+          .recover {
+            case NonFatal(cause) =>
+              logger.warn(s"Failed to expunge ${nextInstanceId}, got:", cause)
+              Done
+          }
+          .map(_ => Done)
       }
     }
   }
 
-  @SuppressWarnings(Array("all")) // async/await
-  def killAndScale(
-    appId: PathId,
-    findToKill: (Seq[Instance] => Seq[Instance]),
-    force: Boolean)(implicit identity: Identity): Future[DeploymentPlan] = async {
-    val instances = await(instanceTracker.specInstances(appId))
-    val launchedInstances = instances.filter(_.isLaunched)
-    val instancesToKill = findToKill(launchedInstances)
-    await(killAndScale(Map(appId -> instancesToKill), force))
-  }
+  def killAndScale(appId: AbsolutePathId, findToKill: (Seq[Instance] => Seq[Instance]), force: Boolean)(implicit
+      identity: Identity
+  ): Future[DeploymentPlan] =
+    async {
+      val instances = await(instanceTracker.specInstances(appId))
+      val activeInstances = instances.filter(_.isActive)
+      val instancesToKill = findToKill(activeInstances)
+      await(killAndScale(Map(appId -> instancesToKill), force))
+    }
 
-  @SuppressWarnings(Array("all")) // async/await
-  def killAndScale(
-    appInstances: Map[PathId, Seq[Instance]],
-    force: Boolean)(implicit identity: Identity): Future[DeploymentPlan] = {
+  def killAndScale(appInstances: Map[AbsolutePathId, Seq[Instance]], force: Boolean)(implicit
+      identity: Identity
+  ): Future[DeploymentPlan] = {
     def scaleApp(app: AppDefinition): AppDefinition = {
-      checkAuthorization(UpdateRunSpec, app)
       appInstances.get(app.id).fold(app) { instances =>
+        checkAuthorization(UpdateRunSpec, app)
         // only count active instances that did not already receive a kill request.
         val toKillCount = instances.count(i => i.isActive && !i.isKilling)
         // make sure we never scale below zero instances.
@@ -103,13 +111,14 @@ class TaskKiller @Inject() (
 
     val version = Timestamp.now()
 
-    def killDeployment = groupManager.updateRoot(
-      PathId.empty,
-      _.updateTransitiveApps(PathId.empty, scaleApp, version),
-      version = version,
-      force = force,
-      toKill = appInstances
-    )
+    def killDeployment =
+      groupManager.updateRoot(
+        PathId.root,
+        _.updateTransitiveApps(PathId.root, scaleApp, version),
+        version = version,
+        force = force,
+        toKill = appInstances
+      )
 
     async {
       val allInstances = await(instanceTracker.instancesBySpec()).instancesMap

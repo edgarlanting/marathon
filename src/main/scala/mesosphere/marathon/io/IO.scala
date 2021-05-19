@@ -1,113 +1,36 @@
 package mesosphere.marathon
 package io
 
-import java.io._
-import java.math.BigInteger
-import java.nio.file.{ Files, Path, Paths }
-import java.security.{ DigestInputStream, MessageDigest }
-import java.util.zip.{ GZIPInputStream, GZIPOutputStream }
+import java.io.{BufferedInputStream, Closeable, File, FileInputStream, FileOutputStream, FileNotFoundException, InputStream, OutputStream}
 
-import com.google.common.io.ByteStreams
+import com.typesafe.scalalogging.StrictLogging
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 
 import scala.annotation.tailrec
-import scala.util.{ Failure, Success, Try }
+import org.apache.commons.io.CopyUtils
 
-object IO {
+import scala.util.{Failure, Success, Try}
 
-  private val BufferSize = 8192
+object IO extends StrictLogging {
 
-  def readFile(file: String): Array[Byte] = readFile(Paths.get(file))
-  def readFile(path: Path): Array[Byte] = Files.readAllBytes(path)
+  /**
+    * This method follows symlinks by invoking `getCanonicalFile` method on the File object. A canonical pathname is
+    * both absolute and unique. The precise definition of canonical form is system-dependent. `getCanonicalFile` first
+    * converts this pathname to absolute form if necessary, as if by invoking the getAbsolutePath() method, and then
+    * maps it to its unique form in a system-dependent way. This typically involves removing redundant names such as "."
+    * and ".." from the pathname, resolving symbolic links (on UNIX platforms), and converting drive letters to a
+    * standard case (on Microsoft Windows platforms).
+    *
+    * @param file string path to the directory
+    * @return an array of file objects in the directory
+    */
+  def listFiles(file: String): Array[File] = listFiles(new File(file).getCanonicalFile)
 
-  def listFiles(file: String): Array[File] = listFiles(new File(file))
   def listFiles(file: File): Array[File] = {
     if (!file.exists()) throw new FileNotFoundException(file.getAbsolutePath)
     if (!file.isDirectory) throw new FileNotFoundException(s"File ${file.getAbsolutePath} is not a directory!")
     file.listFiles()
-  }
-
-  def moveFile(from: File, to: File): File = {
-    if (to.exists()) delete(to)
-    createDirectory(to.getParentFile)
-    if (!from.renameTo(to)) {
-      copyFile(from, to)
-      delete(from)
-    }
-    to
-  }
-
-  def copyFile(sourceFile: File, targetFile: File): Unit = {
-    require(sourceFile.exists, "Source file '" + sourceFile.getAbsolutePath + "' does not exist.")
-    require(!sourceFile.isDirectory, "Source file '" + sourceFile.getAbsolutePath + "' is a directory.")
-    using(new FileInputStream(sourceFile)) { source =>
-      using(new FileOutputStream(targetFile)) { target =>
-        transfer(source, target, close = false)
-      }
-    }
-  }
-
-  def createDirectory(dir: File): Unit = {
-    if (!dir.exists()) {
-      val result = dir.mkdirs()
-      if (!result || !dir.isDirectory || !dir.exists)
-        throw new IOException("Can not create Directory: " + dir.getAbsolutePath)
-    }
-  }
-
-  def delete(file: File): Unit = {
-    if (file.isDirectory) {
-      file.listFiles().foreach(delete)
-    }
-    file.delete()
-  }
-
-  def mdSum(
-    in: InputStream,
-    mdName: String = "SHA-1",
-    out: OutputStream = ByteStreams.nullOutputStream()): String = {
-    val md = MessageDigest.getInstance(mdName)
-    transfer(new DigestInputStream(in, md), out)
-    new BigInteger(1, md.digest()).toString(16)
-  }
-
-  def gzipCompress(bytes: Array[Byte]): Array[Byte] = {
-    val out = new ByteArrayOutputStream(bytes.length)
-    using(new GZIPOutputStream(out)) { gzip =>
-      gzip.write(bytes)
-      gzip.flush()
-    }
-    out.toByteArray
-  }
-
-  def gzipUncompress(bytes: Array[Byte]): Array[Byte] = {
-    using(new GZIPInputStream(new ByteArrayInputStream(bytes))) { in =>
-      ByteStreams.toByteArray(in)
-    }
-  }
-
-  def transfer(
-    in: InputStream,
-    out: OutputStream,
-    close: Boolean = true,
-    continue: => Boolean = true): Unit = {
-    try {
-      val buffer = new Array[Byte](BufferSize)
-      @tailrec def read(): Unit = {
-        val byteCount = in.read(buffer)
-        if (byteCount >= 0 && continue) {
-          out.write(buffer, 0, byteCount)
-          out.flush()
-          read()
-        }
-      }
-      read()
-    } finally { if (close) Try(in.close()) }
-  }
-
-  def copyInputStreamToString(in: InputStream): String = {
-    val out = new ByteArrayOutputStream()
-    transfer(in, out)
-    new String(out.toByteArray, "UTF-8")
   }
 
   def withResource[T](path: String)(fn: InputStream => T): Option[T] = {
@@ -123,8 +46,65 @@ object IO {
     try {
       fn(closeable)
     } finally {
-      Try(closeable.close())
+      try closeable.close()
+      catch {
+        case ex: Exception =>
+        // suppress exceptions
+      }
     }
   }
-}
 
+  /**
+    * Copies all bytes from an input stream to an outputstream.
+    *
+    * The method is adapted from [[com.google.common.io.ByteStreams.copy]] with the only difference that we flush after
+    * each write. Note: This method is blocking!
+    *
+    * @param maybeFrom Inputstream for copy from.
+    * @param maybeTo Outputstream to copy to.
+    * @return
+    */
+  def transfer(maybeFrom: Option[InputStream], maybeTo: Option[OutputStream]): Long = {
+    (maybeFrom, maybeTo) match {
+      case (Some(from), Some(to)) =>
+        @tailrec def iter(buf: Array[Byte], total: Long): Long =
+          from.read(buf) match {
+            case -1 => total
+            case r =>
+              to.write(buf, 0, r)
+              to.flush()
+              iter(buf, total + r)
+          }
+
+        iter(new Array[Byte](8192), 0L)
+      case _ =>
+        logger.debug("Did not copy any data.")
+        0
+    }
+  }
+
+  def transfer(from: InputStream, to: OutputStream): Long = transfer(Some(from), Some(to))
+
+  /**
+    * Extracts a tarball GZipped file to and output directory.
+    *
+    * @param tgzFile The tarball file to extract.
+    * @param outDir The target output directory.
+    */
+  def extractTGZip(tgzFile: File, outDir: File): Unit = {
+    logger.debug(s"Extracting ${tgzFile.getCanonicalPath} to ${outDir.getCanonicalPath}")
+    val tarIs = new TarArchiveInputStream(new GzipCompressorInputStream(new BufferedInputStream(new FileInputStream(tgzFile))))
+    var entry = tarIs.getNextTarEntry
+    while (entry != null) {
+      val destPath = new File(outDir, entry.getName)
+      if (entry.isDirectory) destPath.mkdirs()
+      else {
+        destPath.getParentFile.mkdirs()
+        destPath.createNewFile
+        CopyUtils.copy(tarIs, new FileOutputStream(destPath))
+      }
+      entry = tarIs.getNextTarEntry
+    }
+    tarIs.close()
+  }
+}
